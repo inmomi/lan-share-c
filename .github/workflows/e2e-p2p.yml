@@ -73,3 +73,60 @@ jobs:
 
       - name: P2P 端到端（TCP 基线 + 冷/热测速 + 真实文件 + 逐字节校验 + lane 扫描）
         run: node tools/p2p-e2e.js --server ./lan-share --file-mb ${{ matrix.file-mb }} --timeout 240 --label ci-${{ matrix.file-mb }}mb --sweep 1,2,4,8,16 --sweep-mb 16
+
+  # 无损 loopback 上 4 条 lane 就见到共享瓶颈（包速率/CPU），加 lane 反而略降。
+  # 但用户的真实链路是 Wi-Fi：有丢包时每关联的拥塞窗口会坍缩，多关联是对抗
+  # 丢包的手段——无损环境模拟不出这个。这里用 tc netem 给 loopback 加
+  # 20ms 延迟 + 2% 丢包（模拟偏差的 Wi-Fi），让 TCP 基线和各 lane 数在
+  # 同等损伤下正面对比，直接回答"用户的链路上几条 lane 最优"。
+  sweep-lossy:
+    name: lane 扫描（20ms + 2% 丢包）
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: 生成内嵌前端资源
+        run: node tools/embed-web.js
+
+      - name: 编译
+        run: cc -O2 -std=c99 -Wall -o lan-share lan_share.c
+
+      # 两个浏览器在同主机，host candidate 走本机 IP，Linux 本地交付经过 lo，
+      # 所以 netem 挂在 lo 上即可。信令（127.0.0.1 TCP）同样受影响——但这正是
+      # 想要的：TCP 基线也在同等损伤下测，对比才公平。
+      - name: 给 loopback 加损伤
+        run: |
+          set -e
+          sudo tc qdisc add dev lo root netem delay 20ms loss 2%
+          tc qdisc show dev lo
+          ping -c 5 127.0.0.1 | tail -2
+
+      - name: 安装 / 定位 Chrome
+        run: |
+          set -e
+          if ! command -v google-chrome-stable >/dev/null 2>&1; then
+            cd "$RUNNER_TEMP"
+            curl -fsSL --max-time 300 -o chrome.deb \
+              "https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb"
+            sudo apt-get install -y -qq ./chrome.deb
+          fi
+          FOUND=""
+          for c in google-chrome-stable google-chrome chromium chromium-browser; do
+            if command -v "$c" >/dev/null 2>&1; then
+              FOUND=$(command -v "$c")
+              break
+            fi
+          done
+          if [ -z "$FOUND" ]; then
+            echo "::error::Chrome 装上了但不在 PATH 里"
+            exit 1
+          fi
+          echo "CHROME_PATH=$FOUND" >> "$GITHUB_ENV"
+          "$FOUND" --version
+
+      - name: P2P 扫描（同等丢包下：TCP 基线 vs 1/2/4/8/16 条 lane）
+        run: node tools/p2p-e2e.js --server ./lan-share --file-mb 16 --timeout 300 --label lossy --sweep 1,2,4,8,16 --sweep-mb 16
