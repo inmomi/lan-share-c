@@ -17,7 +17,7 @@
 
 两条路径都支持断点续传：直传中断后重发会接着上次的字节偏移继续；文件库上传按偏移续写 `.part` 半成品；下载走 HTTP Range，浏览器原生续传。设备名会按 IP 记住并在浏览器本地存一份，刷新页面、重连都不会变回随机名。
 
-**关于速度**：P2P 直传走 WebRTC DataChannel，有两条浏览器硬限制——单条消息不能超过 `sctp.maxMessageSize`（Chrome 默认 256KB），发送队列总共只有约 16MB，`bufferedAmount` 一超过 `send()` 就直接抛 `RTCDataChannel send queue is full`（不是排队，是抛异常）。 pacing 逻辑集中在 `public/p2p-pump.js`，高水位取 4MB、离上限留足余量，并且一次读 8MB 再切块发送，避免每 256KB 就走一次 Blob IPC 把带宽卡在读速上。
+**关于速度**：P2P 直传走 WebRTC DataChannel，有两条浏览器硬限制——单条消息不能超过 `sctp.maxMessageSize`（Chrome 默认 256KB），发送队列总共只有约 16MB，`bufferedAmount` 一超过 `send()` 就直接抛 `RTCDataChannel send queue is full`（不是排队，是抛异常）。 pacing 逻辑集中在 `public/p2p-pump.js`：高水位 4MB、低水位 1MB，**窗口没打满就连续发，打满了才等一次**——曾经是每发一块都等一次，而 `bufferedamountlow` 的阈值默认是 0、要等整队泄空才触发，实际放行全靠 50ms 轮询，每块都要赔一个轮询周期，吞吐被钉死在 5MB/s 左右（实测两个版本都卡在 5M/b）。另外一次读 8MB 再切块发送，避免每 256KB 就走一次 Blob IPC 把带宽卡在读速上。
 
 **页面里带了测速页**（第三个标签页）：分别测「服务端下载 / 服务端上传 / 点对点直传」三段，点对点那项还会把对端实际收到的速率一并显示出来。用途是把"慢"拆开定位——服务端慢是磁盘或 HTTP 栈的问题，点对点慢是 Wi-Fi 或 WebRTC SCTP 的问题，两者治法完全不同。测速状态按连接隔离、带 60 秒超时、失败主动发 `speedtest-abort`，不会因为对端没回执就把后续文件分片误吞导致传输卡死。
 
