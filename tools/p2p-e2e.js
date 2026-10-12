@@ -45,6 +45,12 @@ const TIMEOUT_MS = Number(arg('timeout', 240)) * 1000;
 const SERVER_EXE = arg('server', null);
 const SERVER_URL = arg('url', null);
 const LABEL = arg('label', 'e2e');
+/* lane 数量扫描：--sweep 1,2,4,8,16。回答"并行到底能不能线性扩展"——
+ * 4 条在 Runner 上合计约 26MB/s、单条约 6.5MB/s，如果是每关联的上限，
+ * 加 lane 就该继续涨；如果到顶了，说明瓶颈是共享的，加 lane 是徒劳。
+ * 每一轮都走真实 pumpFile + 对端回执，速率由对端计时，不受发送队列干扰。 */
+const SWEEP = arg('sweep', null);
+const SWEEP_MB = Number(arg('sweep-mb', 16));
 const ROOT = path.join(__dirname, '..');
 const PORT = 8471;
 
@@ -315,6 +321,65 @@ const peerNames = (page) => page.evaluate('state.peers.map(p => p.name)');
       return null;
     })()`);
     log(`  接收端记录: ${JSON.stringify(downRec)}`);
+
+    /* ---------------------------------------------------- 4. lane 数量扫描 */
+    if (SWEEP) {
+      log(`\n--- lane 数量扫描（热连接，每轮 ${SWEEP_MB}MB，速率由对端计时）---`);
+      const counts = String(SWEEP).split(',').map((s) => Number(s.trim()))
+        .filter((n) => Number.isFinite(n) && n > 0);
+      const rounds = await pageA.evaluate(`(async () => {
+        const conn = state.conns.get(${JSON.stringify(targetFromA)});
+        const out = [];
+        const blob = new Blob([new Uint8Array(${SWEEP_MB} * 1024 * 1024)]);
+        for (const n of ${JSON.stringify(counts)}) {
+          if (n > conn.lanes.length) { out.push({ n, error: 'lane 不够（只有 ' + conn.lanes.length + ' 条）' }); continue; }
+          const lanes = conn.lanes.slice(0, n);
+          const ranges = splitRange(0, ${SWEEP_MB} * 1024 * 1024, n);
+          /* 和 speedP2p 同一套握手：逐 lane 发 speedtest、等 ready、再泵数据 */
+          await Promise.all(lanes.map((lane, i) => new Promise((resolve, reject) => {
+            const to = setTimeout(() => reject(new Error('lane ' + i + ' 对端没有回应测速请求')), 10000);
+            const onMsg = (e) => {
+              if (typeof e.data !== 'string') return;
+              let m; try { m = JSON.parse(e.data); } catch (_) { return; }
+              if (m.t === 'speedtest-ready' && Number(m.ch) === lane.index) {
+                clearTimeout(to); lane.dc.removeEventListener('message', onMsg); resolve();
+              }
+            };
+            lane.dc.addEventListener('message', onMsg);
+            lane.dc.send(JSON.stringify({ t: 'speedtest', bytes: ranges[i].to - ranges[i].from, ch: lane.index }));
+          })));
+          const echoes = lanes.map((lane) => new Promise((resolve) => {
+            const to = setTimeout(() => resolve(null), 60000);
+            const onMsg = (e) => {
+              if (typeof e.data !== 'string') return;
+              let m; try { m = JSON.parse(e.data); } catch (_) { return; }
+              if (m.t === 'speedtest-result' && Number(m.ch) === lane.index) {
+                clearTimeout(to); lane.dc.removeEventListener('message', onMsg); resolve(m);
+              }
+            };
+            lane.dc.addEventListener('message', onMsg);
+          }));
+          await Promise.all(ranges.map((r, i) =>
+            pumpFile(lanes[i].dc, blob.slice(r.from, r.to), 0, { chunk: chunkSizeFor(lanes[i]) })
+              .then(() => { lanes[i].dc.send(JSON.stringify({ t: 'speedtest-end', ch: lanes[i].index })); })));
+          const results = await Promise.all(echoes);
+          const received = results.reduce((a, r) => a + (r ? r.received : 0), 0);
+          /* 并行时取最慢那条 lane 的耗时当分母，偏保守但不会虚高 */
+          const slowest = results.reduce((mx, r) => Math.max(mx, r ? r.ms : 0), 0);
+          out.push({
+            n, received, slowest,
+            mbps: slowest > 0 ? received / 1048576 / (slowest / 1000) : 0,
+            perLane: results.map((r) => (r && r.ms > 0 ? (r.received / 1048576) / (r.ms / 1000) : 0)),
+          });
+        }
+        return out;
+      })()`);
+      for (const r of rounds) {
+        if (r.error) { log(`  ${String(r.n).padStart(2)} 条: ${r.error}`); continue; }
+        log(`  ${String(r.n).padStart(2)} 条 lane: 合计 ${r.mbps.toFixed(1)} MB/s`
+          + `（单条 ${r.perLane.map((x) => x.toFixed(1)).join(' / ')} MB/s）`);
+      }
+    }
 
     log(`\n===== ${LABEL}: 测速 ${sp.mbps.toFixed(1)} MB/s`
       + `（对端 ${sp.peerMbps.toFixed(1)}）· 端到端传输 ${(FILE_MB / e2eSecs).toFixed(1)} MB/s =====`);
