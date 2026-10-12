@@ -358,7 +358,10 @@ static int ls_remove_file(const char *p) {
 #endif
 
 #define MAX_CLIENTS     24
-#define IO_BUF          8192
+/* IO 缓冲。原来只有 8KB：每次可读事件最多 recv 8KB，千兆网下要十多万次
+ * 系统调用/秒才喂得满，路由器那种单核 MIPS/ARM CPU 直接被打满，
+ * 实测吞吐就卡在几 MB/s。改成 64KB 并配合下面"一次事件读完"的循环。 */
+#define IO_BUF          65536
 #define HEAD_BUF        8192
 #define WS_BUF          16384
 #define NAME_MAX        64
@@ -709,7 +712,9 @@ static int flush_out(ls_client *c) {
     }
 
     while (c->out.sent < c->out.total) {
-        char buf[IO_BUF];
+        /* 单线程服务，flush_out 不会重入，用静态缓冲省掉 64KB 栈空间
+         * （client_readable 里也有一份同样大的）。 */
+        static char buf[IO_BUF];
         size_t want = (size_t)(c->out.total - c->out.sent);
         size_t got, off = 0;
         if (want > sizeof buf) want = sizeof buf;
@@ -1772,60 +1777,88 @@ static void ws_consume(ls_client *c) {
 
 static void client_readable(ls_client *c) {
     char buf[IO_BUF];
-    int n = (int)recv(c->fd, buf, sizeof buf, 0);
+    int rounds;
 
-    if (n == 0) {
-        client_close(c);
-        return;
-    }
-    if (n < 0) {
-        if (would_block()) return;
-        client_close(c);
-        return;
-    }
+    /* 一次可读事件就把 socket 里已有的数据尽量读完。
+     * 原来只 recv 一次、而且一次最多 8KB：客户端一个 4MB 的分块发过来，
+     * 要几十万次 select 唤醒 + recv 才吃得完，路由器那种单核 MIPS/ARM CPU
+     * 直接被打满，吞吐就卡在几 MB/s。现在循环到 EWOULDBLOCK。
+     *
+     * 但每次收多少要看模式，不能一律 IO_BUF：
+     *   HTTP 态——hbuf 只有 HEAD_BUF(8KB)，头还没解析完时多收的字节全是 body，
+     *     塞进 hbuf 会撑爆头缓冲、被当成畸形请求直接关连接（上传第一个分块时
+     *     必现，症状是客户端 "socket hang up"）。所以一次只收"还放得下"的量，
+     *     等 process_request 把模式切成 MODE_UPLOAD 之后再按 IO_BUF 尽量多收。
+     *   WS 态——wbuf 只有 WS_BUF(16KB)，同理按剩余空间收。
+     *   UPLOAD 态——数据直接写盘，没有中间缓冲，放心按 IO_BUF 收。 */
+    for (rounds = 0; rounds < 64; rounds++) {
+        size_t want;
+        int n;
 
-    if (c->mode == MODE_UPLOAD) {
-        size_t w = (size_t)n;
-        if ((uint64_t)w > c->upleft) w = (size_t)c->upleft;
-        if (ls_write(c->upfd, buf, w) != (long)w) {
+        if (c->mode == MODE_HTTP) want = HEAD_BUF - c->hlen;
+        else if (c->mode == MODE_WS) want = WS_BUF - c->wlen;
+        else want = IO_BUF;
+        if (want == 0 || want > IO_BUF) want = IO_BUF;
+
+        n = (int)recv(c->fd, buf, want, 0);
+
+        if (n == 0) {
             client_close(c);
             return;
         }
-        c->upleft -= (uint64_t)w;
-        if (c->upleft == 0) finish_upload(c);
-        return;
-    }
-
-    if (c->mode == MODE_WS) {
-        if (c->wlen + (size_t)n > WS_BUF) {
+        if (n < 0) {
+            if (would_block()) return;
             client_close(c);
             return;
         }
-        memcpy(c->wbuf + c->wlen, buf, (size_t)n);
-        c->wlen += (size_t)n;
-        ws_consume(c);
-        return;
-    }
 
-    if (c->hlen + (size_t)n > HEAD_BUF) {
-        client_close(c);
-        return;
-    }
-    memcpy(c->hbuf + c->hlen, buf, (size_t)n);
-    c->hlen += (size_t)n;
-    c->hbuf[c->hlen] = '\0';
-    for (;;) {
-        long used = process_request(c, c->hbuf, c->hlen);
-        if (used < 0) {
-            client_close(c);
-            return;
+        if (c->mode == MODE_UPLOAD) {
+            size_t w = (size_t)n;
+            if ((uint64_t)w > c->upleft) w = (size_t)c->upleft;
+            if (ls_write(c->upfd, buf, w) != (long)w) {
+                client_close(c);
+                return;
+            }
+            c->upleft -= (uint64_t)w;
+            if (c->upleft == 0) {
+                finish_upload(c);
+                return;
+            }
+        } else if (c->mode == MODE_WS) {
+            if (c->wlen + (size_t)n > WS_BUF) {
+                client_close(c);
+                return;
+            }
+            memcpy(c->wbuf + c->wlen, buf, (size_t)n);
+            c->wlen += (size_t)n;
+            ws_consume(c);
+        } else {
+            /* HTTP：先攒进头缓冲再解析。process_request 会一次性吃掉整个缓冲区
+             * （连同跟着头一起来的 body），所以正常情况下 hbuf 会被清空。 */
+            if (c->hlen + (size_t)n > HEAD_BUF) {
+                client_close(c);
+                return;
+            }
+            memcpy(c->hbuf + c->hlen, buf, (size_t)n);
+            c->hlen += (size_t)n;
+            c->hbuf[c->hlen] = '\0';
+            for (;;) {
+                long used = process_request(c, c->hbuf, c->hlen);
+                if (used < 0) {
+                    client_close(c);
+                    return;
+                }
+                if (used == 0) return;   /* 头还没收全，等下一次可读 */
+                memmove(c->hbuf, c->hbuf + used, c->hlen - (size_t)used);
+                c->hlen -= (size_t)used;
+                c->hbuf[c->hlen] = '\0';
+                if (c->hlen == 0) return;
+                if (c->mode != MODE_HTTP) return;
+            }
         }
-        if (used == 0) return;
-        memmove(c->hbuf, c->hbuf + used, c->hlen - (size_t)used);
-        c->hlen -= (size_t)used;
-        c->hbuf[c->hlen] = '\0';
-        if (c->hlen == 0) return;
-        if (c->mode != MODE_HTTP) return;
+
+        /* 没读满说明 socket 基本空了，不必再试 */
+        if ((size_t)n < want) return;
     }
 }
 
