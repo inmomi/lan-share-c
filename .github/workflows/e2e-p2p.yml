@@ -76,13 +76,21 @@ jobs:
 
   # 无损 loopback 上 4 条 lane 就见到共享瓶颈（包速率/CPU），加 lane 反而略降。
   # 但用户的真实链路是 Wi-Fi：有丢包时每关联的拥塞窗口会坍缩，多关联是对抗
-  # 丢包的手段——无损环境模拟不出这个。这里用 tc netem 给 loopback 加
-  # 20ms 延迟 + 2% 丢包（模拟偏差的 Wi-Fi），让 TCP 基线和各 lane 数在
-  # 同等损伤下正面对比，直接回答"用户的链路上几条 lane 最优"。
+  # 丢包的手段——无损环境模拟不出这个。这里用 tc netem 给 loopback 加损伤，
+  # 让 TCP 基线和各 lane 数在同等损伤下正面对比。
+  # 实测（20ms + 2%）：TCP 4.5~7.2 MB/s，P2P 1 条≈0、4 条 0.9、8 条 1.6、
+  # 16 条 2.8 MB/s——聚合随 lane 数线性增长，丢包下多关联就是硬道理。
   sweep-lossy:
-    name: lane 扫描（20ms + 2% 丢包）
+    name: lane 扫描（${{ matrix.delay }}ms + ${{ matrix.loss }}% 丢包）
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # 两档损伤：2% 是偏差的 Wi-Fi，0.5% 是普通 Wi-Fi，把用户的可能区间夹住
+        include:
+          - { delay: 20, loss: 2 }
+          - { delay: 5, loss: 0.5 }
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -98,12 +106,11 @@ jobs:
       # 两个浏览器在同主机，host candidate 走本机 IP，Linux 本地交付经过 lo，
       # 所以 netem 挂在 lo 上即可。信令（127.0.0.1 TCP）同样受影响——但这正是
       # 想要的：TCP 基线也在同等损伤下测，对比才公平。
-      - name: 给 loopback 加损伤
+      - name: 给 loopback 加损伤（${{ matrix.delay }}ms + ${{ matrix.loss }}%）
         run: |
           set -e
-          sudo tc qdisc add dev lo root netem delay 20ms loss 2%
+          sudo tc qdisc add dev lo root netem delay ${{ matrix.delay }}ms loss ${{ matrix.loss }}%
           tc qdisc show dev lo
-          ping -c 5 127.0.0.1 | tail -2
 
       - name: 安装 / 定位 Chrome
         run: |
@@ -128,5 +135,5 @@ jobs:
           echo "CHROME_PATH=$FOUND" >> "$GITHUB_ENV"
           "$FOUND" --version
 
-      - name: P2P 扫描（同等丢包下：TCP 基线 vs 1/2/4/8/16 条 lane）
-        run: node tools/p2p-e2e.js --server ./lan-share --file-mb 16 --timeout 300 --label lossy --sweep 1,2,4,8,16 --sweep-mb 16
+      - name: P2P 扫描（同等丢包下：TCP 基线 vs 1/2/4/8/16/32 条 lane）
+        run: node tools/p2p-e2e.js --server ./lan-share --file-mb 16 --timeout 300 --label lossy${{ matrix.loss }} --sweep 1,2,4,8,16,32 --sweep-mb 16
