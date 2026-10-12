@@ -8,11 +8,19 @@ on:
     branches: [main]
   workflow_dispatch:
 
+env:
+  # zig 自带 musl，一次下载就能覆盖 x86_64/aarch64/arm/mips 全部目标，
+  # 静态链接后拷到路由器上直接可跑。
+  # 早先用 musl.cc 的交叉工具链，但 GitHub Runner 连不上 musl.cc（curl 28 超时），
+  # zig 的发布包托管在 GitHub Releases，Runner 一定能取到。
+  ZIG_VERSION: '0.15.1'
+
 jobs:
   # ---------------------------------------------------------------- 功能测试
   test:
     name: 功能测试 (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -27,6 +35,11 @@ jobs:
       - name: 编译
         run: cc -O2 -std=c99 -Wall -o lan-share lan_share.c
 
+      - name: 检查可执行文件
+        run: |
+          ./lan-share -h || true
+          ls -la lan-share
+
       # 测试脚本会自己拉起服务、跑完 38 项断言再关掉它
       - name: 运行端到端测试
         env:
@@ -39,97 +52,112 @@ jobs:
   build:
     name: 编译 ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         include:
-          # ---- 桌面 / 服务器 ----
-          - name: linux-x86_64
-            os: ubuntu-latest
-            toolchain: x86_64-linux-musl
-            cc: x86_64-linux-musl-gcc
-            cflags: -static
-            out: lan-share-x86_64-linux
-
-          - name: linux-aarch64
-            os: ubuntu-latest
-            toolchain: aarch64-linux-musl
-            cc: aarch64-linux-musl-gcc
-            cflags: -static
-            out: lan-share-aarch64-linux
-
+          # ---- 桌面 / 服务器（Runner 原生编译）----
           - name: macos-x86_64
-            os: macos-13          # Intel runner，原生产出 x86_64
+            os: macos-13            # Intel runner，原生产出 x86_64
+            kind: unix-native
             cc: clang
             cflags: -arch x86_64
             out: lan-share-x86_64-macos
 
           - name: macos-arm64
-            os: macos-14          # Apple Silicon runner
+            os: macos-14            # Apple Silicon runner
+            kind: unix-native
             cc: clang
             cflags: -arch arm64
             out: lan-share-arm64-macos
 
           - name: windows-x86_64
             os: windows-latest
+            kind: msys2
             out: lan-share-x86_64-windows.exe
 
-          # ---- 路由器 / OpenWrt（静态链接 musl，软浮点与硬浮点各一份）----
+          # ---- Linux 桌面 / 服务器（zig + musl 静态）----
+          - name: linux-x86_64
+            os: ubuntu-latest
+            kind: zig
+            target: x86_64-linux-musl
+            out: lan-share-x86_64-linux
+
+          - name: linux-aarch64
+            os: ubuntu-latest
+            kind: zig
+            target: aarch64-linux-musl
+            out: lan-share-aarch64-linux
+
+          # ---- 路由器 / OpenWrt ----
+          # mipsel 覆盖 MT7620/MT7621/MT7628、MT7688 等联发科方案；
+          # 软浮点（musleabi）与硬浮点（musleabihf）各出一份，按 CPU 选。
           - name: mipsel-softfloat
             os: ubuntu-latest
-            toolchain: mipsel-linux-muslsf
-            cc: mipsel-linux-muslsf-gcc
-            cflags: -static
+            kind: zig
+            target: mipsel-linux-musleabi
             out: lan-share-mipsel-sf-linux
 
           - name: mipsel-hardfloat
             os: ubuntu-latest
-            toolchain: mipsel-linux-musl
-            cc: mipsel-linux-musl-gcc
-            cflags: -static
+            kind: zig
+            target: mipsel-linux-musleabihf
             out: lan-share-mipsel-linux
 
+          # 大端 MIPS：部分老博通（BCM63xx/BCM47xx）与 Atheros AR71xx 早期型号
           - name: mips-softfloat
             os: ubuntu-latest
-            toolchain: mips-linux-muslsf
-            cc: mips-linux-muslsf-gcc
-            cflags: -static
+            kind: zig
+            target: mips-linux-musleabi
             out: lan-share-mips-sf-linux
 
+          # 64 位 ARM 路由器：斐讯 N1、瑞芯微、部分高通 IPQ 方案
           - name: aarch64-router
             os: ubuntu-latest
-            toolchain: aarch64-linux-musl
-            cc: aarch64-linux-musl-gcc
-            cflags: -static
+            kind: zig
+            target: aarch64-linux-musl
             out: lan-share-aarch64-router-linux
 
+          # 32 位 ARM 硬浮点：BCM27xx、i.MX6、大多数现代 ARM 路由器
           - name: armv7l-hardfloat
             os: ubuntu-latest
-            toolchain: armv7l-linux-musleabihf
-            cc: armv7l-linux-musleabihf-gcc
-            cflags: -static
+            kind: zig
+            target: arm-linux-musleabihf
             out: lan-share-armv7l-linux
 
+          # 32 位 ARM 软浮点：老款 ARM9/ARM11 路由器
           - name: arm-softfloat
             os: ubuntu-latest
-            toolchain: arm-linux-musleabi
-            cc: arm-linux-musleabi-gcc
-            cflags: -static
+            kind: zig
+            target: arm-linux-musleabi
             out: lan-share-arm-sf-linux
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: 安装 musl 交叉工具链 (${{ matrix.toolchain }})
-        if: matrix.toolchain != ''
+      - name: 安装 zig ${{ env.ZIG_VERSION }}
+        if: matrix.kind == 'zig'
         run: |
           set -e
-          curl -fsSL -o toolchain.tgz "https://musl.cc/${{ matrix.toolchain }}-cross.tgz"
-          tar xzf toolchain.tgz
-          echo "$PWD/${{ matrix.toolchain }}-cross/bin" >> "$GITHUB_PATH"
+          cd "$RUNNER_TEMP"
+          curl -fsSL -o zig.tar.xz \
+            "https://github.com/ziglang/zig/releases/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+          tar xf zig.tar.xz
+          echo "$RUNNER_TEMP/zig-x86_64-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
+
+      - name: 确认 zig 与目标可用
+        if: matrix.kind == 'zig'
+        run: |
+          set -e
+          zig version
+          # 早一步暴露"该目标没有 libc"这类问题，免得编译到一半才失败
+          zig libc -target "${{ matrix.target }}" >/dev/null 2>&1 \
+            && echo "libc 可用: ${{ matrix.target }}" \
+            || echo "::warning::zig 未列出 ${{ matrix.target }} 的 libc，继续尝试编译"
 
       - name: 安装 MinGW (Windows)
-        if: runner.os == 'Windows'
+        if: matrix.kind == 'msys2'
         uses: msys2/setup-msys2@v2
         with:
           msystem: MINGW64
@@ -137,21 +165,36 @@ jobs:
           update: false
 
       - name: 编译 (Windows)
-        if: runner.os == 'Windows'
+        if: matrix.kind == 'msys2'
         shell: msys2 {0}
         run: |
           gcc -Os -std=c99 -Wall -static \
             -o "${{ matrix.out }}" lan_share.c -lws2_32
           file "${{ matrix.out }}"
+          ls -la "${{ matrix.out }}"
 
-      - name: 编译 (Unix)
-        if: runner.os != 'Windows'
+      - name: 编译 (macOS 原生)
+        if: matrix.kind == 'unix-native'
         run: |
           set -e
           ${{ matrix.cc }} -Os -std=c99 -Wall ${{ matrix.cflags }} \
             -o "${{ matrix.out }}" lan_share.c
+          file "${{ matrix.out }}"
+          ls -la "${{ matrix.out }}"
+
+      - name: 编译 (zig 交叉 + musl 静态)
+        if: matrix.kind == 'zig'
+        run: |
+          set -e
+          zig cc -target "${{ matrix.target }}" -static -Os -std=c99 -Wall \
+            -o "${{ matrix.out }}" lan_share.c
           file "${{ matrix.out }}" 2>/dev/null || true
           ls -la "${{ matrix.out }}"
+          # 静态产物不应再依赖动态链接器，否则拷到 OpenWrt 上跑不起来
+          if file "${{ matrix.out }}" | grep -q "dynamically linked"; then
+            echo "::error::${{ matrix.out }} 仍是动态链接，静态化失败"
+            exit 1
+          fi
 
       - uses: actions/upload-artifact@v4
         with:
@@ -165,6 +208,7 @@ jobs:
     needs: [test, build]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: write
 

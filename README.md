@@ -49,14 +49,26 @@ make CC=mipsel-openwrt-linux-gcc STATIC=-static
 mipsel-openwrt-linux-strip lan-share        # 可再小 30%
 ```
 
-没有 OpenWrt SDK 也能编译，[musl.cc](https://musl.cc) 提供预编译的 musl 交叉工具链：
+没有 OpenWrt SDK 也能编译。**zig 自带 musl**，一个 40 MB 的下载就能覆盖 x86_64 / aarch64 / arm / mips 全部目标，CI 用的就是它：
 
 ```bash
-curl -fsSL -o tc.tgz https://musl.cc/mipsel-linux-muslsf-cross.tgz
-tar xzf tc.tgz
-export PATH="$PWD/mipsel-linux-muslsf-cross/bin:$PATH"
-make CC=mipsel-linux-muslsf-gcc STATIC=-static
+zig cc -target mipsel-linux-musleabi -static -Os -std=c99 -o lan-share lan_share.c
 ```
+
+对应的 zig target 一览：
+
+| 产物 | zig target |
+| --- | --- |
+| `lan-share-x86_64-linux` | `x86_64-linux-musl` |
+| `lan-share-aarch64-linux` | `aarch64-linux-musl` |
+| `lan-share-mipsel-sf-linux` | `mipsel-linux-musleabi` |
+| `lan-share-mipsel-linux` | `mipsel-linux-musleabihf` |
+| `lan-share-mips-sf-linux` | `mips-linux-musleabi` |
+| `lan-share-aarch64-router-linux` | `aarch64-linux-musl` |
+| `lan-share-armv7l-linux` | `arm-linux-musleabihf` |
+| `lan-share-arm-sf-linux` | `arm-linux-musleabi` |
+
+注意 MIPS 必须写全 ABI（`musleabi` / `musleabihf`）。zig 不接受裸 `mipsel-linux-musl`，会报 `unable to provide libc`。
 
 `-Os` 比 `-O2` 更省空间，小 flash 设备优先用它（Makefile 默认已是 `-Os`）。
 

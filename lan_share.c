@@ -312,6 +312,12 @@ static int json_get_str(const char *json, const char *key, char *out, size_t out
 #  include <sys/types.h>
 #  include <sys/stat.h>
 #  include <sys/socket.h>
+/* fd_set / FD_ZERO / FD_SET / struct timeval 来自 sys/select.h。
+ * 必须显式包含：winsock2.h 会顺带提供它们（Windows 分支因此不受影响），
+ * 某些 libc 的 sys/socket.h 也会间接引入，但新版 glibc 已经不再间接包含，
+ * 漏掉就会在 Linux 上报 "unknown type name 'fd_set'"。 */
+#  include <sys/select.h>
+#  include <sys/time.h>
 #  include <netinet/in.h>
 #  include <netinet/tcp.h>
 #  include <arpa/inet.h>
