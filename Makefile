@@ -17,6 +17,9 @@ CFLAGS  ?= -Os -std=c99 -Wall
 STATIC  ?=
 TARGET   = lan-share
 SRC      = lan_share.c
+WEBHDR   = web_assets.h
+WEBGEN   = tools/embed-web.js
+NODE    ?= node
 WEBDIR   = public
 UPLOADDIR= uploads
 
@@ -39,11 +42,19 @@ TEST_CMD   = SPAWN="./$(TARGET) -p $(TEST_PORT) -d $(UPLOADDIR) -w $(WEBDIR)" \
              TRAVERSAL_PROBE=$(SRC) \
              node test.js
 
-.PHONY: all test clean strip
+.PHONY: all test clean strip webgen
 
 all: $(TARGET)
 
-$(TARGET): $(SRC)
+# 前端被编进二进制，所以只把可执行文件拷到路由器上也能打开页面。
+# 前端改了要重新生成；web_assets.h 依赖 public/ 里的三个文件的修改时间。
+$(WEBHDR): $(WEBGEN) $(WEBDIR)/index.html $(WEBDIR)/app.js $(WEBDIR)/style.css
+	$(NODE) $(WEBGEN)
+
+webgen:
+	$(NODE) $(WEBGEN)
+
+$(TARGET): $(SRC) $(WEBHDR)
 	$(CC) $(CFLAGS) -o $@ $(SRC) $(STATIC) $(LDFLAGS)
 
 test: $(TARGET)

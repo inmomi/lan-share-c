@@ -1,8 +1,10 @@
 # LAN Share — C 版
 
-为小内存嵌入式设备（路由器）写的局域网文件分享服务。**只依赖 libc**，静态链接后约 70 KB，常驻内存约 1.5 MB，在 128 MB 内存、2.6/5.4 内核的老路由器上也能跑。
+为小内存嵌入式设备（路由器）写的局域网文件分享服务。**只依赖 libc**，静态链接后约 130 KB，常驻内存约 1.5 MB，在 128 MB 内存、2.6/5.4 内核的老路由器上也能跑。
 
 一台机器跑服务，其他设备用浏览器打开即可，不用装任何东西。
+
+**前端页面已编译进二进制**。`public/` 只是开发时的源文件，**部署时不用一起拷**——把单独一个 `lan-share` 丢到路由器上，`/` 就能正常打开。
 
 > 想要 Node 实现（开发调试、桌面长期运行）？看 [Node 版](../lan-share-node)。
 
@@ -12,6 +14,8 @@
 | --- | --- | --- |
 | **设备直传** | 浏览器之间 WebRTC DataChannel 点对点 | 当场发文件给某台设备，服务端不接触文件内容 |
 | **服务端文件库** | 上传落盘到服务端磁盘，再下载 | 存下来慢慢取，或发给不在线的人 |
+
+两条路径都支持断点续传：直传中断后重发会接着上次的字节偏移继续；文件库上传按偏移续写 `.part` 半成品；下载走 HTTP Range，浏览器原生续传。设备名会按 IP 记住并在浏览器本地存一份，刷新页面、重连都不会变回随机名。
 
 ## 直接下载预编译二进制
 
@@ -70,24 +74,31 @@ zig cc -target arm-linux-musleabihf -static -Os -std=c99 -o lan-share lan_share.
 
 ## 部署到路由器
 
+只拷二进制就够了，前端在它里面：
+
 ```bash
 scp lan-share root@192.168.1.1:/usr/bin/lan-share
-scp -r public root@192.168.1.1:/usr/share/lan-share/
 ssh root@192.168.1.1 chmod +x /usr/bin/lan-share
 ```
 
 运行：
 
 ```bash
-lan-share -p 8080 -d /mnt/sda1/share -w /usr/share/lan-share
+lan-share -p 8080 -d /mnt/sda1/share
 ```
 
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
 | `-p` | `8080` | 监听端口 |
 | `-d` | `./uploads` | 文件库落盘目录（**建议指到挂载的 U 盘/硬盘**） |
-| `-w` | `./public` | 前端静态文件目录 |
+| `-w` | `./public` | 前端静态文件目录，**可省略**，找不到时自动用二进制里内嵌的页面 |
 | `-h` | — | 显示帮助 |
+
+想改前端再重新内嵌（需要 Node，改完重新 `make`）：
+
+```bash
+node tools/embed-web.js        # public/ -> web_assets.h
+```
 
 ### 开机自启（OpenWrt）
 
@@ -101,8 +112,7 @@ STOP=10
 start() {
     service_start /usr/bin/lan-share \
         -p 8080 \
-        -d /mnt/sda1/share \
-        -w /usr/share/lan-share
+        -d /mnt/sda1/share
 }
 
 stop() {
@@ -128,7 +138,15 @@ chmod +x /etc/init.d/lan_share
 make test
 ```
 
-`test.js` 会自己拉起服务、跑完 38 项断言再关掉它，覆盖：静态托管、目录穿越防护（明文与编码两种）、上传/下载/删除、中文与特殊文件名往返、同名自动重命名、5 MB 文件逐字节完整性、WebSocket 信令全链路（设备发现、改名广播、信令转发、无效目标回执、断线收缩）。
+`test.js` 会自己拉起服务、跑完 57 项断言再关掉它，覆盖：
+
+- 静态托管、目录穿越防护（明文与编码两种）
+- 上传 / 下载 / 删除、中文与特殊文件名往返、同名自动重命名
+- 5 MB 文件逐字节完整性
+- WebSocket 信令全链路（设备发现、改名广播、信令转发、无效目标回执、断线收缩）
+- **上传断点续传**：分块写入、未完结不进文件库、`/api/upload-status` 查进度、续传后内容逐字节一致、跳过未上传区域返回 409
+- **下载 Range**：`Accept-Ranges: bytes`、206 + `Content-Range`、开区间与闭区间内容校验、越界返回 416
+- **设备名记忆**：改名回执、断开重连后名字不变
 
 需要本机有 Node ≥ 21（仅用于跑测试，运行服务不需要）。也可以指向已跑起来的服务：
 
@@ -141,6 +159,8 @@ CI 在 Ubuntu 和 macOS 上跑完整功能测试，并编译 Windows / Linux x64
 ## 实现说明
 
 - **只依赖 libc**。WebSocket 需要的 SHA-1 与 Base64 都在文件内实现，不链接 OpenSSL。
+- **前端内嵌进二进制**。`tools/embed-web.js` 把 `public/` 的 HTML/JS/CSS 转成 `web_assets.h` 字节数组，启动时先找磁盘上的 `-w` 目录、找不到就回退到内嵌副本。这样拷一个二进制到路由器（`public/` 没跟着过去）也不会 404。改了前端记得重新生成，CI 每轮都会自己跑一遍并断言「无 `public/` 目录时 `/` 仍返回 200」。
+- **输出缓冲是追加而不是覆盖**。单线程 `select` 循环里 `send` 只是写进内核缓冲，真正 flush 往往在下一轮，连续两次排队（改名回执 `self` + `peers` 广播）会把前一条整帧丢掉。`queue_mem()` 因此先把未发送的部分挪到开头再追加。
 - **不配 STUN/TURN**。纯内网场景下 WebRTC 用本机内网 IP 的 host candidate 就能直连，完全离线可用。
 - **响应头与文件体分流**。下载时 HTTP 头走高优先级缓冲先发出，再流式读盘，避免两者互相覆盖。
 - **UTF-8 文件名在 Windows 上走宽字符 API**。Windows 的 ANSI 版 `open`/`fopen` 会拿当前代码页（简体中文是 GBK 936）解释 UTF-8 字节，只要恰好拼出非法的 GBK 双字节组合就失败——症状很随机，例如"最.txt"能建而"中.txt"不能。所以 Windows 分支一律用 `_wopen` / `_wfopen` / `_wstat64` / `FindFirstFileW`。Linux 下路径是原始字节、内核不解释编码，无需转换。
@@ -152,7 +172,9 @@ CI 在 Ubuntu 和 macOS 上跑完整功能测试，并编译 Windows / Linux x64
 | --- | --- | --- |
 | GET | `/api/files` | 文件列表，`{ files: [{name,size,sizeText,mtime}], total }` |
 | POST | `/api/upload?name=xxx` | 请求体为原始文件流，落盘；同名自动追加 `(1)` |
-| GET | `/api/download?name=xxx` | 下载，带 UTF-8 文件名的 `Content-Disposition` |
+| POST | `/api/upload?name=xxx&size=N&offset=M` | 分块上传。先写 `uploads/.lanshare-parts/<sha1(name\|size)>.part`，收满 `size` 字节才改名进文件库；返回 `done:false,received:N` 表示还没完。跳过未上传区域返回 409 |
+| GET | `/api/upload-status?name=xxx&size=N` | 查询该半成品已收字节数 `{ received }`，续传前用它定位起点 |
+| GET | `/api/download?name=xxx` | 下载，带 UTF-8 文件名的 `Content-Disposition`。支持 `Range: bytes=...`，回 206 + `Content-Range`，越界回 416，始终带 `Accept-Ranges: bytes` |
 | DELETE | `/api/files?name=xxx` | 删除 |
 | GET | `/api/info` | 在线设备数、存储目录、`engine:"c"` |
 

@@ -35,6 +35,10 @@ jobs:
         with:
           node-version: '22'
 
+      # 前端被编进二进制，必须先生成 web_assets.h，否则编译直接失败
+      - name: 生成内嵌前端资源
+        run: node tools/embed-web.js
+
       - name: 编译
         run: cc -O2 -std=c99 -Wall -o lan-share lan_share.c
 
@@ -43,13 +47,33 @@ jobs:
           ./lan-share -h || true
           ls -la lan-share
 
-      # 测试脚本会自己拉起服务、跑完 38 项断言再关掉它
+      # 测试脚本会自己拉起服务、跑完 57 项断言再关掉它
       - name: 运行端到端测试
         env:
           SPAWN: ./lan-share -p 8080 -d ./uploads -w ./public
           BASE: http://127.0.0.1:8080
           TRAVERSAL_PROBE: lan_share.c
         run: node test.js
+
+      # 路由器上通常只有二进制一个文件，旁边没有 public/。
+      # 前端必须已经编进去，否则打开页面就是 404 Not Found。
+      - name: 单文件可用性（无 public 目录也能打开页面）
+        run: |
+          set -e
+          ./lan-share -p 8097 -d ./uploads-solo -w ./no-such-dir >/dev/null 2>&1 &
+          SRV=$!
+          code=000
+          for i in $(seq 1 40); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8097/ || echo 000)
+            [ "$code" = "200" ] && break
+            sleep 0.3
+          done
+          kill $SRV 2>/dev/null || true
+          echo "无 public 目录时 GET / -> $code"
+          if [ "$code" != "200" ]; then
+            echo "::error::内嵌前端未生效，只拷二进制到路由器会打不开页面"
+            exit 1
+          fi
 
   # ------------------------------------------------------------ 多平台编译
   build:
@@ -87,6 +111,13 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # 前端被编进二进制，必须先生成 web_assets.h，否则编译直接失败
+      - name: 生成内嵌前端资源
+        run: node tools/embed-web.js
 
       - name: 安装 zig ${{ env.ZIG_VERSION }}
         if: matrix.kind == 'zig'
@@ -115,6 +146,30 @@ jobs:
           file "${{ matrix.out }}"
           ls -la "${{ matrix.out }}"
 
+      # 只编译不运行，等于没测。这里把刚编出来的 exe 真跑一遍，
+      # 确认拷到一台干净机器上（没有 public/）打开就是页面而不是 404。
+      - name: 实机冒烟 (Windows)
+        if: matrix.kind == 'msys2'
+        shell: pwsh
+        run: |
+          $exe = "${{ matrix.out }}"
+          $p = Start-Process -FilePath ".\$exe" -ArgumentList "-p","8098","-d",".\uploads-solo","-w",".\no-such-dir" -PassThru -WindowStyle Hidden
+          $code = '000'
+          for ($i = 0; $i -lt 40; $i++) {
+            Start-Sleep -Milliseconds 300
+            try {
+              $r = Invoke-WebRequest -Uri "http://127.0.0.1:8098/" -UseBasicParsing -TimeoutSec 3
+              $code = [string]([int]$r.StatusCode)
+              if ($code -eq '200') { break }
+            } catch {}
+          }
+          if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force }
+          Write-Host "Windows 产物 GET / -> $code"
+          if ($code -ne '200') {
+            Write-Host "::error::$exe 跑不起来或打不开页面"
+            exit 1
+          }
+
       - name: 编译 (Linux / OpenWrt，zig + musl 静态)
         if: matrix.kind == 'zig'
         run: |
@@ -127,6 +182,39 @@ jobs:
           # 静态产物不应再依赖动态链接器，否则拷到 OpenWrt 上跑不起来
           if file "${{ matrix.out }}" | grep -q "dynamically linked"; then
             echo "::error::${{ matrix.out }} 仍是动态链接，静态化失败"
+            exit 1
+          fi
+
+      # 路由器 ARM/MIPS 没法在 x86 Runner 上直接跑，用 qemu-user 把刚编出来的
+      # 二进制真跑一遍：起服务、请求首页和 /api/info，确认它不是"能编译但不能运行"。
+      - name: 实机冒烟 (Linux / 路由器目标，qemu)
+        if: matrix.kind == 'zig'
+        run: |
+          set -e
+          BIN="./${{ matrix.out }}"
+          case "${{ matrix.target }}" in
+            x86_64-linux-musl)    RUNNER="" ;;
+            aarch64-linux-musl)   sudo apt-get update -qq
+                                  sudo apt-get install -y -qq qemu-user-static
+                                  RUNNER="qemu-aarch64-static" ;;
+            arm-linux-musleabihf) sudo apt-get update -qq
+                                  sudo apt-get install -y -qq qemu-user-static
+                                  RUNNER="qemu-arm-static" ;;
+            *) echo "::error::未覆盖的 target"; exit 1 ;;
+          esac
+          $RUNNER "$BIN" -p 8098 -d ./uploads-qemu -w ./no-such-dir >/dev/null 2>&1 &
+          SRV=$!
+          code=000; info=000
+          for i in $(seq 1 40); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8098/ || echo 000)
+            [ "$code" = "200" ] && break
+            sleep 0.3
+          done
+          info=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8098/api/info || echo 000)
+          kill $SRV 2>/dev/null || true
+          echo "${{ matrix.out }} 在 ${RUNNER:-native} 下: GET / -> $code, /api/info -> $info"
+          if [ "$code" != "200" ] || [ "$info" != "200" ]; then
+            echo "::error::${{ matrix.out }} 交叉编译产物跑不起来"
             exit 1
           fi
 

@@ -16,6 +16,13 @@
  * 只依赖 libc。WebSocket 需要的 SHA-1 与 Base64 均在本文件内实现，不链接 OpenSSL。
  */
 
+/* 必须在所有头文件之前：32 位路由器（MIPS/ARM）上让 off_t 与 fseek/stat
+ * 走 64 位版本，否则下载超过 2GB 的文件时 Range 偏移会算错。
+ * 对本程序唯一的代价是结构体略大，可以忽略。 */
+#ifndef _FILE_OFFSET_BITS
+#  define _FILE_OFFSET_BITS 64
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -25,6 +32,11 @@
 #include <time.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+
+/* 内嵌的前端资源（index.html / app.js / style.css 的字节数组）。
+ * 由 tools/embed-web.js 生成，make 会自动重新生成。
+ * 没有它，只把二进制拷到路由器上打开页面会得到 404 Not Found。 */
+#include "web_assets.h"
 
 /* Windows 的 SOCKET 句柄值远大于 Linux 的 fd，默认 FD_SETSIZE=64 会让
  * FD_SET() 写越界。这里在任何 winsock 头文件之前放大它。Linux 下无害。 */
@@ -325,9 +337,6 @@ static int json_get_str(const char *json, const char *key, char *out, size_t out
 #  define ls_write(fd,b,n)  write((fd),(b),(n))
 #  define ls_closefile(fd)  close(fd)
 /* POSIX 下路径就是原始字节，内核不解释编码，直接用窄字符版本即可 */
-static int ls_openwrite(const char *p) {
-    return open(p, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-}
 static FILE *ls_fopen_rb(const char *p) {
     return fopen(p, "rb");
 }
@@ -390,6 +399,13 @@ typedef struct {
     char upname[PATH_MAX_LOCAL];
     int pending_hello;   /* 握手响应发完后还需补发一次 peers 广播 */
 
+    /* 分块上传（断点续传）状态。整包上传时这几个字段保持 0。 */
+    int up_chunked;              /* 1 = 本次是分块上传 */
+    uint64_t up_size;            /* 该文件应有的完整大小 */
+    uint64_t up_base;            /* 本次请求之前的已收字节（offset） */
+    uint64_t up_reqlen;          /* 本次请求体的字节数 */
+    char up_final[NAME_MAX * 4]; /* 收满后要落成的文件名 */
+
     char pend[IO_BUF];
     size_t pendlen;
 
@@ -404,6 +420,48 @@ static int g_port = 8080;
 
 static const char *ADJ[] = { "蓝色", "银色", "安静", "敏捷", "温暖", "明亮", "沉稳", "轻盈", "清澈", "柔和" };
 static const char *ANI[] = { "海豚", "猎鹰", "水獭", "狐狸", "鲸鱼", "山猫", "燕子", "小鹿", "海豹", "苍鹭" };
+
+/* 设备名记忆表：按 IP 记住上次用过的名字。
+ *
+ * 每次新建连接都会随机取名，没有这层记忆的话浏览器刷新一次就换一个名字，
+ * 对端根本认不出这台机器。客户端另有 localStorage 记一层，这里是服务端兜底
+ * （换浏览器、清缓存、隐私模式下仍然有效）。
+ *
+ * 只存 32 条，满了覆盖第一条——设备名不是关键数据，丢了重新随机即可。 */
+#define NAME_MEM_MAX 32
+typedef struct {
+    char ip[48];
+    char name[NAME_MAX];
+} ls_name_mem;
+static ls_name_mem g_name_mem[NAME_MEM_MAX];
+
+static const char *name_mem_get(const char *ip) {
+    int i;
+    for (i = 0; i < NAME_MEM_MAX; i++) {
+        if (g_name_mem[i].ip[0] != '\0' && strcmp(g_name_mem[i].ip, ip) == 0) {
+            return g_name_mem[i].name;
+        }
+    }
+    return NULL;
+}
+
+static void name_mem_set(const char *ip, const char *name) {
+    int i;
+    int free_slot = -1;
+    for (i = 0; i < NAME_MEM_MAX; i++) {
+        if (g_name_mem[i].ip[0] == '\0') {
+            if (free_slot < 0) free_slot = i;
+            continue;
+        }
+        if (strcmp(g_name_mem[i].ip, ip) == 0) {
+            snprintf(g_name_mem[i].name, sizeof g_name_mem[i].name, "%s", name);
+            return;
+        }
+    }
+    if (free_slot < 0) free_slot = 0;
+    snprintf(g_name_mem[free_slot].ip, sizeof g_name_mem[free_slot].ip, "%s", ip);
+    snprintf(g_name_mem[free_slot].name, sizeof g_name_mem[free_slot].name, "%s", name);
+}
 
 /* ==========================================================================
  * 基础 IO 帮助
@@ -443,15 +501,6 @@ static void ls_wide_to_utf8(const wchar_t *w, char *out, size_t outsz) {
     if (n <= 0) out[0] = '\0';
 }
 
-static int ls_openwrite(const char *p) {
-    wchar_t *w = ls_utf8_to_wide(p);
-    int fd;
-    if (!w) return -1;
-    fd = _wopen(w, _O_WRONLY | _O_CREAT | _O_TRUNC | _O_BINARY, 0644);
-    free(w);
-    return fd;
-}
-
 static FILE *ls_fopen_rb(const char *p) {
     wchar_t *w = ls_utf8_to_wide(p);
     FILE *f;
@@ -470,6 +519,57 @@ static int ls_remove_file(const char *p) {
     return r;
 }
 #endif
+
+/* 打开文件用于写入并定位到 offset。
+ * keep=0：从零重写（整包上传），keep=1：保留已落盘内容（分块续传）。
+ * 续传的关键就在这里——不能在续写时截断，否则已收的部分全没了。 */
+static int ls_openwrite_at(const char *p, uint64_t offset, int keep) {
+    int fd;
+#ifdef _WIN32
+    wchar_t *w = ls_utf8_to_wide(p);
+    if (!w) return -1;
+    fd = _wopen(w, _O_WRONLY | _O_CREAT | (keep ? 0 : _O_TRUNC) | _O_BINARY, 0644);
+    free(w);
+#else
+    fd = open(p, O_WRONLY | O_CREAT | (keep ? 0 : O_TRUNC), 0644);
+#endif
+    if (fd < 0) return -1;
+    if (offset > 0) {
+#ifdef _WIN32
+        if (_lseeki64(fd, (__int64)offset, SEEK_SET) < 0) {
+            ls_closefile(fd);
+            return -1;
+        }
+#else
+        if (lseek(fd, (off_t)offset, SEEK_SET) < 0) {
+            ls_closefile(fd);
+            return -1;
+        }
+#endif
+    }
+    return fd;
+}
+
+/* 收满之后把 .part 半成品改名成正式文件。用 rename 而不是复制，
+ * 路由器上 flash 慢，能省一次整文件读写。 */
+static int ls_rename_file(const char *from, const char *to) {
+#ifdef _WIN32
+    wchar_t *wf = ls_utf8_to_wide(from);
+    wchar_t *wt = ls_utf8_to_wide(to);
+    int r;
+    if (!wf || !wt) {
+        free(wf);
+        free(wt);
+        return -1;
+    }
+    r = _wrename(wf, wt);
+    free(wf);
+    free(wt);
+    return r;
+#else
+    return rename(from, to);
+#endif
+}
 
 static void set_nonblock(int fd) {
 #ifdef _WIN32
@@ -510,6 +610,24 @@ static void out_reset(ls_client *c) {
 }
 
 static void queue_mem(ls_client *c, const char *data, size_t len) {
+    /* 上一段还没发完就直接再来一段？必须追加，不能覆盖。
+     * 单线程 select 循环里 send 只会写进内核缓冲区，事件循环往往要等下一轮
+     * 才会真正 flush，所以"改名回执 self + peers 广播"这种连发两条的场景
+     * 会撞在一起——旧实现开头的 out_reset() 会把第一条整帧丢掉，
+     * 表现就是前端改名后收不到 self 回执。这里改成把未发送的部分挪到开头再追加。 */
+    if (c->out.has && c->out.is_mem && c->out.buf) {
+        size_t rest = c->out.len - c->out.sent;
+        char *nb;
+        if (rest) memmove(c->out.buf, c->out.buf + c->out.sent, rest);
+        nb = (char *)realloc(c->out.buf, rest + len + 1);
+        if (!nb) return; /* 内存不足时保留原有内容，本次丢弃 */
+        c->out.buf = nb;
+        memcpy(c->out.buf + rest, data, len);
+        c->out.buf[rest + len] = '\0';
+        c->out.len = rest + len;
+        c->out.sent = 0;
+        return;
+    }
     out_reset(c);
     c->out.buf = (char *)malloc(len + 1);
     if (!c->out.buf) return;
@@ -797,6 +915,47 @@ static uint64_t file_size(const char *path) {
     return (uint64_t)st.st_size;
 }
 
+/* 分块上传的半成品目录。用子目录而不是和正式文件混在一起，
+ * 这样文件列表里不会冒出没传完的东西。 */
+static void parts_dir_path(char *out, size_t outsz) {
+    snprintf(out, outsz, "%s/.lanshare-parts", g_upload_dir);
+}
+
+/* 半成品文件名取 name|size 的 SHA-1 十六进制。
+ * 中文或带特殊字符的文件名在文件系统上容易出岔子，哈希后只剩 [0-9a-f]，
+ * 同时保证"同名不同大小"互不干扰。 */
+static void part_path_for(const char *name, uint64_t size, char *out, size_t outsz) {
+    char key[NAME_MAX * 4 + 32];
+    unsigned char dig[20];
+    char hex[41];
+    ls_sha1 ctx;
+    int i;
+
+    snprintf(key, sizeof key, "%s|%llu", name, (unsigned long long)size);
+    sha1_init(&ctx);
+    sha1_update(&ctx, key, strlen(key));
+    sha1_final(&ctx, dig);
+    for (i = 0; i < 20; i++) snprintf(hex + (size_t)i * 2, 3, "%02x", dig[i]);
+    hex[40] = '\0';
+
+    {
+        char dir[PATH_MAX_LOCAL];
+        parts_dir_path(dir, sizeof dir);
+        snprintf(out, outsz, "%s/%s.part", dir, hex);
+    }
+}
+
+/* 某个文件目前收了多少字节。没开始过就是 0。 */
+static uint64_t part_received(const char *name, uint64_t size) {
+    char p[PATH_MAX_LOCAL];
+    uint64_t sz;
+    part_path_for(name, size, p, sizeof p);
+    if (!file_exists(p)) return 0;
+    sz = file_size(p);
+    if (size > 0 && sz > size) sz = size;
+    return sz;
+}
+
 static void api_list_files(ls_client *c) {
     char *body;
     size_t cap = 8192, len = 0;
@@ -920,7 +1079,25 @@ static void serve_static(ls_client *c, const char *rel) {
     }
     snprintf(path, sizeof path, "%s%s", g_web_dir, rel);
     if (!file_exists(path)) {
-        queue_response(c, 404, "text/plain; charset=utf-8", "Not Found", 9);
+        /* 磁盘上没有就回退到编进二进制的前端。
+         * 没有这层回退的话，只把可执行文件拷到路由器上（最常见的用法）
+         * 打开页面就是 404 Not Found，而 /api/info 却是好的，非常迷惑。 */
+        const ls_web_asset *hit = NULL;
+        size_t k;
+        for (k = 0; k < LS_WEB_ASSET_COUNT; k++) {
+            if (strcmp(ls_web_assets[k].route, rel) == 0) {
+                hit = &ls_web_assets[k];
+                break;
+            }
+        }
+        if (!hit) {
+            queue_response(c, 404, "text/plain; charset=utf-8", "Not Found", 9);
+            return;
+        }
+        if (strstr(rel, ".css")) ctype = "text/css; charset=utf-8";
+        else if (strstr(rel, ".js")) ctype = "text/javascript; charset=utf-8";
+        else ctype = "text/html; charset=utf-8";
+        queue_response(c, 200, ctype, (const char *)hit->data, hit->len);
         return;
     }
     sz = file_size(path);
@@ -949,12 +1126,18 @@ static void serve_static(ls_client *c, const char *rel) {
     free(body);
 }
 
-static void api_download(ls_client *c, const char *name) {
+/* range 是 Range 请求头的值（可能为 NULL 或空串）。
+ * 只支持 bytes=start[-end]；多段区间（逗号分隔）直接忽略走全量。 */
+static void api_download(ls_client *c, const char *name, const char *range) {
     char safe[NAME_MAX * 4];
     char path[PATH_MAX_LOCAL];
-    char head[512];
+    char head[640];
     char encoded[NAME_MAX * 12];
     uint64_t sz;
+    uint64_t start = 0;
+    uint64_t end = 0;
+    uint64_t length;
+    int has_range = 0;
     FILE *f;
     size_t i, o = 0;
     int hl;
@@ -972,6 +1155,39 @@ static void api_download(ls_client *c, const char *name) {
     }
     sz = file_size(path);
 
+    if (range && range[0] != '\0') {
+        unsigned long long a = 0;
+        unsigned long long b = 0;
+        if (sscanf(range, "bytes=%llu-%llu", &a, &b) == 2) {
+            start = (uint64_t)a;
+            end = (uint64_t)b;
+            has_range = 1;
+        } else if (sscanf(range, "bytes=%llu-", &a) == 1) {
+            start = (uint64_t)a;
+            end = sz - 1;
+            has_range = 1;
+        }
+    }
+    if (has_range) {
+        if (end > sz - 1) end = sz - 1;
+        /* 起点越界，或者区间反了：按 RFC 7233 回 416 并带上真实长度 */
+        if (start >= sz || start > end) {
+            fclose(f);
+            hl = snprintf(head, sizeof head,
+                "HTTP/1.1 416 Range Not Satisfiable\r\n"
+                "Content-Range: bytes */%llu\r\n"
+                "Content-Length: 0\r\n"
+                "Accept-Ranges: bytes\r\n"
+                "Connection: keep-alive\r\n\r\n",
+                (unsigned long long)sz);
+            if (hl > 0 && (size_t)hl <= sizeof c->pend) {
+                memcpy(c->pend, head, (size_t)hl);
+                c->pendlen = (size_t)hl;
+            }
+            return;
+        }
+    }
+
     for (i = 0; safe[i] != '\0' && o + 4 < sizeof encoded; i++) {
         unsigned char ch = (unsigned char)safe[i];
         if ((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
@@ -983,30 +1199,54 @@ static void api_download(ls_client *c, const char *name) {
     }
     encoded[o] = '\0';
 
-    hl = snprintf(head, sizeof head,
-        "HTTP/1.1 200 OK\r\n"
-        "Content-Type: application/octet-stream\r\n"
-        "Content-Length: %llu\r\n"
-        "Content-Disposition: attachment; filename*=UTF-8''%s\r\n"
-        "Cache-Control: no-store\r\n"
-        "Connection: keep-alive\r\n\r\n",
-        (unsigned long long)sz, encoded);
+    /* 响应头必须走 c->pend（flush_out 里 pend 优先级最高，先于 out 发出）。
+     * 不能图省事用 queue_mem 再改 is_mem：那样 flush_out 会直接进文件分支，
+     * 响应头一个字节都不会发出去，客户端收到的是没有状态行的裸数据。 */
+    out_reset(c);
+
+    if (has_range) {
+        length = end - start + 1;
+#ifdef _WIN32
+        _fseeki64(f, (__int64)start, SEEK_SET);
+#else
+        fseek(f, (long)start, SEEK_SET);
+#endif
+        hl = snprintf(head, sizeof head,
+            "HTTP/1.1 206 Partial Content\r\n"
+            "Content-Type: application/octet-stream\r\n"
+            "Content-Length: %llu\r\n"
+            "Content-Range: bytes %llu-%llu/%llu\r\n"
+            "Content-Disposition: attachment; filename*=UTF-8''%s\r\n"
+            "Accept-Ranges: bytes\r\n"
+            "Cache-Control: no-store\r\n"
+            "Connection: keep-alive\r\n\r\n",
+            (unsigned long long)length,
+            (unsigned long long)start, (unsigned long long)end, (unsigned long long)sz,
+            encoded);
+    } else {
+        length = sz;
+        hl = snprintf(head, sizeof head,
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: application/octet-stream\r\n"
+            "Content-Length: %llu\r\n"
+            "Content-Disposition: attachment; filename*=UTF-8''%s\r\n"
+            "Accept-Ranges: bytes\r\n"
+            "Cache-Control: no-store\r\n"
+            "Connection: keep-alive\r\n\r\n",
+            (unsigned long long)sz, encoded);
+    }
     if (hl <= 0) {
         fclose(f);
         return;
     }
 
-    /* 响应头必须走 c->pend（flush_out 里 pend 优先级最高，先于 out 发出）。
-     * 不能图省事用 queue_mem 再改 is_mem：那样 flush_out 会直接进文件分支，
-     * 响应头一个字节都不会发出去，客户端收到的是没有状态行的裸数据。 */
-    out_reset(c);
     if ((size_t)hl <= sizeof c->pend) {
         memcpy(c->pend, head, (size_t)hl);
         c->pendlen = (size_t)hl;
     }
     c->out.file = f;
     c->out.is_mem = 0;
-    c->out.total = sz;
+    c->out.total = length;
     c->out.sent = 0;
     c->out.has = 1;
 }
@@ -1088,12 +1328,44 @@ static void finish_upload(ls_client *c) {
     const char *slash, *bs, *b;
     uint64_t sz;
     int n;
+    int done = 1;
 
     if (c->upfd >= 0) {
         ls_closefile(c->upfd);
         c->upfd = -1;
     }
     c->mode = MODE_HTTP;
+
+    /* 分块上传：本次收完可能还没到完整大小。
+     * 没收满就回进度、把 .part 留着等下一次续传，绝不落进正式文件列表。 */
+    if (c->up_chunked) {
+        uint64_t total = c->up_base + c->up_reqlen;
+        if (total < c->up_size) {
+            char escn[NAME_MAX * 8];
+            json_escape(c->up_final, escn, sizeof escn);
+            human_size(total, szt, sizeof szt);
+            n = snprintf(body, sizeof body,
+                "{\"ok\":true,\"name\":\"%s\",\"size\":%llu,\"sizeText\":\"%s\","
+                "\"done\":false,\"received\":%llu}",
+                escn, (unsigned long long)total, szt, (unsigned long long)total);
+            if (n > 0) {
+                queue_response(c, 200, "application/json; charset=utf-8", body, (size_t)n);
+            }
+            return;
+        }
+        /* 收满了：把半成品改名成正式文件（重名会自动加 (1)） */
+        {
+            char finalpath[PATH_MAX_LOCAL];
+            unique_path(c->up_final, finalpath, sizeof finalpath);
+            if (ls_rename_file(c->upname, finalpath) != 0) {
+                queue_response(c, 500, "application/json; charset=utf-8",
+                               "{\"error\":\"落盘失败\"}", 21);
+                return;
+            }
+            snprintf(c->upname, sizeof c->upname, "%s", finalpath);
+        }
+    }
+
     sz = file_size(c->upname);
 
     slash = strrchr(c->upname, '/');
@@ -1106,8 +1378,8 @@ static void finish_upload(ls_client *c) {
     human_size(sz, szt, sizeof szt);
 
     n = snprintf(body, sizeof body,
-        "{\"ok\":true,\"name\":\"%s\",\"size\":%llu,\"sizeText\":\"%s\"}",
-        esc, (unsigned long long)sz, szt);
+        "{\"ok\":true,\"name\":\"%s\",\"size\":%llu,\"sizeText\":\"%s\",\"done\":%s}",
+        esc, (unsigned long long)sz, szt, done ? "true" : "false");
     if (n > 0) queue_response(c, 200, "application/json; charset=utf-8", body, (size_t)n);
 }
 
@@ -1225,9 +1497,12 @@ static long process_request(ls_client *c, const char *req, size_t len) {
     }
     if (strcmp(method, "GET") == 0 && strcmp(path, "/api/download") == 0) {
         char name[NAME_MAX * 4];
+        char rangev[64];
         name[0] = '\0';
+        rangev[0] = '\0';
         extract_query_value(query, "name", name, sizeof name);
-        api_download(c, name);
+        header_value(find_header(req, len, "Range"), req + len, rangev, sizeof rangev);
+        api_download(c, name, rangev);
         return (long)len;
     }
     if (strcmp(method, "DELETE") == 0 && strcmp(path, "/api/files") == 0) {
@@ -1245,19 +1520,89 @@ static long process_request(ls_client *c, const char *req, size_t len) {
         if (n > 0) queue_response(c, 200, "application/json; charset=utf-8", body, (size_t)n);
         return (long)len;
     }
+    /* 续传前先问：这个文件已经收了多少字节 */
+    if (strcmp(method, "GET") == 0 && strcmp(path, "/api/upload-status") == 0) {
+        char rawname[NAME_MAX * 4];
+        char safe[NAME_MAX * 4];
+        char sizestr[32];
+        char esc[NAME_MAX * 8];
+        char body[512];
+        uint64_t fsize;
+        int n;
+
+        rawname[0] = '\0';
+        sizestr[0] = '\0';
+        extract_query_value(query, "name", rawname, sizeof rawname);
+        extract_query_value(query, "size", sizestr, sizeof sizestr);
+        sanitize_name(rawname, safe, sizeof safe);
+        fsize = strtoull(sizestr, NULL, 10);
+        json_escape(safe, esc, sizeof esc);
+
+        n = snprintf(body, sizeof body,
+            "{\"ok\":true,\"name\":\"%s\",\"size\":%llu,\"received\":%llu}",
+            esc, (unsigned long long)fsize,
+            (unsigned long long)part_received(safe, fsize));
+        if (n > 0) queue_response(c, 200, "application/json; charset=utf-8", body, (size_t)n);
+        return (long)len;
+    }
+
     if (strcmp(method, "POST") == 0 && strcmp(path, "/api/upload") == 0) {
         char rawname[NAME_MAX * 4];
         char safe[NAME_MAX * 4];
         char fullpath[PATH_MAX_LOCAL];
+        char sizestr[32];
+        char offstr[32];
         size_t bodylen = (len > header_end) ? (len - header_end) : 0;
+        uint64_t fsize = 0;
+        uint64_t foffset = 0;
+        int chunked = 0;
         int fd;
 
         rawname[0] = '\0';
+        sizestr[0] = '\0';
+        offstr[0] = '\0';
         extract_query_value(query, "name", rawname, sizeof rawname);
         sanitize_name(rawname, safe, sizeof safe);
-        unique_path(safe, fullpath, sizeof fullpath);
 
-        fd = ls_openwrite(fullpath);
+        /* 带 size 或 offset 任意一个就走分块续传；都不带是老的整包上传，行为不变。 */
+        if (extract_query_value(query, "size", sizestr, sizeof sizestr)) {
+            chunked = 1;
+            fsize = strtoull(sizestr, NULL, 10);
+        }
+        if (extract_query_value(query, "offset", offstr, sizeof offstr)) {
+            chunked = 1;
+            foffset = strtoull(offstr, NULL, 10);
+        }
+
+        if (chunked) {
+            uint64_t existing = part_received(safe, fsize);
+            if (foffset > existing) {
+                /* 客户端要跳到还没收到的位置。顺序写做不到，
+                 * 放过去会产出一个中间空洞的文件，直接拒绝让它按实际进度重来。 */
+                char body[128];
+                int n = snprintf(body, sizeof body,
+                    "{\"error\":\"offset 超出已接收范围\",\"received\":%llu}",
+                    (unsigned long long)existing);
+                if (n > 0) {
+                    queue_response(c, 409, "application/json; charset=utf-8", body, (size_t)n);
+                }
+                return (long)len;
+            }
+            part_path_for(safe, fsize, fullpath, sizeof fullpath);
+            c->up_chunked = 1;
+            c->up_size = fsize;
+            c->up_base = foffset;
+            snprintf(c->up_final, sizeof c->up_final, "%s", safe);
+        } else {
+            unique_path(safe, fullpath, sizeof fullpath);
+            c->up_chunked = 0;
+            c->up_size = 0;
+            c->up_base = 0;
+            c->up_final[0] = '\0';
+        }
+        c->up_reqlen = content_len;
+
+        fd = ls_openwrite_at(fullpath, foffset, chunked);
         if (fd < 0) {
             queue_response(c, 500, "application/json; charset=utf-8", "{\"error\":\"create failed\"}", 24);
             return (long)len;
@@ -1308,6 +1653,8 @@ static void handle_ws_message(ls_client *c, const char *msg, size_t len) {
             char selfmsg[384];
             char escn[NAME_MAX * 4];
             snprintf(c->name, sizeof c->name, "%s", nm);
+            /* 记住这个名字，让对端下次连上来还是它 */
+            name_mem_set(c->ip, nm);
             json_escape(c->name, escn, sizeof escn);
             snprintf(selfmsg, sizeof selfmsg, "{\"type\":\"self\",\"id\":\"%s\",\"name\":\"%s\"}",
                      c->id, escn);
@@ -1509,20 +1856,38 @@ static void accept_all(int listen_fd) {
         g_clients[i].upfd = -1;
         g_seq++;
         make_id(g_clients[i].id, sizeof g_clients[i].id);
-        random_name(g_clients[i].name, sizeof g_clients[i].name);
         {
             const char *r = inet_ntop(AF_INET, &addr.sin_addr, g_clients[i].ip, sizeof g_clients[i].ip);
             if (!r) g_clients[i].ip[0] = '\0';
+        }
+        /* 同一个 IP 之前用过名字就复用，别每次连接都换一个。
+         * IP 必须先填好才能查记忆表，所以这段在 inet_ntop 之后。 */
+        {
+            const char *remembered = name_mem_get(g_clients[i].ip);
+            if (remembered) {
+                snprintf(g_clients[i].name, sizeof g_clients[i].name, "%s", remembered);
+            } else {
+                random_name(g_clients[i].name, sizeof g_clients[i].name);
+            }
         }
     }
 }
 
 /* 创建上传目录。已存在时各平台都会返回失败，这里不关心返回值。 */
 static void ensure_upload_dir(void) {
+    char parts[PATH_MAX_LOCAL];
 #ifdef _WIN32
     _mkdir(g_upload_dir);
 #else
     mkdir(g_upload_dir, 0755);
+#endif
+    /* 断点续传的半成品目录。分块上传第一次用到它，
+     * 不建的话续传会卡在"打不开文件"上。 */
+    parts_dir_path(parts, sizeof parts);
+#ifdef _WIN32
+    _mkdir(parts);
+#else
+    mkdir(parts, 0755);
 #endif
 }
 
