@@ -144,7 +144,7 @@ chmod +x /etc/init.d/lan_share
 make test
 ```
 
-`test.js` 会自己拉起服务、跑完 85 项断言再关掉它，覆盖：
+`test.js` 会自己拉起服务、跑完 114 项断言再关掉它，覆盖：
 
 - 静态托管、目录穿越防护（明文与编码两种）
 - 上传 / 下载 / 删除、中文与特殊文件名往返、同名自动重命名
@@ -157,6 +157,28 @@ make test
   复现 Chrome 那 16MB 发送队列上限，验证 64MB 文件一次发完、不抛"队列满"、
   缓冲从不越界、慢通道与续传起点都正确
 - **测速接口**：整块 POST / 下载 / 删除（这条路径会让头和 body 挤在同一个 TCP 段到达）
+
+### 真实浏览器点对点测试
+
+假 DataChannel 验证不了"真实 Chrome 的 SCTP 到底能跑多快"——而这正是排查
+点对点慢的关键。`tools/p2p-e2e.js` 拉起两个独立 Chrome 进程（零依赖，直接用
+Node 内置 WebSocket 走 CDP，不装 puppeteer），让它们互相发现，然后：
+
+1. **TCP 基线**：同机服务端上传/下载——点对点数字只有和它比才有意义；
+2. **内置测速**：冷连接、热连接各跑一次 `speedP2p`，报候选对类型与 RTT；
+3. **真实文件传输**（默认 64MB）：自动点接收确认框、等下载落盘、逐字节 SHA-256
+   校验——4 条并行 lane 分段拼回去只要错一段就会现形。
+
+```bash
+cc -O2 -std=c99 -Wall -o lan-share lan_share.c
+node tools/p2p-e2e.js --server ./lan-share --file-mb 64 --timeout 240
+```
+
+注意区分两个速率：**交付速率**只算到发送端字节入队（DataChannel 队列上限
+16MB，能吸收好几秒数据，会虚高），**端到端速率**算到对端文件落盘，才是真实值。
+
+CI 每次 push 都跑（[e2e-p2p.yml](.github/workflows/e2e-p2p.yml)，64MB 与 16MB
+两档）：Runner 上的 Chrome 走真实内核 loopback，没有开发机沙箱虚拟网络的干扰。
 
 ## 服务端吞吐基准
 
