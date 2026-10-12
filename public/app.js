@@ -1023,23 +1023,40 @@ async function speedP2p(peerId) {
   const ranges = splitRange(0, SPEED_BYTES, LANES);
   const lanes = conn.lanes.slice(0, ranges.length);
 
-  /* 每条 lane 独立打招呼：发 speedtest、等对端 ready */
+  /* 每条 lane 独立打招呼：发 speedtest、等对端 ready。
+   * 丢包链路上这条控制消息自己就可能丢（用户 Wi-Fi 实测 2% 丢包时必中），
+   * 所以每 2 秒重发一次、最多等 30 秒——不能一丢就判整个测速失败。 */
   await Promise.all(lanes.map((lane, i) => new Promise((resolve, reject) => {
-    const to = setTimeout(() => reject(new Error(`lane ${i} 对端没有回应测速请求`)), 10000);
+    let tries = 0;
+    const send = () => {
+      tries++;
+      try {
+        lane.dc.send(JSON.stringify({
+          t: 'speedtest', bytes: ranges[i].to - ranges[i].from, ch: lane.index,
+        }));
+      } catch (err) {
+        clearInterval(rep); clearTimeout(to);
+        reject(err); return;
+      }
+    };
+    const rep = setInterval(send, 2000);
+    const to = setTimeout(() => {
+      clearInterval(rep);
+      lane.dc.removeEventListener('message', onMsg);
+      reject(new Error(`lane ${i} 对端没有回应测速请求（重发 ${tries} 次）`));
+    }, 30000);
     const onMsg = (e) => {
       if (typeof e.data !== 'string') return;
       let m;
       try { m = JSON.parse(e.data); } catch (_) { return; }
       if (m.t === 'speedtest-ready' && Number(m.ch) === lane.index) {
-        clearTimeout(to);
+        clearInterval(rep); clearTimeout(to);
         lane.dc.removeEventListener('message', onMsg);
         resolve();
       }
     };
     lane.dc.addEventListener('message', onMsg);
-    lane.dc.send(JSON.stringify({
-      t: 'speedtest', bytes: ranges[i].to - ranges[i].from, ch: lane.index,
-    }));
+    send();
   })));
 
   /* 等每条 lane 的回执。超时给 null，不影响其他 lane 出数 */

@@ -335,18 +335,33 @@ const peerNames = (page) => page.evaluate('state.peers.map(p => p.name)');
           if (n > conn.lanes.length) { out.push({ n, error: 'lane 不够（只有 ' + conn.lanes.length + ' 条）' }); continue; }
           const lanes = conn.lanes.slice(0, n);
           const ranges = splitRange(0, ${SWEEP_MB} * 1024 * 1024, n);
-          /* 和 speedP2p 同一套握手：逐 lane 发 speedtest、等 ready、再泵数据 */
+          /* 和 speedP2p 同一套握手：逐 lane 发 speedtest、等 ready、再泵数据。
+           * 丢包链路上控制消息本身会丢（2% 丢包下几十次握手必中几次），
+         * 所以每 2 秒重发一次，别一丢就判死。 */
           await Promise.all(lanes.map((lane, i) => new Promise((resolve, reject) => {
-            const to = setTimeout(() => reject(new Error('lane ' + i + ' 对端没有回应测速请求')), 10000);
+            let tries = 0;
+            const send = () => {
+              tries++;
+              try {
+                lane.dc.send(JSON.stringify({ t: 'speedtest', bytes: ranges[i].to - ranges[i].from, ch: lane.index }));
+              } catch (err) { clearInterval(rep); clearTimeout(to); reject(err); return; }
+            };
+            const rep = setInterval(send, 2000);
+            const to = setTimeout(() => {
+              clearInterval(rep);
+              lane.dc.removeEventListener('message', onMsg);
+              reject(new Error('lane ' + i + ' 对端没有回应测速请求（重发 ' + tries + ' 次）'));
+            }, 30000);
             const onMsg = (e) => {
               if (typeof e.data !== 'string') return;
               let m; try { m = JSON.parse(e.data); } catch (_) { return; }
               if (m.t === 'speedtest-ready' && Number(m.ch) === lane.index) {
-                clearTimeout(to); lane.dc.removeEventListener('message', onMsg); resolve();
+                clearInterval(rep); clearTimeout(to);
+                lane.dc.removeEventListener('message', onMsg); resolve();
               }
             };
             lane.dc.addEventListener('message', onMsg);
-            lane.dc.send(JSON.stringify({ t: 'speedtest', bytes: ranges[i].to - ranges[i].from, ch: lane.index }));
+            send();
           })));
           const echoes = lanes.map((lane) => new Promise((resolve) => {
             const to = setTimeout(() => resolve(null), 60000);
