@@ -45,29 +45,31 @@ jobs:
         run: cc -O2 -std=c99 -Wall -o lan-share lan_share.c
 
       # ubuntu-24.04 镜像不再预装 Chrome，直接下官方 .deb 用 apt 装
-      # （apt 会自动补依赖）。已有 Chrome 的镜像（如 22.04）跳过这步。
+      # （apt 会自动补依赖）。已有 Chrome 的镜像跳过这步。
+      # 注意：$GITHUB_ENV 要等本步骤结束才被 runner 读取，当前 shell 里
+      # 读不到它，所以先落到局部变量再写进去。
       - name: 安装 / 定位 Chrome
         run: |
           set -e
-          if command -v google-chrome-stable >/dev/null 2>&1; then
-            echo "镜像里已有 Chrome"
-          else
+          if ! command -v google-chrome-stable >/dev/null 2>&1; then
             cd "$RUNNER_TEMP"
             curl -fsSL --max-time 300 -o chrome.deb \
               "https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb"
             sudo apt-get install -y -qq ./chrome.deb
           fi
+          FOUND=""
           for c in google-chrome-stable google-chrome chromium chromium-browser; do
             if command -v "$c" >/dev/null 2>&1; then
-              echo "CHROME_PATH=$(command -v "$c")" >> "$GITHUB_ENV"
+              FOUND=$(command -v "$c")
               break
             fi
           done
-          if [ -z "${CHROME_PATH:-}" ]; then
+          if [ -z "$FOUND" ]; then
             echo "::error::Chrome 装上了但不在 PATH 里"
             exit 1
           fi
-          "$CHROME_PATH" --version
+          echo "CHROME_PATH=$FOUND" >> "$GITHUB_ENV"
+          "$FOUND" --version
 
       - name: P2P 端到端（TCP 基线 + 冷/热测速 + 真实文件 + 逐字节校验）
         run: node tools/p2p-e2e.js --server ./lan-share --file-mb ${{ matrix.file-mb }} --timeout 240 --label ci-${{ matrix.file-mb }}mb
