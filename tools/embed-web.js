@@ -22,9 +22,11 @@ const path = require('path');
 const pubDir = path.resolve(process.argv[2] || path.join(__dirname, '..', 'public'));
 const outFile = path.resolve(process.argv[3] || path.join(__dirname, '..', 'web_assets.h'));
 
-/* route -> 磁盘文件名。 "/" 与 "/index.html" 指向同一个文件。 */
+/* route -> 磁盘文件名。 "/" 与 "/index.html" 指向同一个文件。
+ * p2p-pump.js 必须在 app.js 之前加载（app.js 顶层就解构 LSPump）。 */
 const ASSETS = [
     { file: 'index.html', routes: ['/', '/index.html'] },
+    { file: 'p2p-pump.js', routes: ['/p2p-pump.js'] },
     { file: 'app.js', routes: ['/app.js'] },
     { file: 'style.css', routes: ['/style.css'] },
 ];

@@ -17,6 +17,8 @@
 
 两条路径都支持断点续传：直传中断后重发会接着上次的字节偏移继续；文件库上传按偏移续写 `.part` 半成品；下载走 HTTP Range，浏览器原生续传。设备名会按 IP 记住并在浏览器本地存一份，刷新页面、重连都不会变回随机名。
 
+**关于速度**：P2P 直传走 WebRTC DataChannel，有两条浏览器硬限制——单条消息不能超过 `sctp.maxMessageSize`（Chrome 默认 256KB），发送队列总共只有约 16MB，`bufferedAmount` 一超过 `send()` 就直接抛 `RTCDataChannel send queue is full`（不是排队，是抛异常）。 pacing 逻辑集中在 `public/p2p-pump.js`，高水位取 4MB、离上限留足余量，并且一次读 8MB 再切块发送，避免每 256KB 就走一次 Blob IPC 把带宽卡在读速上。
+
 ## 直接下载预编译二进制
 
 每次 push 到主分支，GitHub Actions 都会编译所有目标；打 `v*` tag 时自动发布到 Release。
@@ -138,7 +140,7 @@ chmod +x /etc/init.d/lan_share
 make test
 ```
 
-`test.js` 会自己拉起服务、跑完 57 项断言再关掉它，覆盖：
+`test.js` 会自己拉起服务、跑完 79 项断言再关掉它，覆盖：
 
 - 静态托管、目录穿越防护（明文与编码两种）
 - 上传 / 下载 / 删除、中文与特殊文件名往返、同名自动重命名
@@ -147,6 +149,9 @@ make test
 - **上传断点续传**：分块写入、未完结不进文件库、`/api/upload-status` 查进度、续传后内容逐字节一致、跳过未上传区域返回 409
 - **下载 Range**：`Accept-Ranges: bytes`、206 + `Content-Range`、开区间与闭区间内容校验、越界返回 416
 - **设备名记忆**：改名回执、断开重连后名字不变
+- **P2P 发送 pacing**（不起浏览器）：用假 DataChannel 跑 `public/p2p-pump.js` 的真代码，
+  复现 Chrome 那 16MB 发送队列上限，验证 64MB 文件一次发完、不抛"队列满"、
+  缓冲从不越界、慢通道与续传起点都正确
 
 需要本机有 Node ≥ 21（仅用于跑测试，运行服务不需要）。也可以指向已跑起来的服务：
 

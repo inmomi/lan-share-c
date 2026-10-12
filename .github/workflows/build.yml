@@ -47,7 +47,7 @@ jobs:
           ./lan-share -h || true
           ls -la lan-share
 
-      # 测试脚本会自己拉起服务、跑完 57 项断言再关掉它
+      # 测试脚本会自己拉起服务、跑完 79 项断言再关掉它
       - name: 运行端到端测试
         env:
           SPAWN: ./lan-share -p 8080 -d ./uploads -w ./public
@@ -57,20 +57,22 @@ jobs:
 
       # 路由器上通常只有二进制一个文件，旁边没有 public/。
       # 前端必须已经编进去，否则打开页面就是 404 Not Found。
+      # p2p-pump.js 也要在：app.js 顶层就解构 LSPump，缺了它整个页面直接白屏。
       - name: 单文件可用性（无 public 目录也能打开页面）
         run: |
           set -e
           ./lan-share -p 8097 -d ./uploads-solo -w ./no-such-dir >/dev/null 2>&1 &
           SRV=$!
-          code=000
+          code=000; pump=000
           for i in $(seq 1 40); do
             code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8097/ || echo 000)
             [ "$code" = "200" ] && break
             sleep 0.3
           done
+          pump=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8097/p2p-pump.js || echo 000)
           kill $SRV 2>/dev/null || true
-          echo "无 public 目录时 GET / -> $code"
-          if [ "$code" != "200" ]; then
+          echo "无 public 目录时 GET / -> $code, /p2p-pump.js -> $pump"
+          if [ "$code" != "200" ] || [ "$pump" != "200" ]; then
             echo "::error::内嵌前端未生效，只拷二进制到路由器会打不开页面"
             exit 1
           fi
