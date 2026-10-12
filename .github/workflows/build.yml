@@ -1,0 +1,195 @@
+name: Build & Test
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  # ---------------------------------------------------------------- 功能测试
+  test:
+    name: 功能测试 (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: 编译
+        run: cc -O2 -std=c99 -Wall -o lan-share lan_share.c
+
+      # 测试脚本会自己拉起服务、跑完 38 项断言再关掉它
+      - name: 运行端到端测试
+        env:
+          SPAWN: ./lan-share -p 8080 -d ./uploads -w ./public
+          BASE: http://127.0.0.1:8080
+          TRAVERSAL_PROBE: lan_share.c
+        run: node test.js
+
+  # ------------------------------------------------------------ 多平台编译
+  build:
+    name: 编译 ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ---- 桌面 / 服务器 ----
+          - name: linux-x86_64
+            os: ubuntu-latest
+            toolchain: x86_64-linux-musl
+            cc: x86_64-linux-musl-gcc
+            cflags: -static
+            out: lan-share-x86_64-linux
+
+          - name: linux-aarch64
+            os: ubuntu-latest
+            toolchain: aarch64-linux-musl
+            cc: aarch64-linux-musl-gcc
+            cflags: -static
+            out: lan-share-aarch64-linux
+
+          - name: macos-x86_64
+            os: macos-13          # Intel runner，原生产出 x86_64
+            cc: clang
+            cflags: -arch x86_64
+            out: lan-share-x86_64-macos
+
+          - name: macos-arm64
+            os: macos-14          # Apple Silicon runner
+            cc: clang
+            cflags: -arch arm64
+            out: lan-share-arm64-macos
+
+          - name: windows-x86_64
+            os: windows-latest
+            out: lan-share-x86_64-windows.exe
+
+          # ---- 路由器 / OpenWrt（静态链接 musl，软浮点与硬浮点各一份）----
+          - name: mipsel-softfloat
+            os: ubuntu-latest
+            toolchain: mipsel-linux-muslsf
+            cc: mipsel-linux-muslsf-gcc
+            cflags: -static
+            out: lan-share-mipsel-sf-linux
+
+          - name: mipsel-hardfloat
+            os: ubuntu-latest
+            toolchain: mipsel-linux-musl
+            cc: mipsel-linux-musl-gcc
+            cflags: -static
+            out: lan-share-mipsel-linux
+
+          - name: mips-softfloat
+            os: ubuntu-latest
+            toolchain: mips-linux-muslsf
+            cc: mips-linux-muslsf-gcc
+            cflags: -static
+            out: lan-share-mips-sf-linux
+
+          - name: aarch64-router
+            os: ubuntu-latest
+            toolchain: aarch64-linux-musl
+            cc: aarch64-linux-musl-gcc
+            cflags: -static
+            out: lan-share-aarch64-router-linux
+
+          - name: armv7l-hardfloat
+            os: ubuntu-latest
+            toolchain: armv7l-linux-musleabihf
+            cc: armv7l-linux-musleabihf-gcc
+            cflags: -static
+            out: lan-share-armv7l-linux
+
+          - name: arm-softfloat
+            os: ubuntu-latest
+            toolchain: arm-linux-musleabi
+            cc: arm-linux-musleabi-gcc
+            cflags: -static
+            out: lan-share-arm-sf-linux
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 musl 交叉工具链 (${{ matrix.toolchain }})
+        if: matrix.toolchain != ''
+        run: |
+          set -e
+          curl -fsSL -o toolchain.tgz "https://musl.cc/${{ matrix.toolchain }}-cross.tgz"
+          tar xzf toolchain.tgz
+          echo "$PWD/${{ matrix.toolchain }}-cross/bin" >> "$GITHUB_PATH"
+
+      - name: 安装 MinGW (Windows)
+        if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          install: mingw-w64-x86_64-gcc
+          update: false
+
+      - name: 编译 (Windows)
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        run: |
+          gcc -Os -std=c99 -Wall -static \
+            -o "${{ matrix.out }}" lan_share.c -lws2_32
+          file "${{ matrix.out }}"
+
+      - name: 编译 (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          set -e
+          ${{ matrix.cc }} -Os -std=c99 -Wall ${{ matrix.cflags }} \
+            -o "${{ matrix.out }}" lan_share.c
+          file "${{ matrix.out }}" 2>/dev/null || true
+          ls -la "${{ matrix.out }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.out }}
+          path: ${{ matrix.out }}
+          if-no-files-found: error
+
+  # --------------------------------------------------------------- 发布
+  release:
+    name: 发布 Release
+    needs: [test, build]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: 生成校验和
+        run: |
+          cd artifacts
+          sha256sum lan-share-* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SHA256SUMS
+          path: artifacts/SHA256SUMS.txt
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/lan-share-*
+            artifacts/SHA256SUMS.txt
+          generate_release_notes: true

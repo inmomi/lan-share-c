@@ -1,0 +1,11 @@
+lan-share
+lan-share.exe
+*.o
+*.tgz
+toolchain/
+*-cross/
+uploads/*
+!uploads/.gitkeep
+*.log
+.DS_Store
+Thumbs.db
