@@ -19,6 +19,8 @@
 
 **关于速度**：P2P 直传走 WebRTC DataChannel，有两条浏览器硬限制——单条消息不能超过 `sctp.maxMessageSize`（Chrome 默认 256KB），发送队列总共只有约 16MB，`bufferedAmount` 一超过 `send()` 就直接抛 `RTCDataChannel send queue is full`（不是排队，是抛异常）。 pacing 逻辑集中在 `public/p2p-pump.js`，高水位取 4MB、离上限留足余量，并且一次读 8MB 再切块发送，避免每 256KB 就走一次 Blob IPC 把带宽卡在读速上。
 
+**页面里带了测速页**（第三个标签页）：分别测「服务端下载 / 服务端上传 / 点对点直传」三段，点对点那项还会把对端实际收到的速率一并显示出来。用途是把"慢"拆开定位——服务端慢是磁盘或 HTTP 栈的问题，点对点慢是 Wi-Fi 或 WebRTC SCTP 的问题，两者治法完全不同。测速状态按连接隔离、带 60 秒超时、失败主动发 `speedtest-abort`，不会因为对端没回执就把后续文件分片误吞导致传输卡死。
+
 ## 直接下载预编译二进制
 
 每次 push 到主分支，GitHub Actions 都会编译所有目标；打 `v*` tag 时自动发布到 Release。
