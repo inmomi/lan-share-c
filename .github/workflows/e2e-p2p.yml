@@ -72,7 +72,7 @@ jobs:
           "$FOUND" --version
 
       - name: P2P 端到端（TCP 基线 + 冷/热测速 + 真实文件 + 逐字节校验 + lane 扫描）
-        run: node tools/p2p-e2e.js --server ./lan-share --file-mb ${{ matrix.file-mb }} --timeout 240 --label ci-${{ matrix.file-mb }}mb --sweep 1,2,4,8,16 --sweep-mb 16
+        run: node tools/p2p-e2e.js --server ./lan-share --file-mb ${{ matrix.file-mb }} --timeout 240 --label ci-${{ matrix.file-mb }}mb --sweep 1,2,4,8,16,32 --sweep-mb 16
 
   # 无损 loopback 上 4 条 lane 就见到共享瓶颈（包速率/CPU），加 lane 反而略降。
   # 但用户的真实链路是 Wi-Fi：有丢包时每关联的拥塞窗口会坍缩，多关联是对抗
