@@ -9,10 +9,13 @@ on:
   workflow_dispatch:
 
 env:
-  # zig 自带 musl，一次下载就能覆盖 x86_64/aarch64/arm/mips 全部目标，
-  # 静态链接后拷到路由器上直接可跑。
-  # 早先用 musl.cc 的交叉工具链，但 GitHub Runner 连不上 musl.cc（curl 28 超时），
-  # zig 的发布包托管在 GitHub Releases，Runner 一定能取到。
+  # Linux 目标用 zig 交叉编译：zig 自带 musl，-static 出来的二进制拷到
+  # OpenWrt（musl 环境）直接可跑，不挑发行版。
+  #
+  # 不要从 GitHub Release 下 zig —— ziglang 从 0.14 起只把源码包放 GitHub，
+  # 预编译二进制只在 ziglang.org，写成
+  #   github.com/ziglang/zig/releases/download/0.15.1/zig-x86_64-linux-0.15.1.tar.xz
+  # 会 404。
   ZIG_VERSION: '0.15.1'
 
 jobs:
@@ -57,81 +60,30 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # ---- 桌面 / 服务器（Runner 原生编译）----
-          - name: macos-x86_64
-            os: macos-13            # Intel runner，原生产出 x86_64
-            kind: unix-native
-            cc: clang
-            cflags: -arch x86_64
-            out: lan-share-x86_64-macos
-
-          - name: macos-arm64
-            os: macos-14            # Apple Silicon runner
-            kind: unix-native
-            cc: clang
-            cflags: -arch arm64
-            out: lan-share-arm64-macos
-
-          - name: windows-x86_64
-            os: windows-latest
-            kind: msys2
-            out: lan-share-x86_64-windows.exe
-
-          # ---- Linux 桌面 / 服务器（zig + musl 静态）----
-          - name: linux-x86_64
+          - name: linux_amd64
             os: ubuntu-latest
             kind: zig
             target: x86_64-linux-musl
-            out: lan-share-x86_64-linux
+            out: lan-share-linux-amd64
 
-          - name: linux-aarch64
+          - name: linux_arm64
             os: ubuntu-latest
             kind: zig
             target: aarch64-linux-musl
-            out: lan-share-aarch64-linux
+            out: lan-share-linux-arm64
 
-          # ---- 路由器 / OpenWrt ----
-          # mipsel 覆盖 MT7620/MT7621/MT7628、MT7688 等联发科方案；
-          # 软浮点（musleabi）与硬浮点（musleabihf）各出一份，按 CPU 选。
-          - name: mipsel-softfloat
-            os: ubuntu-latest
-            kind: zig
-            target: mipsel-linux-musleabi
-            out: lan-share-mipsel-sf-linux
-
-          - name: mipsel-hardfloat
-            os: ubuntu-latest
-            kind: zig
-            target: mipsel-linux-musleabihf
-            out: lan-share-mipsel-linux
-
-          # 大端 MIPS：部分老博通（BCM63xx/BCM47xx）与 Atheros AR71xx 早期型号
-          - name: mips-softfloat
-            os: ubuntu-latest
-            kind: zig
-            target: mips-linux-musleabi
-            out: lan-share-mips-sf-linux
-
-          # 64 位 ARM 路由器：斐讯 N1、瑞芯微、部分高通 IPQ 方案
-          - name: aarch64-router
-            os: ubuntu-latest
-            kind: zig
-            target: aarch64-linux-musl
-            out: lan-share-aarch64-router-linux
-
-          # 32 位 ARM 硬浮点：BCM27xx、i.MX6、大多数现代 ARM 路由器
-          - name: armv7l-hardfloat
+          # OpenWrt 32 位 ARM 硬浮点：BCM27xx、i.MX6、大多数现代 ARM 路由器。
+          # 与桌面 ARMv8 区分开单独出一份，因为路由器普遍是 32 位 userspace。
+          - name: openwrt_armv7l
             os: ubuntu-latest
             kind: zig
             target: arm-linux-musleabihf
-            out: lan-share-armv7l-linux
+            out: lan-share-openwrt-armv7l
 
-          # 32 位 ARM 软浮点：老款 ARM9/ARM11 路由器
-          - name: arm-softfloat
-            os: ubuntu-latest
-            kind: zig
-            target: arm-linux-musleabi
-            out: lan-share-arm-sf-linux
+          - name: windows_amd64
+            os: windows-latest
+            kind: msys2
+            out: lan-share-windows-amd64.exe
 
     steps:
       - uses: actions/checkout@v4
@@ -141,20 +93,10 @@ jobs:
         run: |
           set -e
           cd "$RUNNER_TEMP"
-          curl -fsSL -o zig.tar.xz \
-            "https://github.com/ziglang/zig/releases/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+          curl -fsSL --max-time 300 -o zig.tar.xz \
+            "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
           tar xf zig.tar.xz
           echo "$RUNNER_TEMP/zig-x86_64-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
-
-      - name: 确认 zig 与目标可用
-        if: matrix.kind == 'zig'
-        run: |
-          set -e
-          zig version
-          # 早一步暴露"该目标没有 libc"这类问题，免得编译到一半才失败
-          zig libc -target "${{ matrix.target }}" >/dev/null 2>&1 \
-            && echo "libc 可用: ${{ matrix.target }}" \
-            || echo "::warning::zig 未列出 ${{ matrix.target }} 的 libc，继续尝试编译"
 
       - name: 安装 MinGW (Windows)
         if: matrix.kind == 'msys2'
@@ -173,19 +115,11 @@ jobs:
           file "${{ matrix.out }}"
           ls -la "${{ matrix.out }}"
 
-      - name: 编译 (macOS 原生)
-        if: matrix.kind == 'unix-native'
-        run: |
-          set -e
-          ${{ matrix.cc }} -Os -std=c99 -Wall ${{ matrix.cflags }} \
-            -o "${{ matrix.out }}" lan_share.c
-          file "${{ matrix.out }}"
-          ls -la "${{ matrix.out }}"
-
-      - name: 编译 (zig 交叉 + musl 静态)
+      - name: 编译 (Linux / OpenWrt，zig + musl 静态)
         if: matrix.kind == 'zig'
         run: |
           set -e
+          zig version
           zig cc -target "${{ matrix.target }}" -static -Os -std=c99 -Wall \
             -o "${{ matrix.out }}" lan_share.c
           file "${{ matrix.out }}" 2>/dev/null || true

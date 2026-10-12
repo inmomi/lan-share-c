@@ -19,21 +19,16 @@
 
 | 目标 | 文件名 | 适用 |
 | --- | --- | --- |
-| Linux x86_64 | `lan-share-x86_64-linux` | 普通 PC、服务器、x86 软路由 |
-| Linux aarch64 | `lan-share-aarch64-linux` | ARM64 服务器、树莓派 64 位系统 |
-| macOS Intel | `lan-share-x86_64-macos` | Intel Mac |
-| macOS Apple Silicon | `lan-share-arm64-macos` | M 系列 Mac |
-| Windows x86_64 | `lan-share-x86_64-windows.exe` | Windows |
-| **mipsel 软浮点** | `lan-share-mipsel-sf-linux` | **MT7620/MT7621/MT7628 等常见 OpenWrt 路由器** |
-| mipsel 硬浮点 | `lan-share-mipsel-linux` | 带 FPU 的 mipsel |
-| mips 软浮点 | `lan-share-mips-sf-linux` | 大端 MIPS（老 AR7xxx） |
-| aarch64 路由器 | `lan-share-aarch64-router-linux` | ARMv8 路由器 |
-| armv7l 硬浮点 | `lan-share-armv7l-linux` | ARMv7 路由器 |
-| arm 软浮点 | `lan-share-arm-sf-linux` | 老 ARM9/ARM11 |
+| Windows x86_64 | `lan-share-windows-amd64.exe` | Windows |
+| Linux x86_64 | `lan-share-linux-amd64` | 普通 PC、服务器、x86 软路由 |
+| Linux ARM64 | `lan-share-linux-arm64` | ARM64 服务器、树莓派 64 位系统 |
+| OpenWrt ARMv7l | `lan-share-openwrt-armv7l` | 32 位 ARM 硬浮点路由器（BCM27xx、i.MX6 等） |
 
-Linux 产物全部是静态链接，任何发行版（含 OpenWrt 的 musl）都能直接跑，不挑 libc。
+Linux 产物全部是 musl 静态链接，任何发行版（含 OpenWrt）都能直接跑，不挑 libc，约 60 KB。
 
 Release 里附 `SHA256SUMS.txt` 可校验。
+
+需要 MIPS 之类没预编译的架构，照下面自己编一条即可，zig 支持 mipsel / mips（大端）/ arm 软浮点等。
 
 ## 自己编译
 
@@ -49,26 +44,27 @@ make CC=mipsel-openwrt-linux-gcc STATIC=-static
 mipsel-openwrt-linux-strip lan-share        # 可再小 30%
 ```
 
-没有 OpenWrt SDK 也能编译。**zig 自带 musl**，一个 40 MB 的下载就能覆盖 x86_64 / aarch64 / arm / mips 全部目标，CI 用的就是它：
+没有 OpenWrt SDK 也能编译。**zig 自带 musl**，一个 40 MB 的下载就能覆盖全部 Linux 目标，CI 用的就是它：
 
 ```bash
-zig cc -target mipsel-linux-musleabi -static -Os -std=c99 -o lan-share lan_share.c
+zig cc -target arm-linux-musleabihf -static -Os -std=c99 -o lan-share lan_share.c
 ```
-
-对应的 zig target 一览：
 
 | 产物 | zig target |
 | --- | --- |
-| `lan-share-x86_64-linux` | `x86_64-linux-musl` |
-| `lan-share-aarch64-linux` | `aarch64-linux-musl` |
-| `lan-share-mipsel-sf-linux` | `mipsel-linux-musleabi` |
-| `lan-share-mipsel-linux` | `mipsel-linux-musleabihf` |
-| `lan-share-mips-sf-linux` | `mips-linux-musleabi` |
-| `lan-share-aarch64-router-linux` | `aarch64-linux-musl` |
-| `lan-share-armv7l-linux` | `arm-linux-musleabihf` |
-| `lan-share-arm-sf-linux` | `arm-linux-musleabi` |
+| `lan-share-linux-amd64` | `x86_64-linux-musl` |
+| `lan-share-linux-arm64` | `aarch64-linux-musl` |
+| `lan-share-openwrt-armv7l` | `arm-linux-musleabihf` |
+| （按需）mipsel 软浮点 | `mipsel-linux-musleabi` |
+| （按需）mipsel 硬浮点 | `mipsel-linux-musleabihf` |
+| （按需）大端 MIPS | `mips-linux-musleabi` |
+| （按需）ARM 软浮点 | `arm-linux-musleabi` |
 
-注意 MIPS 必须写全 ABI（`musleabi` / `musleabihf`）。zig 不接受裸 `mipsel-linux-musl`，会报 `unable to provide libc`。
+两个坑：
+
+- **zig 不在 GitHub Release 上**。0.14 起 ziglang 只把源码包放 GitHub，预编译二进制在
+  `https://ziglang.org/download/<版本>/zig-x86_64-linux-<版本>.tar.xz`。写成 GitHub 的 URL 会 404。
+- **MIPS 必须写全 ABI**（`musleabi` / `musleabihf`）。写裸 `mipsel-linux-musl` 会报 `unable to provide libc`。
 
 `-Os` 比 `-O2` 更省空间，小 flash 设备优先用它（Makefile 默认已是 `-Os`）。
 
@@ -140,7 +136,7 @@ make test
 BASE=http://192.168.1.1:8080 node test.js
 ```
 
-CI 在 Ubuntu 和 macOS 上跑完整功能测试，并交叉编译全部 11 个目标，见 [build.yml](.github/workflows/build.yml)。
+CI 在 Ubuntu 和 macOS 上跑完整功能测试，并编译 Windows / Linux x64 / Linux ARM64 / OpenWrt ARMv7l 四个目标的二进制，见 [build.yml](.github/workflows/build.yml)。
 
 ## 实现说明
 
