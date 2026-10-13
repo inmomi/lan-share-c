@@ -206,7 +206,13 @@ async function dumpConnDiag(page, peerId) {
       const out = [];
       for (const l of conn.lanes) {
         const pc = l.pc;
-        const info = { cs: pc ? pc.connectionState : null, ice: pc ? pc.iceConnectionState : null };
+        /* ss=signalingState：区分"offer 已发出在等 answer"（have-local-offer）
+         * 和"压根没建链"（stable/new）——连不上时这是最关键的一条信息。 */
+        const info = {
+          cs: pc ? pc.connectionState : null,
+          ice: pc ? pc.iceConnectionState : null,
+          ss: pc ? pc.signalingState : null,
+        };
         if (pc && pc.getStats) {
           try {
             const stats = await pc.getStats();
@@ -298,9 +304,12 @@ async function dumpConnDiag(page, peerId) {
       `(async () => { await initiate(${JSON.stringify(targetFromA)}); return true; })()`, 30000);
     const connState = await waitConnected(pageA, targetFromA, 60000, 1);
     if (!connState.ok) {
-      const diag = await dumpConnDiag(pageA, targetFromA);
+      /* 两侧都要看：A 停在 have-local-offer 说明 offer 发出去了但没等到 answer，
+       * 而 B 侧 noConn 就说明 offer 根本没送到——两种原因修法完全不同。 */
+      const myId = await pageA.evaluate('state.myId');
       log(`连接未建立: ${JSON.stringify(connState)}`);
-      log(`ICE 候选对诊断: ${JSON.stringify(diag)}`);
+      log(`A 侧（发给 ${targetFromA}）: ${JSON.stringify(await dumpConnDiag(pageA, targetFromA))}`);
+      log(`B 侧（发给 ${myId}）: ${JSON.stringify(await dumpConnDiag(pageB, myId))}`);
       throw new Error('WebRTC 连接未在 60s 内建立（netns 直连或中继路径不通）');
     }
     log(`连接已建立: ${connState.connected}/${connState.total} 条 lane connected`);

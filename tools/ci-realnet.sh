@@ -131,6 +131,23 @@ no-cli
 EOF
   nohup turnserver -c /tmp/turn.conf >/tmp/turn.log 2>&1 &
   sleep 2
+  # TURN 预检：从 nsA 里真跑一次中继分配，确认 coturn 可达且凭据可用。
+  # Chrome 侧 ICE 失败是静默的（只表现为连不上），先在这里把
+  # "coturn 本身有问题" 和 "WebRTC 路径有问题" 区分开。
+  if command -v turnutils_uclient >/dev/null 2>&1; then
+    if ip netns exec "$NS_A" timeout 20 turnutils_uclient -u lan -w sharepass "$GW_A" \
+        >/tmp/turn-probe.log 2>&1; then
+      echo "TURN 预检 OK：nsA 能向 $GW_A 成功分配中继"
+    else
+      echo "::warning::TURN 预检失败（nsA 分配中继失败）"
+      echo "---- /tmp/turn-probe.log ----"
+      tail -n 20 /tmp/turn-probe.log 2>/dev/null || true
+      echo "---- /tmp/turn.log ----"
+      tail -n 20 /tmp/turn.log 2>/dev/null || true
+    fi
+  else
+    echo "（未找到 turnutils_uclient，跳过 TURN 预检）"
+  fi
   TURN_JSON="[{\"urls\":\"turn:$GW_A:3478?transport=udp\",\"username\":\"lan\",\"credential\":\"sharepass\"},{\"urls\":\"turn:$GW_A:3478?transport=tcp\",\"username\":\"lan\",\"credential\":\"sharepass\"}]"
   echo "coturn 已启动，TURN 配置已生成（中继地址 $GW_A:3478）"
 fi
