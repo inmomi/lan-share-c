@@ -1093,6 +1093,11 @@ static char *apply_turn_injection(const char *in, size_t in_len, size_t *out_len
     static const char TOKEN[] = "/*__TURN_CONFIG__*/ null";
     if (!g_turn_config || g_turn_config[0] == '\0') return NULL;
     const char *p = memstr(in, in_len, TOKEN);
+    /* 排查用：曾出现"服务端说已启用、但页面里 window.__LAN_SHARE_TURN__
+     * 仍是 null"，只能靠这行日志区分是"根本没调用"还是"调用了但没找到占位符"。
+     * 输出到 stderr，CI 里随 /tmp/lanshare.log 一起捞出来。 */
+    fprintf(stderr, "[turn-inject] cfg=%s body_len=%zu found=%d\n",
+            g_turn_config ? g_turn_config : "(null)", in_len, p ? 1 : 0);
     if (!p) return NULL;
     size_t tok_len = sizeof(TOKEN) - 1;
     size_t cfg_len = strlen(g_turn_config);

@@ -91,9 +91,12 @@
   </div>
 </div>
 
-<!-- 可选 TURN 中继配置：服务端按 LAN_SHARE_TURN 环境变量在返回首页时，
-     把占位符 /*__TURN_CONFIG__*/ null 替换成一段 JSON 数组（无则留 null，
-     纯内网离线直连）。app.js 的 makeLane 会把它加进 iceServers。 -->
+<!-- 可选 TURN 中继配置：服务端按 LAN_SHARE_TURN 环境变量在返回首页时，把下面
+     那行 script 里的占位标记替换成一段 JSON 数组（无则留 null，纯内网离线
+     直连）。app.js 的 makeLane 会把它加进 iceServers。
+     注意：占位标记的原文在整个文件里只能出现一次，就是下面那行。服务端的
+     替换命中的是"第一次出现"，所以在注释里再抄一遍原文，注入就会打进注释、
+     而真正要用的那行反而没被替换（页面里就永远是 null）。 -->
 <script>window.__LAN_SHARE_TURN__ = /*__TURN_CONFIG__*/ null;</script>
 <script src="/p2p-pump.js"></script>
 <script src="/app.js"></script>

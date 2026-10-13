@@ -51,8 +51,22 @@ const SERVER_URL_A = arg('server-url-a', null) || SERVER_URL;
 const SERVER_URL_B = arg('server-url-b', null) || SERVER_URL;
 const DEVTOOLS_A = arg('devtools-host-a', '127.0.0.1');
 const DEVTOOLS_B = arg('devtools-host-b', '127.0.0.1');
+/* DevTools 端口：浏览器 A / B 各一个。netns 场景下 ci-realnet.sh 起的转发代理
+ * 必须按同样的端口转发（nsA→9331、nsB→9332），两边约定一致才连得上——之前
+ * 两个 ns 都按 9331 起代理，B 的 9332 没人转发，于是"DevTools 未就绪"。 */
+const DEVTOOLS_PORT_A = Number(arg('devtools-port-a', 9331));
+const DEVTOOLS_PORT_B = Number(arg('devtools-port-b', 9332));
 /* 吞吐下限（MB/s）：低于此值判失败，用于守住"中继/直连确实能用"的回归。0 表示不检查。 */
 const THROUGHPUT_FLOOR = Number(arg('throughput-floor', 0));
+
+/* 全局硬超时：任何意外的永久挂起（比如兜底超时之前、或收尾阶段卡住）都不能
+ * 让 job 一直吃到 GitHub 的 30 分钟墙。内部上传循环有 TIMEOUT_MS 上限，
+ * 这里在它之外再给足余量后强制退出。 */
+const HARD_MS = TIMEOUT_MS + 180000;
+setTimeout(() => {
+  log(`全局硬超时 ${HARD_MS}ms，强制退出（疑似永久挂起）`);
+  process.exit(1);
+}, HARD_MS).unref();
 
 /* 把 "ip netns exec nsA" 这样的空格分隔串拆成命令前缀数组。 */
 function splitWrap(s) {
@@ -144,6 +158,82 @@ async function waitReady(page, timeoutMs) {
 const peerIds = (page) => page.evaluate('state.peers.map(p => p.id)');
 const peerNames = (page) => page.evaluate('state.peers.map(p => p.name)');
 
+/* 等 WebRTC 连接真正 established。app 在发现对端后会自动建 lane（每条一个
+ * RTCPeerConnection），这里轮询每条 lane 的 pc.connectionState，全部 connected
+ * 才继续；failed 或超时则把 ICE 候选对诊断打出来，让 CI 日志直接告诉我们
+ * "直连/中继到底通没通"，而不是默默卡死等到 job 被掐。 */
+async function waitConnected(page, peerId, timeoutMs, minConnected) {
+  /* minConnected：至少连上几条才算通（默认 1）。LANES 是 32，全连上要受
+   * initiate 的 150ms 逐条建链、以及 TURN 逐条分配中继端口影响，拿"全部连上"
+   * 当闸门会误杀；能通不能通看至少 1 条，快不快交给后面的吞吐下限去卡。 */
+  const need = minConnected || 1;
+  const deadline = Date.now() + timeoutMs;
+  let last = { found: false, lanes: [] };
+  for (;;) {
+    const st = await page.evaluate(`(function(){
+      const conn = state.conns.get(${JSON.stringify(peerId)});
+      if (!conn) return { found: false };
+      return { found: true, lanes: conn.lanes.map(function(l){
+        return { cs: l.pc ? l.pc.connectionState : 'no-pc', ice: l.pc ? l.pc.iceConnectionState : 'no-pc' };
+      }) };
+    })()`);
+    last = st;
+    if (st.found && st.lanes.length) {
+      /* 不把瞬时 failed 判死：app 的 retireLane 会把 failed 的 lane 换成全新
+       * 的 pc（回到 new/connecting 重新建链），这种可自愈的抖动不该让闸门失败。 */
+      const n = st.lanes.filter((l) => l.cs === 'connected').length;
+      if (n >= need) return { ok: true, connected: n, total: st.lanes.length, lanes: st.lanes };
+    }
+    if (Date.now() > deadline) {
+      const lanes = st.found ? st.lanes : [];
+      return {
+        ok: false, timeout: true,
+        connected: lanes.filter((l) => l.cs === 'connected').length,
+        total: lanes.length, lanes,
+      };
+    }
+    await new Promise((r) => setTimeout(r, 300));
+  }
+}
+
+/* 从 getStats 挖出每条 lane 选中的候选对（类型 + 地址）。悬而未连时这份
+ * 信息能直接定位是"host 候选没互通"还是"中继根本没用上"。 */
+async function dumpConnDiag(page, peerId) {
+  try {
+    return await page.evaluate(`(async () => {
+      const conn = state.conns.get(${JSON.stringify(peerId)});
+      if (!conn) return { noConn: true };
+      const out = [];
+      for (const l of conn.lanes) {
+        const pc = l.pc;
+        /* ss=signalingState：区分"offer 已发出在等 answer"（have-local-offer）
+         * 和"压根没建链"（stable/new）——连不上时这是最关键的一条信息。 */
+        const info = {
+          cs: pc ? pc.connectionState : null,
+          ice: pc ? pc.iceConnectionState : null,
+          ss: pc ? pc.signalingState : null,
+        };
+        if (pc && pc.getStats) {
+          try {
+            const stats = await pc.getStats();
+            let pair = null, local = null, remote = null;
+            stats.forEach((s) => {
+              if (s.type === 'candidate-pair' && s.state === 'succeeded' && !pair) pair = s;
+              if (s.type === 'local-candidate' && !local && s.candidateType) local = s;
+              if (s.type === 'remote-candidate' && !remote && s.candidateType) remote = s;
+            });
+            if (pair) info.pair = { type: pair.candidateType || pair.type };
+            if (local) info.local = { type: local.candidateType, addr: (local.address || '') + ':' + (local.port || '') };
+            if (remote) info.remote = { type: remote.candidateType, addr: (remote.address || '') + ':' + (remote.port || '') };
+          } catch (e) { info.statsErr = String(e); }
+        }
+        out.push(info);
+      }
+      return out;
+    })()`);
+  } catch (e) { return { err: e.message }; }
+}
+
 /* ------------------------------------------------------------ 主流程 */
 
 (async () => {
@@ -166,8 +256,14 @@ const peerNames = (page) => page.evaluate('state.peers.map(p => p.name)');
     log(`服务端: A→${urlA}  B→${urlB}`);
 
     log('拉起两个浏览器…');
-    pageA = await launchBrowser({ port: 9331, wrap: WRAP_A, devtoolsHost: DEVTOOLS_A });
-    pageB = await launchBrowser({ port: 9332, wrap: WRAP_B, devtoolsHost: DEVTOOLS_B });
+    pageA = await launchBrowser({
+      port: DEVTOOLS_PORT_A, wrap: WRAP_A,
+      devtoolsHost: DEVTOOLS_A, devtoolsPort: DEVTOOLS_PORT_A,
+    });
+    pageB = await launchBrowser({
+      port: DEVTOOLS_PORT_B, wrap: WRAP_B,
+      devtoolsHost: DEVTOOLS_B, devtoolsPort: DEVTOOLS_PORT_B,
+    });
     await pageA.navigate(urlA);
     await pageB.navigate(urlB);
     await waitReady(pageA, 30000);
@@ -195,6 +291,38 @@ const peerNames = (page) => page.evaluate('state.peers.map(p => p.name)');
     } catch (err) {
       log(`  TCP 基线测速失败（不影响 P2P 结论）: ${err.message}`);
     }
+
+    /* ---------------------------------------------------- 连接闸门
+     * 先显式等连接建立再跑测速：否则一旦 netns 直连或中继不通，speedP2p 会
+     * 永远 await，整个 job 只能被 GitHub 掐掉。这里 60s 内没 connected 就直接
+     * 失败并打印 ICE 诊断，日志里一眼能看出是"host 候选不通"还是"中继没用上"。 */
+    log('\n--- 等待 WebRTC 连接建立（闸门，60s）---');
+    /* 必须先用 app 自己的 initiate() 把连接发起：getConn 是懒创建的，不调它
+     * state.conns 里根本没有这条连接，直接等连接状态只会空等超时（第一次跑就
+     * 得到 {"noConn":true}）。initiate 幂等，已建过的 lane 会跳过。 */
+    await pageA.evaluate(
+      `(async () => { await initiate(${JSON.stringify(targetFromA)}); return true; })()`, 30000);
+    const connState = await waitConnected(pageA, targetFromA, 60000, 1);
+    if (!connState.ok) {
+      /* 两侧都要看：A 停在 have-local-offer 说明 offer 发出去了但没等到 answer，
+       * 而 B 侧 noConn 就说明 offer 根本没送到——两种原因修法完全不同。 */
+      const myId = await pageA.evaluate('state.myId');
+      /* 最关键的一条：TURN 到底有没有真的进到页面里。没进去的话隔离场景下
+       * 就只剩被 DROP 的 host 候选，必然连不上，而日志上和"中继配错了"长得一样。 */
+      const iceA = await pageA.evaluate(
+        'JSON.stringify({ injected: window.__LAN_SHARE_TURN__ || null,'
+        + ' built: (typeof buildIceServers === "function") ? buildIceServers() : "no-fn" })');
+      const iceB = await pageB.evaluate(
+        'JSON.stringify({ injected: window.__LAN_SHARE_TURN__ || null,'
+        + ' built: (typeof buildIceServers === "function") ? buildIceServers() : "no-fn" })');
+      log(`A 页 ICE 配置: ${iceA}`);
+      log(`B 页 ICE 配置: ${iceB}`);
+      log(`连接未建立: ${JSON.stringify(connState)}`);
+      log(`A 侧（发给 ${targetFromA}）: ${JSON.stringify(await dumpConnDiag(pageA, targetFromA))}`);
+      log(`B 侧（发给 ${myId}）: ${JSON.stringify(await dumpConnDiag(pageB, myId))}`);
+      throw new Error('WebRTC 连接未在 60s 内建立（netns 直连或中继路径不通）');
+    }
+    log(`连接已建立: ${connState.connected}/${connState.total} 条 lane connected`);
 
     /* ---------------------------------------------------- 1. 内置测速 */
     log('\n--- 内置测速（speedP2p，与真实传输同一条 pumpFile 通路）---');
@@ -440,4 +568,9 @@ const peerNames = (page) => page.evaluate('state.peers.map(p => p.name)');
     if (server) server.kill();
     try { fs.rmSync(dlDir, { recursive: true, force: true }); } catch (_) {}
   }
-})();
+})().then(() => {
+  /* 明确退出：失败后残留的 WebSocket / 浏览器子进程会把事件循环一直撑住，
+   * 只设 process.exitCode 而不退出的话，job 会空转到全局硬超时才结束
+   * （第一次跑就是 08:09 失败、08:16 才被硬超时收掉）。 */
+  process.exit(process.exitCode || 0);
+});
