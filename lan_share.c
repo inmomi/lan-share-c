@@ -419,6 +419,11 @@ typedef struct {
     char pend[IO_BUF];
     size_t pendlen;
 
+    /* 兜底通道（二进制中转）统计。关闭时打出来，就能看出"是谁先断的、
+     * 断的时候两边各走到哪一步"——只报一句"连接中断"是查不出东西的。 */
+    uint64_t relay_in;    /* 从本连接收到的二进制帧字节（含帧首 id 前缀） */
+    uint64_t relay_out;   /* 转发给本连接的二进制帧字节（纯载荷） */
+
     ls_out out;
 } ls_client;
 
@@ -834,7 +839,18 @@ static void ws_send_binary(ls_client *c, const unsigned char *payload, size_t le
     size_t body, hlen, i;
     if (idlen > 255) return;
     body = 1 + idlen + len;
-    if (body > WS_BUF) return;
+    if (body > WS_BUF) {
+        /* 超限只能丢（一帧塞不下）。静默丢会让发送端永远等不到确认——
+         * 表现是进度卡死在某个百分比，而服务端日志一片空白。 */
+        static unsigned long toobig = 0;
+        toobig++;
+        if (toobig <= 5 || toobig % 500 == 0) {
+            fprintf(stderr, "[lan-share] 中转丢弃：单帧 %lu > WS_BUF=%d（累计 %lu 帧）\n",
+                    (unsigned long)body, WS_BUF, toobig);
+            fflush(stderr);
+        }
+        return;
+    }
     frame = (unsigned char *)malloc(body + 16);
     if (!frame) return;
     /* 先按 body 长度算出帧头占几个字节，再把 body 写到正确偏移上。
@@ -857,10 +873,12 @@ static void ws_send_binary(ls_client *c, const unsigned char *payload, size_t le
     if (len) memcpy(frame + hlen + 1 + idlen, payload, len);
     queue_mem(c, (const char *)frame, hlen + body);
     free(frame);
+    c->relay_out += len;
 }
 
 /* 把一条二进制帧转给目标客户端。找不到就静默丢弃——对端可能刚断线，
- * 上层有超时和重传兜着，没必要为了一个找不到的 id 关掉转发方的连接。 */
+ * 上层有超时和重传兜着，没必要为了一个找不到的 id 关掉转发方的连接。
+ * 但丢了多少必须留下痕迹：否则表现就是"进度条突然不动了"，而日志全空白。 */
 static void forward_binary(ls_client *c, const unsigned char *payload, size_t len) {
     char to[ID_MAX];
     size_t idlen;
@@ -871,12 +889,26 @@ static void forward_binary(ls_client *c, const unsigned char *payload, size_t le
     if (idlen >= sizeof to) return;
     memcpy(to, payload + 1, idlen);
     to[idlen] = '\0';
+    c->relay_in += len;
+    /* 每 8MB 打一行进度。只报"连接中断"是没用的，得知道断之前双方各走了多远。 */
+    if (c->relay_in / (8u << 20) != (c->relay_in - len) / (8u << 20)) {
+        fprintf(stderr, "[lan-share] 中转进度 %s→%s：已转发 %llu MB\n",
+                c->id, to, (unsigned long long)(c->relay_in / (1u << 20)));
+        fflush(stderr);
+    }
     for (i = 0; i < MAX_CLIENTS; i++) {
         if (!g_clients[i].used || g_clients[i].mode != MODE_WS) continue;
         if (strcmp(g_clients[i].id, to) == 0) {
             ws_send_binary(&g_clients[i], payload + 1 + idlen, len - 1 - idlen, c->id);
             return;
         }
+    }
+    static unsigned long dropped = 0;
+    dropped++;
+    if (dropped <= 5 || dropped % 500 == 0) {
+        fprintf(stderr, "[lan-share] 中转丢弃：找不到目标 %s（累计 %lu 帧，来自 %s）\n",
+                to, dropped, c->id);
+        fflush(stderr);
     }
 }
 
@@ -933,8 +965,23 @@ static void broadcast_peers(void) {
     }
 }
 
-static void client_close(ls_client *c) {
+/* 关连接一律走这里，并且必须说清"为什么关"。
+ *
+ * 原来有十来个调用点直接 client_close(c)，什么也不打。于是出现这种局面：
+ * 客户端报 1006（对端没说再见就消失），服务端进程还在、日志一片空白，
+ * 谁关的、在哪一步关的完全无从判断——只能靠猜。现在每条关闭都带一个原因
+ * 字符串，加上 errno、收发位置和中转计数，一次就能定位。 */
+static void client_close_why(ls_client *c, const char *why) {
     int was_ws = (c->mode == MODE_WS);
+    int err = (int)ls_last_err();
+    fprintf(stderr,
+            "[lan-share] 关闭连接 id=%s ip=%s mode=%d 原因=%s errno=%d "
+            "wlen=%lu 待发=%lu/%lu 中转 收=%llu 发=%llu\n",
+            c->id[0] ? c->id : "-", c->ip[0] ? c->ip : "-", c->mode, why, err,
+            (unsigned long)c->wlen,
+            (unsigned long)c->out.sent, (unsigned long)c->out.len,
+            (unsigned long long)c->relay_in, (unsigned long long)c->relay_out);
+    fflush(stderr);
     if (c->upfd >= 0) {
         ls_closefile(c->upfd);
         c->upfd = -1;
@@ -945,6 +992,10 @@ static void client_close(ls_client *c) {
     c->fd = -1;
     c->upfd = -1;
     if (was_ws) broadcast_peers();
+}
+
+static void client_close(ls_client *c) {
+    client_close_why(c, "未标注");
 }
 
 static void forward_signal(ls_client *target, const char *from_id, const char *msg) {
@@ -1654,6 +1705,9 @@ static long process_request(ls_client *c, const char *req, size_t len) {
          * 101 响应占用了输出缓冲，peers 广播必须等它发完再补发，
          * 否则会把握手响应覆盖掉，浏览器会认为握手失败。 */
         c->pending_hello = 1;
+        fprintf(stderr, "[lan-share] WS 就绪 id=%s ip=%s（当前 WS 连接 %d 个）\n",
+                c->id, c->ip, count_ws_clients());
+        fflush(stderr);
         return (long)len;
     }
 
@@ -1876,9 +1930,7 @@ static void ws_consume(ls_client *c) {
             off = 10;
         }
         if (plen > WS_BUF) {
-            fprintf(stderr, "[lan-share] 单帧超限关闭：plen=%llu > WS_BUF=%d\n",
-                    (unsigned long long)plen, WS_BUF);
-            client_close(c);
+            client_close_why(c, "单帧超限");
             return;
         }
         mask[0] = mask[1] = mask[2] = mask[3] = 0;
@@ -1895,13 +1947,20 @@ static void ws_consume(ls_client *c) {
         }
 
         if (opcode == 0x8) {
-            client_close(c);
+            /* 对端说了再见：按规范回一个关闭帧再关，否则它看到的是 1006
+             * （异常断开），和网络掉线长得一模一样，查起来白费功夫。 */
+            unsigned char bye[16];
+            size_t bl = ws_frame_build(0x8, NULL, 0, bye, sizeof bye);
+            if (bl) {
+                (void)send(c->fd, (const char *)bye, (int)bl, 0);
+            }
+            client_close_why(c, "收到对端关闭帧");
             return;
         }
 
         if (opcode == 0x0) {
             if (c->fraglen + (size_t)plen > WS_BUF) {
-                client_close(c);
+                client_close_why(c, "分片缓冲超限");
                 return;
             }
             memcpy(c->frag + c->fraglen, payload, (size_t)plen);
@@ -1971,12 +2030,12 @@ static void client_readable(ls_client *c) {
         n = (int)recv(c->fd, buf, want, 0);
 
         if (n == 0) {
-            client_close(c);
+            client_close_why(c, "对端 FIN（recv 返回 0）");
             return;
         }
         if (n < 0) {
             if (would_block()) return;
-            client_close(c);
+            client_close_why(c, "recv 出错");
             return;
         }
 
@@ -1984,7 +2043,7 @@ static void client_readable(ls_client *c) {
             size_t w = (size_t)n;
             if ((uint64_t)w > c->upleft) w = (size_t)c->upleft;
             if (ls_write(c->upfd, buf, w) != (long)w) {
-                client_close(c);
+                client_close_why(c, "上传写盘失败");
                 return;
             }
             c->upleft -= (uint64_t)w;
@@ -1994,9 +2053,7 @@ static void client_readable(ls_client *c) {
             }
         } else if (c->mode == MODE_WS) {
             if (c->wlen + (size_t)n > WS_BUF) {
-                fprintf(stderr, "[lan-share] WS 缓冲放不下关闭：wlen=%lu + n=%d > WS_BUF=%d\n",
-                        (unsigned long)c->wlen, n, WS_BUF);
-                client_close(c);
+                client_close_why(c, "WS 接收缓冲放不下");
                 return;
             }
             memcpy(c->wbuf + c->wlen, buf, (size_t)n);
@@ -2006,7 +2063,7 @@ static void client_readable(ls_client *c) {
             /* HTTP：先攒进头缓冲再解析。process_request 会一次性吃掉整个缓冲区
              * （连同跟着头一起来的 body），所以正常情况下 hbuf 会被清空。 */
             if (c->hlen + (size_t)n > HEAD_BUF) {
-                client_close(c);
+                client_close_why(c, "HTTP 头缓冲超限");
                 return;
             }
             memcpy(c->hbuf + c->hlen, buf, (size_t)n);
@@ -2015,7 +2072,7 @@ static void client_readable(ls_client *c) {
             for (;;) {
                 long used = process_request(c, c->hbuf, c->hlen);
                 if (used < 0) {
-                    client_close(c);
+                    client_close_why(c, "请求解析/响应失败");
                     return;
                 }
                 if (used == 0) return;   /* 头还没收全，等下一次可读 */
@@ -2386,7 +2443,7 @@ int main(int argc, char **argv) {
             if (FD_ISSET(g_clients[i].fd, &wfds)) {
                 int fr = flush_out(&g_clients[i]);
                 if (fr < 0) {
-                    client_close(&g_clients[i]);
+                    client_close_why(&g_clients[i], "发送失败（flush_out<0）");
                     continue;
                 }
                 if (fr == 1 && g_clients[i].pending_hello) {

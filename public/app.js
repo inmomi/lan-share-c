@@ -209,6 +209,10 @@ function connect() {
       at: Date.now(),
       sent: ws ? ws.bufferedAmount : -1,
     };
+    /* 也往控制台打一份：CI 会把页面 console 汇到日志里，这样"谁在哪一刻断的"
+     * 和服务端日志能对上时间轴，不用两边猜。 */
+    console.log('[lan-share] 信令已断:', JSON.stringify(window.__wsClose),
+                '我=', state.myId, '已有连接=', state.conns.size);
     state.peers = [];
     /* 兜底通道是挂在信令 WebSocket 上的：连接一断它就废了。必须显式关掉，
      * 否则正在跑的传输会卡在 waitDrain 上（readyState 还是 open，却永远

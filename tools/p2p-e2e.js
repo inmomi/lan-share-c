@@ -376,24 +376,33 @@ async function dumpConnDiag(page, peerId) {
         log(`  测速失败: ${err.message}`);
         for (const [tag, pg] of [['A', pageA], ['B', pageB]]) {
           try {
+            /* 之前这里按 targetFromA 去查 conns——那是"对端"的 id，在 B 的
+             * 表里根本不存在，于是 B 侧永远打出 relay:null/lanes:-1，看着像
+             * "B 什么都没建"，其实是查错了键。现在整表打出来，一个都不漏。 */
             const d = await pg.evaluate(`(function(){
-              const conn = state.conns.get(${JSON.stringify(targetFromA)});
-              const wsState = ws ? ws.readyState : -1;
-              return JSON.stringify({
-                wsState: wsState,
+              const out = {
+                myId: state.myId,
+                wsState: ws ? ws.readyState : -1,
                 wsBuffered: ws ? ws.bufferedAmount : -1,
-                wsClose: window.__wsClose || null,
-                relay: conn && conn.relay ? {
-                  ready: conn.relay.dc.readyState,
-                  inflight: conn.relay.dc.inflight,
-                  buffered: conn.relay.dc.bufferedAmount,
-                  ackPending: conn.relay.ackPending,
-                } : null,
-                lanes: conn ? conn.lanes.filter(function(l){
-                  return l.pc && (l.pc.connectionState === 'connected'
-                    || l.pc.connectionState === 'failed');
-                }).length : -1,
+                wsClosed: window.__wsClose || null,
+                conns: [],
+              };
+              state.conns.forEach(function(conn, key){
+                out.conns.push({
+                  key: key,
+                  relay: conn.relay ? {
+                    ready: conn.relay.dc.readyState,
+                    inflight: conn.relay.dc.inflight,
+                    buffered: conn.relay.dc.bufferedAmount,
+                    ackPending: conn.relay.ackPending,
+                  } : null,
+                  lanes: (conn.lanes || []).length,
+                  open: (conn.lanes || []).filter(function(l){
+                    return l.dc && l.dc.readyState === 'open';
+                  }).length,
+                });
               });
+              return JSON.stringify(out);
             })()`);
             log(`  ${tag} 侧传输层状态: ${d}`);
           } catch (e2) { log(`  ${tag} 侧状态读取失败: ${e2.message}`); }
