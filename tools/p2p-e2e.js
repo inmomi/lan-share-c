@@ -550,7 +550,10 @@ async function dumpConnDiag(page, peerId) {
           });
         }
         return out;
-      })()`);
+        /* lane 扫描要按 TIMEOUT_MS 给足预算，不能用 evaluate 的默认 120s：
+         * 6 档 lane 数（1,2,4,8,16,32）逐档跑，丢包链路上每档最多要等 30s
+         * 握手重传，累计轻松超过 120s——20ms+2% 丢包那档就是这么被误杀的。 */
+      })()`, TIMEOUT_MS);
       for (const r of rounds) {
         if (r.error) { log(`  ${String(r.n).padStart(2)} 条: ${r.error}`); continue; }
         log(`  ${String(r.n).padStart(2)} 条 lane: 合计 ${r.mbps.toFixed(1)} MB/s`
