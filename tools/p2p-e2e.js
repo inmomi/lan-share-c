@@ -162,8 +162,13 @@ const peerNames = (page) => page.evaluate('state.peers.map(p => p.name)');
  * RTCPeerConnection），这里轮询每条 lane 的 pc.connectionState，全部 connected
  * 才继续；failed 或超时则把 ICE 候选对诊断打出来，让 CI 日志直接告诉我们
  * "直连/中继到底通没通"，而不是默默卡死等到 job 被掐。 */
-async function waitConnected(page, peerId, timeoutMs) {
+async function waitConnected(page, peerId, timeoutMs, minConnected) {
+  /* minConnected：至少连上几条才算通（默认 1）。LANES 是 32，全连上要受
+   * initiate 的 150ms 逐条建链、以及 TURN 逐条分配中继端口影响，拿"全部连上"
+   * 当闸门会误杀；能通不能通看至少 1 条，快不快交给后面的吞吐下限去卡。 */
+  const need = minConnected || 1;
   const deadline = Date.now() + timeoutMs;
+  let last = { found: false, lanes: [] };
   for (;;) {
     const st = await page.evaluate(`(function(){
       const conn = state.conns.get(${JSON.stringify(peerId)});
@@ -172,14 +177,21 @@ async function waitConnected(page, peerId, timeoutMs) {
         return { cs: l.pc ? l.pc.connectionState : 'no-pc', ice: l.pc ? l.pc.iceConnectionState : 'no-pc' };
       }) };
     })()`);
+    last = st;
     if (st.found && st.lanes.length) {
-      /* 只在"全部 connected"时判成功，其余一律继续轮询到截止。
-       * 不把瞬时 failed 判死：app 的 retireLane 会把 failed 的 lane 换成全新
+      /* 不把瞬时 failed 判死：app 的 retireLane 会把 failed 的 lane 换成全新
        * 的 pc（回到 new/connecting 重新建链），这种可自愈的抖动不该让闸门失败。 */
-      const all = st.lanes.every((l) => l.cs === 'connected');
-      if (all) return { ok: true, lanes: st.lanes };
+      const n = st.lanes.filter((l) => l.cs === 'connected').length;
+      if (n >= need) return { ok: true, connected: n, total: st.lanes.length, lanes: st.lanes };
     }
-    if (Date.now() > deadline) return { ok: false, timeout: true, lanes: st.found ? st.lanes : [] };
+    if (Date.now() > deadline) {
+      const lanes = st.found ? st.lanes : [];
+      return {
+        ok: false, timeout: true,
+        connected: lanes.filter((l) => l.cs === 'connected').length,
+        total: lanes.length, lanes,
+      };
+    }
     await new Promise((r) => setTimeout(r, 300));
   }
 }
@@ -279,14 +291,19 @@ async function dumpConnDiag(page, peerId) {
      * 永远 await，整个 job 只能被 GitHub 掐掉。这里 60s 内没 connected 就直接
      * 失败并打印 ICE 诊断，日志里一眼能看出是"host 候选不通"还是"中继没用上"。 */
     log('\n--- 等待 WebRTC 连接建立（闸门，60s）---');
-    const connState = await waitConnected(pageA, targetFromA, 60000);
+    /* 必须先用 app 自己的 initiate() 把连接发起：getConn 是懒创建的，不调它
+     * state.conns 里根本没有这条连接，直接等连接状态只会空等超时（第一次跑就
+     * 得到 {"noConn":true}）。initiate 幂等，已建过的 lane 会跳过。 */
+    await pageA.evaluate(
+      `(async () => { await initiate(${JSON.stringify(targetFromA)}); return true; })()`, 30000);
+    const connState = await waitConnected(pageA, targetFromA, 60000, 1);
     if (!connState.ok) {
       const diag = await dumpConnDiag(pageA, targetFromA);
       log(`连接未建立: ${JSON.stringify(connState)}`);
       log(`ICE 候选对诊断: ${JSON.stringify(diag)}`);
       throw new Error('WebRTC 连接未在 60s 内建立（netns 直连或中继路径不通）');
     }
-    log(`连接已建立: ${JSON.stringify(connState)}`);
+    log(`连接已建立: ${connState.connected}/${connState.total} 条 lane connected`);
 
     /* ---------------------------------------------------- 1. 内置测速 */
     log('\n--- 内置测速（speedP2p，与真实传输同一条 pumpFile 通路）---');
