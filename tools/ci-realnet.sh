@@ -117,11 +117,24 @@ EOF
   echo "coturn 已启动，TURN 配置已生成（中继地址 $GW_A:3478）"
 fi
 
+# ---- netns 连通自检（秒级，先于浏览器测试；路由接错立刻现形）----
+echo "=== netns 连通自检 ==="
+if ip netns exec "$NS_A" ping -c1 -W2 -q "$GW_A" >/dev/null 2>&1; then echo "  nsA -> 网关 $GW_A: OK"; else echo "  nsA -> 网关 $GW_A: FAIL"; fi
+if ip netns exec "$NS_B" ping -c1 -W2 -q "$GW_B" >/dev/null 2>&1; then echo "  nsB -> 网关 $GW_B: OK"; else echo "  nsB -> 网关 $GW_B: FAIL"; fi
+if [ "$ISOLATE" = "1" ]; then
+  if ip netns exec "$NS_A" ping -c1 -W2 -q "$IP_B" >/dev/null 2>&1; then echo "  隔离异常: nsA -> nsB($IP_B) 竟可达"; else echo "  隔离 OK: nsA -> nsB($IP_B) 被 DROP（符合预期）"; fi
+else
+  if ip netns exec "$NS_A" ping -c1 -W2 -q "$IP_B" >/dev/null 2>&1; then echo "  直连 OK: nsA -> nsB($IP_B) 可达（符合预期）"; else echo "  直连异常: nsA -> nsB($IP_B) 不可达（netns 路由坏了）"; fi
+fi
+
 # ---- 写出 realnet.env（值含空格的必须加引号，否则 source 时会被当成命令执行）----
 {
   echo "SERVER_PORT=$SERVER_PORT"
   echo "SERVER_URL_A='http://$GW_A:$SERVER_PORT'"
   echo "SERVER_URL_B='http://$GW_B:$SERVER_PORT'"
+  echo "GW_A='$GW_A'"
+  echo "GW_B='$GW_B'"
+  echo "ISOLATE='$ISOLATE'"
   echo "WRAP_A='ip netns exec $NS_A'"
   echo "WRAP_B='ip netns exec $NS_B'"
   echo "DEVTOOLS_A='$IP_A'"

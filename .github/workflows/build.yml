@@ -230,7 +230,7 @@ jobs:
   two-host-lan:
     name: 两主机 LAN（netns 真实 IP 直连）
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -275,6 +275,11 @@ jobs:
             ./lan-share -p "$SERVER_PORT" -d ./uploads -w ./public >/tmp/lanshare.log 2>&1 &
             SRV=$!
             sleep 1
+            # 服务端可达性自检：从两个 ns 各探一次，路由接错立刻现形
+            ip netns exec nsA curl -sf -o /dev/null --max-time 5 "http://$GW_A:$SERVER_PORT/" \
+              && echo "nsA 可达服务端 OK" || { echo "::error::nsA 不可达服务端"; kill $SRV 2>/dev/null; exit 1; }
+            ip netns exec nsB curl -sf -o /dev/null --max-time 5 "http://$GW_B:$SERVER_PORT/" \
+              && echo "nsB 可达服务端 OK" || { echo "::error::nsB 不可达服务端"; kill $SRV 2>/dev/null; exit 1; }
             node tools/p2p-e2e.js --server-url "$SERVER_URL_A" \
               --chrome-wrap-a "$WRAP_A" --chrome-wrap-b "$WRAP_B" \
               --devtools-host-a "$DEVTOOLS_A" --devtools-host-b "$DEVTOOLS_B" \
@@ -286,7 +291,7 @@ jobs:
   isolated-relay:
     name: AP 隔离 + TURN 中继（必须走中继）
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -330,6 +335,11 @@ jobs:
             LAN_SHARE_TURN="$LAN_SHARE_TURN" ./lan-share -p "$SERVER_PORT" -d ./uploads -w ./public >/tmp/lanshare.log 2>&1 &
             SRV=$!
             sleep 1
+            # 服务端可达性自检：隔离下每个 ns 只能到自己的网关，这也是预期路径
+            ip netns exec nsA curl -sf -o /dev/null --max-time 5 "http://$GW_A:$SERVER_PORT/" \
+              && echo "nsA 可达服务端 OK" || { echo "::error::nsA 不可达服务端"; kill $SRV 2>/dev/null; exit 1; }
+            ip netns exec nsB curl -sf -o /dev/null --max-time 5 "http://$GW_B:$SERVER_PORT/" \
+              && echo "nsB 可达服务端 OK" || { echo "::error::nsB 不可达服务端"; kill $SRV 2>/dev/null; exit 1; }
             node tools/p2p-e2e.js --server-url "$SERVER_URL_A" \
               --chrome-wrap-a "$WRAP_A" --chrome-wrap-b "$WRAP_B" \
               --devtools-host-a "$DEVTOOLS_A" --devtools-host-b "$DEVTOOLS_B" \

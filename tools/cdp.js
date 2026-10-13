@@ -121,11 +121,19 @@ class CdpPage {
     this._handlers.get(method).push(handler);
   }
 
-  /** 在页面里执行表达式，awaitPromise 让 async 函数也能直接拿到结果。 */
-  async evaluate(expression) {
-    const r = await this.send('Runtime.evaluate', {
-      expression, returnByValue: true, awaitPromise: true,
-    });
+  /** 在页面里执行表达式，awaitPromise 让 async 函数也能直接拿到结果。
+   *  timeoutMs（默认 120s）：页面内若是 async 且永远不 settle（比如 WebRTC
+   *  连接始终建不起来，speedP2p 卡死），这里必须兜底超时，否则整个测试会
+   *  一直挂到 GitHub 的 job 超时（30 分钟）才被掐掉，既浪费又看不到原因。 */
+  async evaluate(expression, timeoutMs) {
+    const t = timeoutMs || 120000;
+    const r = await Promise.race([
+      this.send('Runtime.evaluate', {
+        expression, returnByValue: true, awaitPromise: true,
+      }),
+      new Promise((_, rej) =>
+        setTimeout(() => rej(new Error(`evaluate 超时 ${t}ms（页面内异步可能永远没返回）`)), t)),
+    ]);
     if (r.exceptionDetails) {
       const d = r.exceptionDetails.exception && r.exceptionDetails.exception.description;
       throw new Error(`页面内执行出错: ${d || r.exceptionDetails.text}`);

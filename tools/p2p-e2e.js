@@ -54,6 +54,15 @@ const DEVTOOLS_B = arg('devtools-host-b', '127.0.0.1');
 /* 吞吐下限（MB/s）：低于此值判失败，用于守住"中继/直连确实能用"的回归。0 表示不检查。 */
 const THROUGHPUT_FLOOR = Number(arg('throughput-floor', 0));
 
+/* 全局硬超时：任何意外的永久挂起（比如兜底超时之前、或收尾阶段卡住）都不能
+ * 让 job 一直吃到 GitHub 的 30 分钟墙。内部上传循环有 TIMEOUT_MS 上限，
+ * 这里在它之外再给足余量后强制退出。 */
+const HARD_MS = TIMEOUT_MS + 180000;
+setTimeout(() => {
+  log(`全局硬超时 ${HARD_MS}ms，强制退出（疑似永久挂起）`);
+  process.exit(1);
+}, HARD_MS).unref();
+
 /* 把 "ip netns exec nsA" 这样的空格分隔串拆成命令前缀数组。 */
 function splitWrap(s) {
   if (!s || typeof s !== 'string') return [];
@@ -144,6 +153,64 @@ async function waitReady(page, timeoutMs) {
 const peerIds = (page) => page.evaluate('state.peers.map(p => p.id)');
 const peerNames = (page) => page.evaluate('state.peers.map(p => p.name)');
 
+/* 等 WebRTC 连接真正 established。app 在发现对端后会自动建 lane（每条一个
+ * RTCPeerConnection），这里轮询每条 lane 的 pc.connectionState，全部 connected
+ * 才继续；failed 或超时则把 ICE 候选对诊断打出来，让 CI 日志直接告诉我们
+ * "直连/中继到底通没通"，而不是默默卡死等到 job 被掐。 */
+async function waitConnected(page, peerId, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const st = await page.evaluate(`(function(){
+      const conn = state.conns.get(${JSON.stringify(peerId)});
+      if (!conn) return { found: false };
+      return { found: true, lanes: conn.lanes.map(function(l){
+        return { cs: l.pc ? l.pc.connectionState : 'no-pc', ice: l.pc ? l.pc.iceConnectionState : 'no-pc' };
+      }) };
+    })()`);
+    if (st.found && st.lanes.length) {
+      /* 只在"全部 connected"时判成功，其余一律继续轮询到截止。
+       * 不把瞬时 failed 判死：app 的 retireLane 会把 failed 的 lane 换成全新
+       * 的 pc（回到 new/connecting 重新建链），这种可自愈的抖动不该让闸门失败。 */
+      const all = st.lanes.every((l) => l.cs === 'connected');
+      if (all) return { ok: true, lanes: st.lanes };
+    }
+    if (Date.now() > deadline) return { ok: false, timeout: true, lanes: st.found ? st.lanes : [] };
+    await new Promise((r) => setTimeout(r, 300));
+  }
+}
+
+/* 从 getStats 挖出每条 lane 选中的候选对（类型 + 地址）。悬而未连时这份
+ * 信息能直接定位是"host 候选没互通"还是"中继根本没用上"。 */
+async function dumpConnDiag(page, peerId) {
+  try {
+    return await page.evaluate(`(async () => {
+      const conn = state.conns.get(${JSON.stringify(peerId)});
+      if (!conn) return { noConn: true };
+      const out = [];
+      for (const l of conn.lanes) {
+        const pc = l.pc;
+        const info = { cs: pc ? pc.connectionState : null, ice: pc ? pc.iceConnectionState : null };
+        if (pc && pc.getStats) {
+          try {
+            const stats = await pc.getStats();
+            let pair = null, local = null, remote = null;
+            stats.forEach((s) => {
+              if (s.type === 'candidate-pair' && s.state === 'succeeded' && !pair) pair = s;
+              if (s.type === 'local-candidate' && !local && s.candidateType) local = s;
+              if (s.type === 'remote-candidate' && !remote && s.candidateType) remote = s;
+            });
+            if (pair) info.pair = { type: pair.candidateType || pair.type };
+            if (local) info.local = { type: local.candidateType, addr: (local.address || '') + ':' + (local.port || '') };
+            if (remote) info.remote = { type: remote.candidateType, addr: (remote.address || '') + ':' + (remote.port || '') };
+          } catch (e) { info.statsErr = String(e); }
+        }
+        out.push(info);
+      }
+      return out;
+    })()`);
+  } catch (e) { return { err: e.message }; }
+}
+
 /* ------------------------------------------------------------ 主流程 */
 
 (async () => {
@@ -195,6 +262,20 @@ const peerNames = (page) => page.evaluate('state.peers.map(p => p.name)');
     } catch (err) {
       log(`  TCP 基线测速失败（不影响 P2P 结论）: ${err.message}`);
     }
+
+    /* ---------------------------------------------------- 连接闸门
+     * 先显式等连接建立再跑测速：否则一旦 netns 直连或中继不通，speedP2p 会
+     * 永远 await，整个 job 只能被 GitHub 掐掉。这里 60s 内没 connected 就直接
+     * 失败并打印 ICE 诊断，日志里一眼能看出是"host 候选不通"还是"中继没用上"。 */
+    log('\n--- 等待 WebRTC 连接建立（闸门，60s）---');
+    const connState = await waitConnected(pageA, targetFromA, 60000);
+    if (!connState.ok) {
+      const diag = await dumpConnDiag(pageA, targetFromA);
+      log(`连接未建立: ${JSON.stringify(connState)}`);
+      log(`ICE 候选对诊断: ${JSON.stringify(diag)}`);
+      throw new Error('WebRTC 连接未在 60s 内建立（netns 直连或中继路径不通）');
+    }
+    log(`连接已建立: ${JSON.stringify(connState)}`);
 
     /* ---------------------------------------------------- 1. 内置测速 */
     log('\n--- 内置测速（speedP2p，与真实传输同一条 pumpFile 通路）---');
