@@ -18,6 +18,8 @@
  */
 
 const http = require('http');
+const net = require('net');
+const crypto = require('crypto');
 const { URL } = require('url');
 const { spawn } = require('child_process');
 
@@ -239,6 +241,199 @@ async function testBigFile() {
         `${dl.body.length} vs ${size}`);
     check('5MB 内容逐字节一致', dl.body.equals(big));
     await json('DELETE', '/api/files?name=big5mb.bin');
+}
+
+/* ==========================================================================
+ * 最小 WebSocket 客户端（只用 net + crypto，零依赖）
+ *
+ * 为什么不用 Node 全局 WebSocket：它不暴露"分片发送"和"握手与首帧合并成一次
+ * 写入"这两件事，而服务端的两个坑恰恰只在这两种形状下才暴露。浏览器会替我们
+ * 造出这些形状，但不可控（分片阈值是实现细节）、也慢——真机上表现为"传到
+ * 380KB 突然全断、只报一句连接中断"，查了很久。
+ * 自己拼字节，就能把它变成一条确定性的断言。
+ * ========================================================================== */
+function buildFrame(op, payload, fin) {
+    const p = Buffer.isBuffer(payload) ? payload : Buffer.from(payload || '');
+    const mask = crypto.randomBytes(4);
+    let head;
+    if (p.length < 126) {
+        head = Buffer.alloc(2);
+        head[1] = 0x80 | p.length;
+    } else if (p.length < 65536) {
+        head = Buffer.alloc(4);
+        head[1] = 0x80 | 126;
+        head.writeUInt16BE(p.length, 2);
+    } else {
+        head = Buffer.alloc(10);
+        head[1] = 0x80 | 127;
+        head.writeBigUInt64BE(BigInt(p.length), 2);
+    }
+    head[0] = (fin === false ? 0 : 0x80) | op;
+    const body = Buffer.alloc(p.length);
+    for (let i = 0; i < p.length; i++) body[i] = p[i] ^ mask[i % 4];
+    return Buffer.concat([head, mask, body]);
+}
+
+/* 服务端→客户端的帧不带掩码 */
+function takeFrame(state) {
+    const b = state.buf;
+    if (b.length < 2) return null;
+    const fin = (b[0] & 0x80) !== 0;
+    const op = b[0] & 0x0f;
+    let len = b[1] & 0x7f;
+    let off = 2;
+    if (len === 126) {
+        if (b.length < 4) return null;
+        len = b.readUInt16BE(2); off = 4;
+    } else if (len === 127) {
+        if (b.length < 10) return null;
+        len = Number(b.readBigUInt64BE(2)); off = 10;
+    }
+    if (b.length < off + len) return null;
+    const payload = b.slice(off, off + len);
+    state.buf = b.slice(off + len);
+    return { fin, op, payload };
+}
+
+function rawWsConnect(host, port, path) {
+    const socket = net.connect(Number(port), host);
+    const key = crypto.randomBytes(16).toString('base64');
+    const accept = crypto.createHash('sha1')
+        .update(key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11')
+        .digest('base64');
+    const req = Buffer.from(
+        `GET ${path} HTTP/1.1\r\n`
+        + `Host: ${host}:${port}\r\n`
+        + 'Upgrade: websocket\r\n'
+        + 'Connection: Upgrade\r\n'
+        + `Sec-WebSocket-Key: ${key}\r\n`
+        + 'Sec-WebSocket-Version: 13\r\n\r\n', 'latin1');
+
+    const state = {
+        socket, upgraded: false, buf: Buffer.alloc(0), inbox: [], bin: [],
+        closed: false, bad: null,
+    };
+    socket.on('data', (chunk) => {
+        state.buf = Buffer.concat([state.buf, chunk]);
+        if (!state.upgraded) {
+            const i = state.buf.indexOf('\r\n\r\n');
+            if (i < 0) return;
+            const head = state.buf.slice(0, i).toString('latin1');
+            state.buf = state.buf.slice(i + 4);
+            if (!head.startsWith('HTTP/1.1 101') || !head.includes(accept)) {
+                state.bad = head.split('\r\n')[0];
+                return;
+            }
+            state.upgraded = true;
+        }
+        for (;;) {
+            const f = takeFrame(state);
+            if (!f) break;
+            if (f.op === 0x1) {
+                try { state.inbox.push(JSON.parse(f.payload.toString('utf8'))); }
+                catch (_) { /* 非 JSON 的文本帧与用例无关 */ }
+            } else if (f.op === 0x2) {
+                state.bin.push(f.payload);
+            }
+        }
+    });
+    socket.on('close', () => { state.closed = true; });
+    socket.on('error', (e) => { state.bad = e.message; });
+
+    state.sendFrame = (op, payload, fin) => socket.write(buildFrame(op, payload, fin));
+    /* preamble 会跟着握手请求一起发出去——真实网络里 TCP 合并就是这么发生的 */
+    state.start = (preamble) =>
+        socket.write(preamble ? Buffer.concat([req, preamble]) : req);
+    state.end = () => socket.end();
+    return state;
+}
+
+async function waitFor(fn, timeoutMs) {
+    const deadline = Date.now() + (timeoutMs || 4000);
+    for (;;) {
+        const v = fn();
+        if (v) return v;
+        if (Date.now() >= deadline) return null;
+        await sleep(50);
+    }
+}
+
+/* ==========================================================================
+ * 兜底通道（WebSocket 二进制中转）的帧级用例
+ *
+ * 服务端原来是按"前端一次 send 就是一帧"写的：0x2 二进制帧直接转发，
+ * 0x0 续帧只当文本分片处理（只有 frag_op==0x1 才清零）。可浏览器发大消息会
+ * 自己切片，首片是 0x2、其余是 0x0，于是续帧永远清不掉、一路堆过 WS_BUF，
+ * 最后把整条连接关掉。信令 JSON 都很小、永不分片，所以这个坑只在兜底通道
+ * 传大文件时才现形。
+ * ========================================================================== */
+async function testRelayFrames() {
+    console.log('\n--- 兜底通道帧形状（分片 / 握手与首帧合并）---');
+    const host = base.hostname;
+    const port = Number(base.port || 80);
+
+    const a = rawWsConnect(host, port, '/ws');
+    const b = rawWsConnect(host, port, '/ws');
+    a.start();
+    b.start();
+    await sleep(500);
+
+    const aSelf = a.inbox.filter((m) => m.type === 'self').pop();
+    const bSelf = b.inbox.filter((m) => m.type === 'self').pop();
+    check('原始 WS 客户端握手成功并拿到 id', !!aSelf && !!bSelf,
+        `${aSelf && aSelf.id} / ${bSelf && bSelf.id}${a.bad ? ' :: ' + a.bad : ''}`);
+    if (!aSelf || !bSelf) { a.end(); b.end(); return; }
+
+    /* ---------- 用例 1：二进制消息分片发送，必须被拼回完整一条 ---------- */
+    const payload = Buffer.alloc(50000);
+    for (let i = 0; i < payload.length; i++) payload[i] = (i * 7 + 13) & 0xff;
+    const idb = Buffer.from(bSelf.id, 'utf8');
+    const framed = Buffer.concat([Buffer.from([idb.length]), idb, payload]);
+
+    const sendFragmented = () => {
+        /* 首片 0x2 + fin=0，续片 0x0 + fin=1 —— 浏览器大消息就是这么发的 */
+        a.sendFrame(0x2, framed.slice(0, 30000), false);
+        a.sendFrame(0x0, framed.slice(30000), true);
+    };
+    sendFragmented();
+    await sleep(250);
+    sendFragmented();
+
+    await waitFor(() => (b.bin.length >= 2 ? true : null), 4000);
+    check('分片的二进制消息被拼回完整一条并转发', b.bin.length === 2,
+        `收到 ${b.bin.length} 条，期望 2 条`);
+    if (b.bin.length) {
+        const idlen = b.bin[0][0];
+        const fromId = b.bin[0].slice(1, 1 + idlen).toString('utf8');
+        const body = b.bin[0].slice(1 + idlen);
+        check('转发帧的 id 前缀正确', fromId === aSelf.id, `${fromId} vs ${aSelf.id}`);
+        check('分片拼回后载荷逐字节一致', body.equals(payload),
+            `收到 ${body.length} / 期望 ${payload.length}`);
+    }
+    check('分片没有把发送端连接关掉', !a.closed);
+
+    /* 旧实现的 frag 缓冲只增不减：连发 40 条必然堆过 WS_BUF 把连接关掉。
+     * 40 × 20012 ≈ 780KB > 128KB，所以这条断言就是当时那个故障的复现。 */
+    for (let n = 0; n < 40; n++) sendFragmented();
+    await waitFor(() => (b.bin.length >= 42 ? true : null), 6000);
+    check('连续 40 条分片消息后连接仍在', !a.closed);
+    check('42 条全部转发出去', b.bin.length === 42, `收到 ${b.bin.length} 条`);
+
+    /* ---------- 用例 2：握手请求和第一帧合并成一次写入 ---------- */
+    /* 服务端原来在 WS 握手处 `return (long)len`（把整段都算成自己吃掉了），
+     * 跟在请求头后面的字节会被调用方的 memmove 丢掉——第一帧静默消失。 */
+    const c = rawWsConnect(host, port, '/ws');
+    c.start(buildFrame(0x1,
+        Buffer.from(JSON.stringify({ type: 'rename', name: '合并首帧测试' })), true));
+    await sleep(700);
+    const names = c.inbox.filter((m) => m.type === 'self').map((m) => m.name);
+    check('握手后附带的第一帧没有被丢掉', names.includes('合并首帧测试'),
+        JSON.stringify(names));
+    c.end();
+
+    a.end();
+    b.end();
+    await sleep(300);
 }
 
 async function testWebSocket() {
@@ -833,6 +1028,7 @@ async function testNameMemory() {
         await testUnicode();
         await testBigFile();
         await testWebSocket();
+        await testRelayFrames();
         await testResumeUpload();
         await testRange();
         await testNameMemory();
