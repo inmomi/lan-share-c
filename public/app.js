@@ -215,17 +215,38 @@ function getConn(peerId) {
   return conn;
 }
 
+/* 构造 ICE 服务器列表：基础 STUN 永远在；若页面被服务端注入了 TURN 配置
+ * （window.__LAN_SHARE_TURN__，由服务端按 LAN_SHARE_TURN 环境变量透传），
+ * 把其中每一条都加进来。返回新数组，避免污染全局。
+ * TURN 为可选：缺省（null）时纯 STUN + host，数据绝不经第三方；一旦服务端
+ * 配了 TURN，AP / 客户端隔离下设备间直连被丢弃时即可走中继，不再"中继无效"。 */
+function buildIceServers() {
+  const servers = [{ urls: 'stun:stun.l.google.com:19302' }];
+  const extra = (typeof window !== 'undefined') && window.__LAN_SHARE_TURN__;
+  if (Array.isArray(extra)) {
+    for (const s of extra) {
+      if (s && s.urls) {
+        servers.push({
+          urls: s.urls,
+          username: s.username || '',
+          credential: s.credential || '',
+        });
+      }
+    }
+    console.log('[lan-share] 已启用 TURN 中继，共 ' + servers.length + ' 个 ICE 服务器');
+  }
+  return servers;
+}
+
 function makeLane(session, index) {
   /* 必须带 STUN：纯 host 候选会被 Chrome 默认伪装成 mDNS .local 名字，两台
    * Windows PC 在真实局域网里经常解析失败，于是 32 条 lane 里绝大多数 ICE
    * 连通性检查都过不了——表现就是回环(loopback)能开 32 条、真机千兆只开 1 条、
    * 速度卡在单关联 ~5MB/s。加 STUN 后浏览器还会收集 srflx 候选（可达的 IPv4 UDP
-   * 端点），绕开 mDNS/IPv6 主机候选的不可达问题。注意只加 STUN、不加 TURN，
-   * 所以数据绝不会经第三方中转；纯离线局域网下 STUN 请求会超时，但 host 候选
-   * 照常使用，只是 ICE 稍慢一点。 */
-  const pc = new RTCPeerConnection({
-    iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
-  });
+   * 端点），绕开 mDNS/IPv6 主机候选的不可达问题。默认只加 STUN、不加 TURN
+   * （数据绝不经第三方）；若服务端注入了 TURN（见 buildIceServers），则一并加入。
+   * 纯离线局域网下 STUN 请求会超时，但 host 候选照常使用，只是 ICE 稍慢一点。 */
+  const pc = new RTCPeerConnection({ iceServers: buildIceServers() });
   const lane = {
     session, index, peerId: session.peerId,
     pc, dc: null, ready: null, role: null, speedtest: null,

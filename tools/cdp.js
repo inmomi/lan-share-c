@@ -59,13 +59,22 @@ function getJson(url, timeoutMs) {
 }
 
 /** 等 DevTools 端口起来。浏览器刚拉起时端口还没监听，要重试。 */
-async function waitForDevtools(port, timeoutMs) {
+/* 把 Chrome 回报的 DevTools WebSocket 地址改写成对外可达的 host:port。
+ * 例如 ws://127.0.0.1:9331/devtools/page/abc 在 netns 场景下改成
+ * ws://10.9.1.1:9331/devtools/page/abc（10.9.1.1 是 nsA 内代理监听的 IP）。 */
+function rewriteWsUrl(url, host, port) {
+  const m = /^(wss?):\/\/([^:/]+)(:(\d+))?(\/.*)$/.exec(url);
+  if (!m) return url;
+  return `${m[1]}://${host}:${port}${m[5]}`;
+}
+
+async function waitForDevtools(host, port, timeoutMs) {
   const deadline = Date.now() + (timeoutMs || 20000);
   for (;;) {
     try {
-      return await getJson(`http://127.0.0.1:${port}/json/version`, 1500);
+      return await getJson(`http://${host}:${port}/json/version`, 1500);
     } catch (_) {
-      if (Date.now() > deadline) throw new Error(`DevTools 端口 ${port} 20 秒内未就绪`);
+      if (Date.now() > deadline) throw new Error(`DevTools 端口 ${host}:${port} 20 秒内未就绪`);
       await new Promise((r) => setTimeout(r, 200));
     }
   }
@@ -166,6 +175,10 @@ class CdpPage {
     /* Windows 下 Edge/Chrome 是多进程树，只 kill 主进程会留下Renderer 孤儿 */
     if (process.platform === 'win32') {
       spawn('taskkill', ['/F', '/T', '/PID', String(this.child.pid)], { stdio: 'ignore' });
+    } else if (this.child.wrapped) {
+      /* 被 ip netns exec 包裹时，child 是 ip 进程，Chrome 是它的子进程。
+       * 用进程组（detached 时已设为组长）一次杀干净，避免 Chrome 残留。 */
+      try { process.kill(-this.child.pid, 'SIGKILL'); } catch (_) {}
     } else {
       this.child.kill('SIGKILL');
     }
@@ -181,6 +194,13 @@ async function launchBrowser(options) {
   const executable = findBrowser(opts.executable);
   const port = opts.port || 9331;
   const userDataDir = opts.userDataDir || path.join(os.tmpdir(), `cdp-profile-${port}`);
+  /* devtoolsHost / devtoolsPort：DevTools 端口暴露给本测试进程的地址。
+   * 默认 127.0.0.1:port（同机回环）。当浏览器被包在 network namespace 里
+   * （测试里用 ip netns exec nsX 模拟"另一台设备"），Chrome 的调试端口在
+   * nsX 内的 127.0.0.1 上，宿主机连不到，于是用一个跑在 nsX 里、监听 nsX IP
+   * 的 TCP 代理把它转出来，这里就填那个 nsX IP。 */
+  const devtoolsHost = opts.devtoolsHost || '127.0.0.1';
+  const devtoolsPort = opts.devtoolsPort || port;
 
   const args = [
     `--remote-debugging-port=${port}`,
@@ -192,6 +212,7 @@ async function launchBrowser(options) {
     '--no-default-browser-check',
     '--disable-extensions',
     '--disable-background-networking',
+    '--disable-dev-shm-usage',
     /* 关掉 mDNS 候选混淆，让 ICE 直接用真实内网 IP——测试里要的就是
      * 确定能连上的 host candidate，不想再叠一层 mDNS 解析。 */
     '--disable-features=WebRtcHideLocalIpsWithMdns',
@@ -199,21 +220,32 @@ async function launchBrowser(options) {
   ];
   if (opts.extraArgs) args.unshift(...opts.extraArgs);
 
-  const child = spawn(executable, args, { stdio: 'ignore' });
+  /* wrap：命令前缀数组，用于把浏览器进程塞进 netns / 容器等隔离环境，
+   * 例如 ['ip','netns','exec','nsA']。宿主机上的测试进程仍按 devtoolsHost
+   * 连过去。空数组表示不包裹（默认同机回环）。detached 让 wrap 时的子进程
+   * 树成为独立进程组，便于 close() 一次杀干净。 */
+  const wrap = (opts.wrap && Array.isArray(opts.wrap) && opts.wrap.length) ? opts.wrap : [];
+  const cmd = [...wrap, executable, ...args];
+  const child = spawn(cmd[0], cmd.slice(1), { stdio: 'ignore', detached: wrap.length > 0 });
+  child.wrapped = wrap.length > 0;
   child.on('error', (err) => { throw new Error(`浏览器启动失败: ${err.message}`); });
 
-  await waitForDevtools(port, 30000);
-  const targets = await getJson(`http://127.0.0.1:${port}/json/list`, 5000);
+  await waitForDevtools(devtoolsHost, devtoolsPort, 30000);
+  const targets = await getJson(`http://${devtoolsHost}:${devtoolsPort}/json/list`, 5000);
   let target = targets.find((t) => t.type === 'page');
   if (!target) {
     /* 有些构建默认不开页面，用 /json/new 开一个 */
-    target = await getJson(`http://127.0.0.1:${port}/json/new?about:blank`, 5000);
+    target = await getJson(`http://${devtoolsHost}:${devtoolsPort}/json/new?about:blank`, 5000);
   }
   if (!target || !target.webSocketDebuggerUrl) {
     throw new Error('没拿到可调试的页面目标');
   }
 
-  const ws = new WebSocket(target.webSocketDebuggerUrl);
+  /* Chrome 上报的 webSocketDebuggerUrl 用的是它自己以为的地址（常是
+   * 127.0.0.1）。被包在 netns 里时，我们是从宿主机经代理连，要把 host/port
+   * 改写成对外暴露的 devtoolsHost:devtoolsPort，否则 WebSocket 连不上。 */
+  const wsUrl = rewriteWsUrl(target.webSocketDebuggerUrl, devtoolsHost, devtoolsPort);
+  const ws = new WebSocket(wsUrl);
   await new Promise((resolve, reject) => {
     ws.addEventListener('open', resolve, { once: true });
     ws.addEventListener('error', () => reject(new Error('DevTools WebSocket 连接失败')), { once: true });

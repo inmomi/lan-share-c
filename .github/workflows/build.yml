@@ -226,10 +226,120 @@ jobs:
           path: ${{ matrix.out }}
           if-no-files-found: error
 
+  # ----------------------------------------- 真实双机（netns 模拟两设备直连）T1
+  two-host-lan:
+    name: 两主机 LAN（netns 真实 IP 直连）
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: 生成内嵌前端资源
+        run: node tools/embed-web.js
+
+      - name: 编译
+        run: cc -O2 -std=c99 -Wall -o lan-share lan_share.c
+
+      - name: 安装 / 定位 Chrome
+        run: |
+          set -e
+          if ! command -v google-chrome-stable >/dev/null 2>&1; then
+            cd "$RUNNER_TEMP"
+            curl -fsSL --max-time 300 -o chrome.deb \
+              "https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb"
+            sudo apt-get install -y -qq ./chrome.deb
+          fi
+          FOUND=""
+          for c in google-chrome-stable google-chrome chromium chromium-browser; do
+            if command -v "$c" >/dev/null 2>&1; then FOUND=$(command -v "$c"); break; fi
+          done
+          if [ -z "$FOUND" ]; then echo "::error::Chrome 装上了但不在 PATH 里"; exit 1; fi
+          export CHROME_PATH="$FOUND"
+          echo "CHROME_PATH=$FOUND" >> "$GITHUB_ENV"
+          "$FOUND" --version
+
+      # netns 搭建 + 浏览器测试需要 root。Chrome 安装后的 CHROME_PATH 经 sudo -E
+      # 透传；node 经 setup-node 已在 PATH，sudo -E 保留 PATH。
+      - name: netns 两机直连 + 浏览器 e2e（T1，吞吐下限 8MB/s）
+        run: |
+          set -e
+          sudo -E bash -c '
+            set -e
+            export CHROME_PATH="'"$CHROME_PATH"'"
+            COTURN=0 bash tools/ci-realnet.sh setup
+            set -a; . ./realnet.env; set +a
+            ./lan-share -p "$SERVER_PORT" -d ./uploads -w ./public >/tmp/lanshare.log 2>&1 &
+            SRV=$!
+            sleep 1
+            node tools/p2p-e2e.js --server-url "$SERVER_URL_A" \
+              --chrome-wrap-a "$WRAP_A" --chrome-wrap-b "$WRAP_B" \
+              --devtools-host-a "$DEVTOOLS_A" --devtools-host-b "$DEVTOOLS_B" \
+              --file-mb 64 --timeout 240 --label ci-lan --throughput-floor 8
+            kill $SRV 2>/dev/null || true
+          '
+
+  # -------------------------- 真实双机 + AP 隔离 + TURN 中继（关键闸门）T2
+  isolated-relay:
+    name: AP 隔离 + TURN 中继（必须走中继）
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: 生成内嵌前端资源
+        run: node tools/embed-web.js
+
+      - name: 编译
+        run: cc -O2 -std=c99 -Wall -o lan-share lan_share.c
+
+      - name: 安装 / 定位 Chrome
+        run: |
+          set -e
+          if ! command -v google-chrome-stable >/dev/null 2>&1; then
+            cd "$RUNNER_TEMP"
+            curl -fsSL --max-time 300 -o chrome.deb \
+              "https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb"
+            sudo apt-get install -y -qq ./chrome.deb
+          fi
+          FOUND=""
+          for c in google-chrome-stable google-chrome chromium chromium-browser; do
+            if command -v "$c" >/dev/null 2>&1; then FOUND=$(command -v "$c"); break; fi
+          done
+          if [ -z "$FOUND" ]; then echo "::error::Chrome 装上了但不在 PATH 里"; exit 1; fi
+          export CHROME_PATH="$FOUND"
+          echo "CHROME_PATH=$FOUND" >> "$GITHUB_ENV"
+          "$FOUND" --version
+
+      # 隔离 + 起 coturn；服务端按 LAN_SHARE_TURN 把 TURN 注入页面。
+      # 直连被 DROP，连接必须经由中继成功建立并完整传文件（吞吐下限 4MB/s）。
+      - name: netns 隔离 + TURN 中继 + 浏览器 e2e（T2，关键闸门）
+        run: |
+          set -e
+          sudo -E bash -c '
+            set -e
+            export CHROME_PATH="'"$CHROME_PATH"'"
+            COTURN=1 bash tools/ci-realnet.sh setup isolate
+            set -a; . ./realnet.env; set +a
+            LAN_SHARE_TURN="$LAN_SHARE_TURN" ./lan-share -p "$SERVER_PORT" -d ./uploads -w ./public >/tmp/lanshare.log 2>&1 &
+            SRV=$!
+            sleep 1
+            node tools/p2p-e2e.js --server-url "$SERVER_URL_A" \
+              --chrome-wrap-a "$WRAP_A" --chrome-wrap-b "$WRAP_B" \
+              --devtools-host-a "$DEVTOOLS_A" --devtools-host-b "$DEVTOOLS_B" \
+              --file-mb 64 --timeout 240 --label ci-isorel --throughput-floor 4
+            kill $SRV 2>/dev/null || true
+          '
+
   # --------------------------------------------------------------- 发布
   release:
     name: 发布 Release
-    needs: [test, build]
+    needs: [test, build, two-host-lan, isolated-relay]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     timeout-minutes: 10

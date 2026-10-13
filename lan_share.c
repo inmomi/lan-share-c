@@ -421,6 +421,13 @@ static char g_upload_dir[PATH_MAX_LOCAL] = "./uploads";
 static char g_web_dir[PATH_MAX_LOCAL] = "./public";
 static int g_port = 8080;
 
+/* 可选 TURN 中继配置：一段合法 JSON 数组文本（如
+ * [{"urls":"turn:1.2.3.4:3478","username":"u","credential":"p"}]），由
+ * LAN_SHARE_TURN 环境变量提供。为空表示纯内网离线直连（默认）。serve_static
+ * 在返回首页时把占位符替换成该 JSON，让前端把 TURN 加进 iceServers。
+ * AP / 客户端隔离下设备间直连被丢弃时即可走中继。 */
+static char *g_turn_config = NULL;
+
 static const char *ADJ[] = { "蓝色", "银色", "安静", "敏捷", "温暖", "明亮", "沉稳", "轻盈", "清澈", "柔和" };
 static const char *ANI[] = { "海豚", "猎鹰", "水獭", "狐狸", "鲸鱼", "山猫", "燕子", "小鹿", "海豹", "苍鹭" };
 
@@ -1065,6 +1072,42 @@ static void api_list_files(ls_client *c) {
     free(body);
 }
 
+/* 首页里有一个占位符（默认就是 null，纯内网直连）。若启动时通过
+ * LAN_SHARE_TURN 提供了 TURN 配置（一段合法 JSON 数组文本），则把占位符
+ * 整段替换成该 JSON，让前端（app.js 的 makeLane）把 TURN 加进 iceServers。
+ * 这样 AP / 客户端隔离下设备间直连被丢弃时，仍可经自建 TURN 中继打通。 */
+
+/* 在长度为 hlen 的字节串中查找子串 needle，返回首次出现的位置，找不到返回 NULL。 */
+static const char *memstr(const char *hay, size_t hlen, const char *needle) {
+    size_t nlen = strlen(needle);
+    if (nlen == 0 || nlen > hlen) return NULL;
+    for (size_t i = 0; i + nlen <= hlen; i++) {
+        if (memcmp(hay + i, needle, nlen) == 0) return hay + i;
+    }
+    return NULL;
+}
+
+/* 返回新分配的缓冲（以 '\0' 结尾），*out_len 为内容长度（不含结尾 '\0'）；
+ * 无占位符或未配置 TURN 时返回 NULL（调用方直接用原缓冲即可）。 */
+static char *apply_turn_injection(const char *in, size_t in_len, size_t *out_len) {
+    static const char TOKEN[] = "/*__TURN_CONFIG__*/ null";
+    if (!g_turn_config || g_turn_config[0] == '\0') return NULL;
+    const char *p = memstr(in, in_len, TOKEN);
+    if (!p) return NULL;
+    size_t tok_len = sizeof(TOKEN) - 1;
+    size_t cfg_len = strlen(g_turn_config);
+    size_t new_len = in_len - tok_len + cfg_len;
+    char *out = (char *)malloc(new_len + 1);
+    if (!out) return NULL;
+    size_t head = (size_t)(p - in);
+    memcpy(out, in, head);
+    memcpy(out + head, g_turn_config, cfg_len);
+    memcpy(out + head + cfg_len, in + head + tok_len, in_len - head - tok_len);
+    out[new_len] = '\0';
+    *out_len = new_len;
+    return out;
+}
+
 static void serve_static(ls_client *c, const char *rel) {
     char path[PATH_MAX_LOCAL];
     char *body;
@@ -1102,6 +1145,16 @@ static void serve_static(ls_client *c, const char *rel) {
         if (strstr(rel, ".css")) ctype = "text/css; charset=utf-8";
         else if (strstr(rel, ".js")) ctype = "text/javascript; charset=utf-8";
         else ctype = "text/html; charset=utf-8";
+        int is_html = (strncmp(ctype, "text/html", 9) == 0);
+        if (is_html) {
+            size_t inj_len = 0;
+            char *inj = apply_turn_injection((const char *)hit->data, hit->len, &inj_len);
+            if (inj) {
+                queue_response(c, 200, ctype, inj, inj_len);
+                free(inj);
+                return;
+            }
+        }
         queue_response(c, 200, ctype, (const char *)hit->data, hit->len);
         return;
     }
@@ -1127,6 +1180,17 @@ static void serve_static(ls_client *c, const char *rel) {
     else if (strstr(rel, ".js")) ctype = "text/javascript; charset=utf-8";
     else if (strstr(rel, ".svg")) ctype = "image/svg+xml";
     else ctype = "text/html; charset=utf-8";
+    int is_html = (strncmp(ctype, "text/html", 9) == 0);
+    if (is_html) {
+        size_t inj_len = 0;
+        char *inj = apply_turn_injection(body, got, &inj_len);
+        if (inj) {
+            queue_response(c, 200, ctype, inj, inj_len);
+            free(inj);
+            free(body);
+            return;
+        }
+    }
     queue_response(c, 200, ctype, body, got);
     free(body);
 }
@@ -1964,6 +2028,25 @@ int main(int argc, char **argv) {
         fprintf(stderr, "端口无效: %d\n\n", g_port);
         usage(argv[0]);
         return 1;
+    }
+
+    /* 可选 TURN 中继配置（见 g_turn_config 注释与 serve_static 的占位符替换）。
+     * 格式必须是以 '[' 开头、']' 结尾的 JSON 数组文本，且不含 '<' '>'，避免
+     * 注入破坏页面。留空则纯内网直连。 */
+    {
+        const char *env_turn = getenv("LAN_SHARE_TURN");
+        if (env_turn && *env_turn) {
+            size_t L = strlen(env_turn);
+            int ok = (L > 1 && env_turn[0] == '[' && env_turn[L - 1] == ']'
+                      && strpbrk(env_turn, "<>") == NULL);
+            if (ok) {
+                g_turn_config = (char *)malloc(L + 1);
+                if (g_turn_config) memcpy(g_turn_config, env_turn, L + 1);
+                printf("  TURN 中继:    已启用（来自 LAN_SHARE_TURN）\n");
+            } else {
+                fprintf(stderr, "警告: LAN_SHARE_TURN 不是合法 JSON 数组，已忽略（仍走纯直连）\n");
+            }
+        }
     }
 
 #ifdef _WIN32

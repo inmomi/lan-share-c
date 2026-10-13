@@ -91,6 +91,10 @@
   </div>
 </div>
 
+<!-- 可选 TURN 中继配置：服务端按 LAN_SHARE_TURN 环境变量在返回首页时，
+     把占位符 /*__TURN_CONFIG__*/ null 替换成一段 JSON 数组（无则留 null，
+     纯内网离线直连）。app.js 的 makeLane 会把它加进 iceServers。 -->
+<script>window.__LAN_SHARE_TURN__ = /*__TURN_CONFIG__*/ null;</script>
 <script src="/p2p-pump.js"></script>
 <script src="/app.js"></script>
 </body>

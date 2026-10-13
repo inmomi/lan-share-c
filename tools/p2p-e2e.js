@@ -43,8 +43,24 @@ function arg(name, dflt) {
 const FILE_MB = Number(arg('file-mb', 64));
 const TIMEOUT_MS = Number(arg('timeout', 240)) * 1000;
 const SERVER_EXE = arg('server', null);
-const SERVER_URL = arg('url', null);
+const SERVER_URL = arg('url', null) || arg('server-url', null);
 const LABEL = arg('label', 'e2e');
+/* 真实双机 / netns 场景：每个浏览器走各自的信令 URL、各自的 netns 包裹前缀、
+ * 各自的 DevTools 暴露地址。缺省回退到统一的 SERVER_URL / 同机回环。 */
+const SERVER_URL_A = arg('server-url-a', null) || SERVER_URL;
+const SERVER_URL_B = arg('server-url-b', null) || SERVER_URL;
+const DEVTOOLS_A = arg('devtools-host-a', '127.0.0.1');
+const DEVTOOLS_B = arg('devtools-host-b', '127.0.0.1');
+/* 吞吐下限（MB/s）：低于此值判失败，用于守住"中继/直连确实能用"的回归。0 表示不检查。 */
+const THROUGHPUT_FLOOR = Number(arg('throughput-floor', 0));
+
+/* 把 "ip netns exec nsA" 这样的空格分隔串拆成命令前缀数组。 */
+function splitWrap(s) {
+  if (!s || typeof s !== 'string') return [];
+  return s.trim().split(/\s+/).filter(Boolean);
+}
+const WRAP_A = splitWrap(arg('chrome-wrap-a', null));
+const WRAP_B = splitWrap(arg('chrome-wrap-b', null));
 /* lane 数量扫描：--sweep 1,2,4,8,16。回答"并行到底能不能线性扩展"——
  * 4 条在 Runner 上合计约 26MB/s、单条约 6.5MB/s，如果是每关联的上限，
  * 加 lane 就该继续涨；如果到顶了，说明瓶颈是共享的，加 lane 是徒劳。
@@ -137,18 +153,23 @@ const peerNames = (page) => page.evaluate('state.peers.map(p => p.name)');
   const dlDir = fs.mkdtempSync(path.join(os.tmpdir(), 'lanshare-dl-'));
 
   try {
-    const url = SERVER_URL || `http://127.0.0.1:${PORT}`;
-    if (!SERVER_URL) {
+    const urlA = SERVER_URL_A || `http://127.0.0.1:${PORT}`;
+    const urlB = SERVER_URL_B || `http://127.0.0.1:${PORT}`;
+    /* 只有完全没给任何 URL 时才自己拉服务端（默认同机回环）。
+     * 给了 --server-url* 就认为服务端已经由外部（CI 步骤）起好。 */
+    if (!SERVER_URL_A && !SERVER_URL_B && !SERVER_URL) {
       server = startServer();
-      await waitServer(url, 20000);
+      await waitServer(urlA, 20000);
+    } else {
+      await waitServer(urlA, 20000);
     }
-    log(`服务端: ${url}`);
+    log(`服务端: A→${urlA}  B→${urlB}`);
 
     log('拉起两个浏览器…');
-    pageA = await launchBrowser({ port: 9331 });
-    pageB = await launchBrowser({ port: 9332 });
-    await pageA.navigate(url);
-    await pageB.navigate(url);
+    pageA = await launchBrowser({ port: 9331, wrap: WRAP_A, devtoolsHost: DEVTOOLS_A });
+    pageB = await launchBrowser({ port: 9332, wrap: WRAP_B, devtoolsHost: DEVTOOLS_B });
+    await pageA.navigate(urlA);
+    await pageB.navigate(urlB);
     await waitReady(pageA, 30000);
     await waitReady(pageB, 30000);
 
@@ -284,6 +305,8 @@ const peerNames = (page) => page.evaluate('state.peers.map(p => p.name)');
     }
 
     /* 等接收端把文件存下来 */
+    let transferOk = false;
+    let e2eRate = 0;
     const saved = await pageB.waitForDownload(fileName, TIMEOUT_MS);
     /* 真正的端到端速率要算到"文件落盘"为止。发送端的 done 现在代表对端
      * 已组装落盘（收到 file-done 回执），与 waitForDownload 命中的时间点
@@ -309,6 +332,17 @@ const peerNames = (page) => page.evaluate('state.peers.map(p => p.name)');
         log(`  接收端: ${(got.length / 1048576).toFixed(1)} MB 落盘，SHA-256 一致 ✓`);
         log(`  交付速率 : ${(FILE_MB / sendSecs).toFixed(2)} MB/s（发起到对端回执 done）`);
         log(`  端到端   : ${(FILE_MB / e2eSecs).toFixed(2)} MB/s（发起到对端落盘，这才是真实速率）`);
+        transferOk = true;
+        e2eRate = FILE_MB / e2eSecs;
+      }
+    }
+
+    /* 吞吐下限：守住"直连 / 中继确实能跑通且达到可用速率"的回归。 */
+    if (transferOk && THROUGHPUT_FLOOR > 0) {
+      if (e2eRate < THROUGHPUT_FLOOR) {
+        fail(`端到端吞吐 ${e2eRate.toFixed(2)} MB/s 低于下限 ${THROUGHPUT_FLOOR} MB/s`);
+      } else {
+        log(`  吞吐下限 : ${e2eRate.toFixed(2)} MB/s ≥ ${THROUGHPUT_FLOOR} MB/s ✓`);
       }
     }
 
