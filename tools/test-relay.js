@@ -118,6 +118,24 @@ async function testPumpOverRelay() {
         String(pump.chunkSizeFor({ relay: true })));
 }
 
+/* ---- close 必须派发 close 事件 ----
+ * 上层（app.js）就是靠这个事件把"这条通道死了"翻译成「已中断（N MB），可续传」
+ * 的。不派发的话，信令 WS 断掉之后接收中的传输会永远停在"接收中"：既等不到
+ * lane-end 也没有失败提示，用户连续传入口都拿不到。 */
+(function testCloseEmitsEvent() {
+    const ch = new LSRelay.RelayChannel('peer1', { send() {}, bufferedAmount: 0 });
+    let closed = 0;
+    ch.addEventListener('close', () => { closed++; });
+    ch.close();
+    check('close() 派发 close 事件', closed === 1, String(closed));
+    ch.close();
+    check('重复 close() 只派发一次', closed === 1, String(closed));
+    check('close() 之后 readyState 为 closed', ch.readyState === 'closed', ch.readyState);
+    let threw = false;
+    try { ch.send('x'); } catch (_) { threw = true; }
+    check('关闭后 send 抛错（上层据此收尾而不是干等）', threw);
+})();
+
 (async () => {
     try {
         await testPumpOverRelay();

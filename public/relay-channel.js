@@ -146,7 +146,12 @@
     };
 
     RelayChannel.prototype.close = function () {
+        if (this.readyState === 'closed') return;   /* 重复关只派发一次 */
         this.readyState = 'closed';
+        /* 必须派发 close：上层（app.js）就是靠它把"这条通道死了"翻译成
+         * 「已中断（N MB），可续传」的。不派发的话信令 WS 断了以后界面会一直
+         * 停在"接收中"，用户既看不到失败也拿不到续传入口。 */
+        this._emit('close', {});
     };
 
     return {

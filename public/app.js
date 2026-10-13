@@ -325,6 +325,13 @@ function ensureRelay(peerId) {
    * 应答监听器，在兜底通道上和 DataChannel 上行为完全相同——否则对端回了
    * speedtest-ready 也没人听见，表现就是"对端没有回应测速请求"。 */
   dc.addEventListener('message', (e) => onChannelMessage(lane, e.data));
+  /* 信令 WS 一断，这条兜底通道就废了。和 attachChannel 里的 DataChannel 一样
+   * 挂 close：否则传输会一直卡在"接收中"，既等不到 lane-end 也没有失败提示。 */
+  dc.addEventListener('close', () => {
+    if (conn.relay === lane) conn.relay = null;
+    markInterrupted(lane);
+    renderPeers();
+  });
   conn.relay = lane;
   return lane;
 }
@@ -906,6 +913,10 @@ async function askReceive(lane, msg) {
     priorChunks: (prior && already < msg.size) ? prior.laneBufs.flat() : [],
     laneBufs: lane.session.lanes.map(() => []),
     lanesDone: 0,
+    /* 这次传输实际在用的通道。判"中断"时必须拿它过滤——直连建不起来时文件走
+     * 兜底通道，而同期那 32 条 WebRTC lane 还在陆续 ICE 失败被判死刑，它们的
+     * 死活跟这次传输毫无关系（详见 markInterrupted）。 */
+    lanes: new Set(lane.relay ? [lane] : myLive.map((i) => lane.session.lanes[i])),
     expectedLanes: splitRange(already, msg.size, useCount).length,
     received: already,
     /* progress 回执的节流状态：每 1MB 或 500ms 报一次实收字节数 */
@@ -932,6 +943,20 @@ function markInterrupted(lane) {
   if (lane) speedtestAbort(lane);
   const inc = state.incoming;
   if (!inc) return;
+
+  /* 死掉的这条 lane 不是本次传输在用的通道，那就跟它无关，不能顺着往下判中断。
+   *
+   * 这是个必现的竞态，不是偶发：直连建不起来时文件走兜底通道，而同一时间轴上
+   * 那 32 条 WebRTC lane 还在各自跑 ICE，失败后由 retireLane 依次调到这里。
+   * 老代码不看 lane 归属，于是"第一批判死刑"的那一刻就把正在传的传输写成
+   * 「已中断（N MB），可续传」，同时 state.incoming 被置空——后续字节全部没人
+   * 接，界面就停在传了几 MB 然后中断，对端却还在发（最终"发送未完成"）。
+   *
+   * 断点落在哪完全由两条时间轴的相对快慢决定（兜底吞吐 × 首条 lane 判死刑的
+   * 时刻），所以真机上看起来是"19.7MB 与 32.6MB 之间随机断"，CI 里则表现为
+   * 同一份代码时绿时红。 */
+  if (lane && inc.lanes && !inc.lanes.has(lane)) return;
+
   state.incoming = null;
   if (inc.fileId && inc.received > 0 && inc.received < inc.size) {
     state.resume.set(inc.fileId, inc);

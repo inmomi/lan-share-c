@@ -71,6 +71,20 @@ const REQUIRE_MODE = String(arg('require-mode', 'any') || 'any');
 /* 吞吐下限（MB/s）：低于此值判失败，用于守住"中继/直连确实能用"的回归。0 表示不检查。 */
 const THROUGHPUT_FLOOR = Number(arg('throughput-floor', 0));
 
+/* --probe-lane-retire：传输进行中，故意把一条"注定失败"的 WebRTC lane 走
+ * retireLane 判死刑，断言这次传输必须活下来。
+ *
+ * 守的是一个必现的竞态：直连建不起来时文件走兜底通道，而那 32 条 WebRTC lane
+ * 还在同一时间轴上陆续 ICE 失败、被 retireLane 依次收掉。老代码的
+ * markInterrupted 不区分死的是哪条 lane，于是"第一批判死刑"的那一刻就把正在
+ * 传的传输写成「已中断（N MB），可续传」并丢弃后续所有字节——真机上表现为
+ * "传了 19.7MB 到 32.6MB 之间就断"，CI 里则表现为同一份代码时绿时红。
+ *
+ * 这里不依赖任何时序：直接调用那条真实路径，改前必红、改后必绿。
+ * 默认在 relay 档开启（正是会走兜底的那一档）。 */
+const PROBE_LANE_RETIRE =
+  String(arg('probe-lane-retire', REQUIRE_MODE === 'relay' ? '1' : '0')) !== '0';
+
 /* 全局硬超时：任何意外的永久挂起（比如兜底超时之前、或收尾阶段卡住）都不能
  * 让 job 一直吃到 GitHub 的 30 分钟墙。内部上传循环有 TIMEOUT_MS 上限，
  * 这里在它之外再给足余量后强制退出。 */
@@ -451,6 +465,7 @@ async function dumpConnDiag(page, peerId) {
 
     /* 等发送端记录变成"已送达" */
     let upRec = null;
+    let laneRetireProbe = null;
     const upDeadline = Date.now() + TIMEOUT_MS;
     let lastDump = 0;
     for (;;) {
@@ -462,6 +477,46 @@ async function dumpConnDiag(page, peerId) {
         return null;
       })()`);
       if (upRec && (upRec.done || upRec.failed)) break;
+
+      /* 传输进行中注入一次"注定失败的 WebRTC lane 被判死刑"（见文件头
+       * PROBE_LANE_RETIRE 的说明）。只注入一次，且必须挑一条不属于本次传输的
+       * lane——挑错了这次注入就没有意义，宁可判失败也不能假绿。 */
+      if (PROBE_LANE_RETIRE && !laneRetireProbe) {
+        const pr = await pageB.evaluate(`(function(){
+          const conn = [...state.conns.values()].find((c) => c.relay);
+          if (!conn) return null;             /* 还没降级到兜底，稍后再试 */
+          if (!state.incoming) return null;   /* 传输还没进入接收状态 */
+          const inc = state.incoming;
+          const victim = conn.lanes.find((l) => !(inc.lanes && inc.lanes.has(l))) || conn.lanes[0];
+          const statusOf = () => {
+            for (const r of state.transfers.values()) if (r.dir === 'down') return r.status;
+            return null;
+          };
+          const statusBefore = statusOf();
+          const receivedBefore = inc.received;
+          retireLane(victim);                 /* 走真机上的真实路径 */
+          return {
+            victimIsRelay: victim.relay === true,
+            receivedBefore,
+            survived: !!state.incoming,
+            statusBefore,
+            statusAfter: statusOf(),
+          };
+        })()`);
+        if (pr) {
+          laneRetireProbe = pr;
+          log(`  注入探针: 判死一条 WebRTC lane（isRelay=${pr.victimIsRelay}，`
+            + `已收 ${(pr.receivedBefore / 1048576).toFixed(1)} MB）→ `
+            + `传输${pr.survived ? '仍在 ✓' : '被误判中断 ✗'} · `
+            + `${JSON.stringify(pr.statusBefore)} → ${JSON.stringify(pr.statusAfter)}`);
+          if (pr.victimIsRelay) {
+            fail('探针挑到了兜底通道本身（isRelay=true），这次注入无效');
+          } else if (!pr.survived) {
+            fail('一条与本次传输无关的 WebRTC lane 判死，却把正在进行的兜底传输判成了中断');
+          }
+        }
+      }
+
       /* 卡住的时候最需要知道两端各自停在哪：发送记录、对端连接状态、
        * 待确认的 accept、接收端 incoming。每 3 秒打一次。 */
       if (Date.now() - lastDump > 3000) {
@@ -498,6 +553,12 @@ async function dumpConnDiag(page, peerId) {
       await new Promise((r) => setTimeout(r, 300));
     }
     const sendSecs = (Date.now() - sendStart) / 1000;
+
+    /* 兜底档里探针一定能注入（通道已降级 + 接收状态会持续整个传输）。
+     * 没注入成功就是这条断言失效了，必须炸出来——否则它会静默变成"永远绿"。 */
+    if (PROBE_LANE_RETIRE && !laneRetireProbe) {
+      fail('lane 判死探针没能注入（兜底档里应当总能拿到 relay 通道与进行中的接收）');
+    }
 
     if (!upRec || !upRec.done) {
       fail(`发送未完成: ${JSON.stringify(upRec)}`);
@@ -557,6 +618,11 @@ async function dumpConnDiag(page, peerId) {
       return null;
     })()`);
     log(`  接收端记录: ${JSON.stringify(downRec)}`);
+    /* 探针的收尾检查：判死一条无关 lane 之后，这次传输必须仍然走到"已保存"，
+     * 不能以"已中断"收场。 */
+    if (laneRetireProbe && downRec && /已中断/.test(String(downRec.status))) {
+      fail(`注入 lane 判死探针后接收端仍以中断收场: ${JSON.stringify(downRec)}`);
+    }
 
     /* ---------------------------------------------------- 4. lane 数量扫描 */
     if (SWEEP) {
