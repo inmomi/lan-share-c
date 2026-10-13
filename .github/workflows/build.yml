@@ -261,14 +261,15 @@ jobs:
           echo "CHROME_PATH=$FOUND" >> "$GITHUB_ENV"
           "$FOUND" --version
 
-      # netns 搭建 + 浏览器测试需要 root。Chrome 安装后的 CHROME_PATH 经 sudo -E
-      # 透传；node 经 setup-node 已在 PATH，sudo -E 保留 PATH。
+      # netns 搭建 + 浏览器测试需要 root。注意：sudo 默认会把 PATH 重置为
+      # secure_path，不含 setup-node 装的 node，所以用 `env PATH="$PATH"` 把当前
+      # （含 node）的 PATH 透传进去；CHROME_PATH 经 sudo -E 透传。
       - name: netns 两机直连 + 浏览器 e2e（T1，吞吐下限 8MB/s）
         run: |
           set -e
-          sudo -E bash -c '
+          sudo -E env PATH="$PATH" bash -c '
             set -e
-            export CHROME_PATH="'"$CHROME_PATH"'"
+            export CHROME_PATH="$CHROME_PATH"
             COTURN=0 bash tools/ci-realnet.sh setup
             set -a; . ./realnet.env; set +a
             ./lan-share -p "$SERVER_PORT" -d ./uploads -w ./public >/tmp/lanshare.log 2>&1 &
@@ -321,9 +322,9 @@ jobs:
       - name: netns 隔离 + TURN 中继 + 浏览器 e2e（T2，关键闸门）
         run: |
           set -e
-          sudo -E bash -c '
+          sudo -E env PATH="$PATH" bash -c '
             set -e
-            export CHROME_PATH="'"$CHROME_PATH"'"
+            export CHROME_PATH="$CHROME_PATH"
             COTURN=1 bash tools/ci-realnet.sh setup isolate
             set -a; . ./realnet.env; set +a
             LAN_SHARE_TURN="$LAN_SHARE_TURN" ./lan-share -p "$SERVER_PORT" -d ./uploads -w ./public >/tmp/lanshare.log 2>&1 &
