@@ -228,6 +228,8 @@ fi
   echo "GW_B='$GW_B'"
   echo "IP_A='$IP_A'"
   echo "IP_B='$IP_B'"
+  echo "SUBNET_A='$SUBNET_A'"
+  echo "SUBNET_B='$SUBNET_B'"
   echo "ISOLATE='$ISOLATE'"
   echo "NOUDP='$NOUDP'"
   echo "WRAP_A='ip netns exec $NS_A'"

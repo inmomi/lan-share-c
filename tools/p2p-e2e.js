@@ -316,11 +316,16 @@ async function dumpConnDiag(page, peerId) {
      * 永远 await，整个 job 只能被 GitHub 掐掉。这里 60s 内没 connected 就直接
      * 失败并打印 ICE 诊断，日志里一眼能看出是"host 候选不通"还是"中继没用上"。 */
     log('\n--- 等待 WebRTC 连接建立（闸门，60s）---');
-    /* 必须先用 app 自己的 initiate() 把连接发起：getConn 是懒创建的，不调它
-     * state.conns 里根本没有这条连接，直接等连接状态只会空等超时（第一次跑就
-     * 得到 {"noConn":true}）。initiate 幂等，已建过的 lane 会跳过。 */
-    await pageA.evaluate(
-      `(async () => { await initiate(${JSON.stringify(targetFromA)}); return true; })()`, 30000);
+    /* 必须走 app 自己的 ensureChannel()，不能只调 initiate()：
+     *  - getConn 是懒创建的，不调它 state.conns 里根本没有这条连接，
+     *    waitConnected 只会空等超时（第一次跑就得到 {"noConn":true}）；
+     *  - 更重要的是兜底通道是 ensureChannel 在"直连建不起来"时才建的。只调
+     *    initiate 的话 conn.relay 永远是 undefined，兜底用例会误判成连接超时，
+     *    而真实原因其实是"压根没人去决定走哪一层"。 */
+    const mode0 = await pageA.evaluate(
+      `(async () => { const r = await ensureChannel(${JSON.stringify(targetFromA)}); return r.mode; })()`,
+      90000);
+    log(`ensureChannel 选定传输层: ${mode0}`);
     const connState = await waitConnected(pageA, targetFromA, 60000, 1);
     if (!connState.ok) {
       /* 两侧都要看：A 停在 have-local-offer 说明 offer 发出去了但没等到 answer，
