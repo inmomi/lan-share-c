@@ -90,13 +90,17 @@ sysctl -w net.ipv4.conf.default.rp_filter=0 >/dev/null 2>&1 || true
 # 表现为"到网关通、到对端不通"，第一次跑就被这个假象骗了）。
 # 一律用 -I FORWARD 1 插到链首，确保优先于 Docker 留下的规则生效。
 if [ "$ISOLATE" = "1" ]; then
-  # AP / 客户端隔离：每个 ns 只能访问自己的网关（宿主机），于是
-  #   - nsA <-> nsB 直连被丢弃（设备间互访失败，对应"Wi-Fi 连不上"）；
-  #   - 到宿主机（网关）的信令 / 中继仍可达（宿主机自身地址走 INPUT，不走 FORWARD）。
-  # 这样直连必失败，只剩经宿主机 coturn 中继的路径，严格逼出"必须走中继"。
-  iptables -I FORWARD 1 -s "$IP_A" ! -d "$GW_A" -j DROP
-  iptables -I FORWARD 1 -s "$IP_B" ! -d "$GW_B" -j DROP
-  echo "隔离已启用：$IP_A / $IP_B 只能访问各自网关（宿主机），设备间直连被 DROP"
+  # AP / 客户端隔离的真实语义：只禁"客户端之间互访"，不禁客户端访问网络基础
+  # 设施（网关、以及跑在网关上的中继服务器）。真实 AP 隔离就是这样——设备能
+  # 上网、能连路由器，只是彼此不通；也正因为"都够得着网关"，跑在网关上的
+  # 中继才成为唯一可用通路。
+  #
+  # 之前写成"只能访问自己的网关"，把 nsB 访问网关上的 coturn 也一并挡了，
+  # 结果中继在测试里永远用不上（表现就是 nsB 分配中继超时）。隔离要隔离的是
+  # 设备互访，不是把设备从整个网络里拔掉。
+  iptables -I FORWARD 1 -s "$IP_A" -d "$IP_B" -j DROP
+  iptables -I FORWARD 1 -s "$IP_B" -d "$IP_A" -j DROP
+  echo "隔离已启用：只禁 $IP_A <-> $IP_B 客户端互访，网关与中继仍可达"
 else
   # 直连：显式放行两个子网互访，绕开 Docker 设的 FORWARD DROP 策略。
   iptables -I FORWARD 1 -s "$SUBNET_A" -d "$SUBNET_B" -j ACCEPT
@@ -183,6 +187,18 @@ if [ "$ISOLATE" = "1" ]; then
   if ip netns exec "$NS_A" ping -c1 -W2 -q "$IP_B" >/dev/null 2>&1; then echo "  隔离异常: nsA -> nsB($IP_B) 竟可达"; else echo "  隔离 OK: nsA -> nsB($IP_B) 被 DROP（符合预期）"; fi
 else
   if ip netns exec "$NS_A" ping -c1 -W2 -q "$IP_B" >/dev/null 2>&1; then echo "  直连 OK: nsA -> nsB($IP_B) 可达（符合预期）"; else echo "  直连异常: nsA -> nsB($IP_B) 不可达（netns 路由坏了）"; fi
+fi
+# 中继可达性：两端都必须够得着中继，少一端这条链路就废了（曾出现 nsA 通、
+# nsB 不通，表现是 nsB 分配中继超时，而日志上和"中继配错了"长得一样）。
+if [ "$COTURN" = "1" ]; then
+  for pair in "$NS_A:$IP_A" "$NS_B:$IP_B"; do
+    ns="${pair%%:*}"
+    if ip netns exec "$ns" timeout 5 bash -c "echo > /dev/tcp/$GW_A/3478" 2>/dev/null; then
+      echo "  $ns -> 中继 $GW_A:3478: OK"
+    else
+      echo "  $ns -> 中继 $GW_A:3478: 不通"
+    fi
+  done
 fi
 
 # ---- 写出 realnet.env（值含空格的必须加引号，否则 source 时会被当成命令执行）----

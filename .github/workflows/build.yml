@@ -342,6 +342,15 @@ jobs:
               && echo "nsA 可达服务端 OK" || { echo "::error::nsA 不可达服务端"; kill $SRV 2>/dev/null; exit 1; }
             ip netns exec nsB curl -sf -o /dev/null --max-time 5 "http://$GW_B:$SERVER_PORT/" \
               && echo "nsB 可达服务端 OK" || { echo "::error::nsB 不可达服务端"; kill $SRV 2>/dev/null; exit 1; }
+            # 先看服务端到底把什么发给了浏览器：TURN 注入生没生效，一眼可见。
+            # 页面里 window.__LAN_SHARE_TURN__ 一直是 null，靠这里定位是
+            # "服务端没拿到环境变量" 还是 "拿到了但替换没命中"。必须放在 e2e
+            # 之前——set -e 下 e2e 一失败就退出了，放后面永远打不出来。
+            echo "---- 服务端返回首页里的 TURN 注入片段 ----"
+            ip netns exec nsA curl -s "http://$GW_A:$SERVER_PORT/" \
+              | grep -o '__LAN_SHARE_TURN__.\{0,120\}' || echo "(首页里没找到 __LAN_SHARE_TURN__)"
+            echo "---- 服务端启动日志 /tmp/lanshare.log ----"
+            head -25 /tmp/lanshare.log 2>/dev/null || true
             node tools/p2p-e2e.js --server-url "$SERVER_URL_A" \
               --server-url-b "$SERVER_URL_B" \
               --chrome-wrap-a "$WRAP_A" --chrome-wrap-b "$WRAP_B" \
