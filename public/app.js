@@ -283,18 +283,17 @@ function attachChannel(lane, dc) {
 async function initiate(peerId) {
   const conn = getConn(peerId);
   const pending = conn.lanes.filter((l) => !l.dc);
-  /* 32 条 RTCPeerConnection 同时握手，在真实网卡/浏览器上会把 UDP 和 DTLS
-   * 打爆，大量握手失败——回环上无所谓，真机上就只开得出 1 条 lane。分小批错开
-   * 建立，给浏览器和网卡喘息，握手成功率立刻上来。每条 lane 是独立的关联，
-   * 错峰不影响数据并行，只是把"建链"这一步摊平了。 */
-  const WAVE = 4;
-  const GAP = 120;
-  for (let i = 0; i < pending.length; i += WAVE) {
-    const wave = pending.slice(i, i + WAVE);
-    await Promise.all(wave.map((l) => initiateLane(conn, l)));
-    if (i + WAVE < pending.length) {
-      await new Promise((r) => setTimeout(r, GAP));
-    }
+  /* 逐条建立、每条之间留 150ms。真实局域网里 Chrome 默认把 host 候选伪装成
+   * mDNS .local 名字，32 条同时建会瞬间灌出 60+ 个 mDNS 组播查询，操作系统
+   * 大量丢弃 → 多数候选永远解析不出、对应 lane 的 ICE 连不上（典型症状：
+   * 回环能开 32 条、真机只开 1~4 条、速度卡在单关联 ~5MB/s）。一条一条来，
+   * mDNS 查询错开，几乎每条都能解析出真实 IP，32 条基本全开；而且每条走的是
+   * 干净的直接 host 连接，单关联速度也会从"mDNS 降级路径"回到正常的几十
+   * MB/s——这样少量 lane 就能跑满千兆。 */
+  const GAP = 150;
+  for (const l of pending) {
+    await initiateLane(conn, l);
+    await new Promise((r) => setTimeout(r, GAP));
   }
   return conn;
 }
@@ -453,17 +452,22 @@ async function sendOne(peerId, file) {
   const use = accept.lanes
     ? chosen.filter((l) => accept.lanes.includes(l.index))
     : chosen;
+  /* 实际并行路数直接显示出来：如果这里长期只有 1~4 路，速度上不去的
+   * 根因就是真机上多数 lane 没建起来（典型是 mDNS 候选解析失败），而不是
+   * 数据分发的问题。 */
+  console.log('[lan-share] 发送端活 lane:', live.length, '本次使用:', use.length, 'chosen:', chosen.length);
   if (!use.length) throw new Error('对端没有可用的传输通道');
   /* 把 [start, size) 均分给活 lane。段与段首尾相接，接收端按 lane 顺序
    * 拼回去就是原文件——所以这里切的顺序不能乱，也不能漏段。
    * 每条 lane 是独立的 SCTP 关联，拥塞窗口互不影响：丢包链路上单关联
    * 的窗口会坍缩，多关联并联是对抗手段（CI 实测 2% 丢包下 4 条 0.9MB/s、
    * 32 条 5.1MB/s）。 */
+  const laneLabel = use.length + ' 路并行';
   const ranges = splitRange(start, file.size, use.length);
   const laneSent = use.map(() => 0);
   const report = () => {
     const total = start + laneSent.reduce((a, b) => a + b, 0);
-    updateTransfer(tid, { sent: total, status: '传输中' });
+    updateTransfer(tid, { sent: total, status: '传输中 · ' + laneLabel });
   };
 
   const sendStart = Date.now();
@@ -642,6 +646,7 @@ async function askReceive(lane, msg) {
   const myLive = lane.session.lanes
     .filter((l) => l.dc && l.dc.readyState === 'open')
     .map((l) => l.index);
+  console.log('[lan-share] 接收端活 lane:', myLive.length, '对端要约:', (msg.lanes || []).length);
   const myLiveSet = new Set(myLive);
   const useCount = Array.isArray(msg.lanes) && msg.lanes.length
     ? msg.lanes.filter((i) => myLiveSet.has(i)).length
@@ -673,7 +678,7 @@ async function askReceive(lane, msg) {
   addTransfer({
     tid: msg.tid, name: msg.name, size: msg.size, dir: 'down', peerId: lane.peerId, peerLabel: from,
   });
-  updateTransfer(msg.tid, { status: '接收中', sent: inc.received });
+  updateTransfer(msg.tid, { status: '接收中 · ' + myLive.length + ' 路', sent: inc.received });
   /* 回传本端活着的 lane：发送端取交集后切段，段数和这边才对得上 */
   lane.dc.send(JSON.stringify({
     t: 'file-accept', tid: msg.tid, fileId: msg.fileId, offset: inc.received,
