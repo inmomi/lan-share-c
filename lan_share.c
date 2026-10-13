@@ -1876,6 +1876,8 @@ static void ws_consume(ls_client *c) {
             off = 10;
         }
         if (plen > WS_BUF) {
+            fprintf(stderr, "[lan-share] 单帧超限关闭：plen=%llu > WS_BUF=%d\n",
+                    (unsigned long long)plen, WS_BUF);
             client_close(c);
             return;
         }
@@ -1992,6 +1994,8 @@ static void client_readable(ls_client *c) {
             }
         } else if (c->mode == MODE_WS) {
             if (c->wlen + (size_t)n > WS_BUF) {
+                fprintf(stderr, "[lan-share] WS 缓冲放不下关闭：wlen=%lu + n=%d > WS_BUF=%d\n",
+                        (unsigned long)c->wlen, n, WS_BUF);
                 client_close(c);
                 return;
             }

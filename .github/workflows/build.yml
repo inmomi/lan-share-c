@@ -457,7 +457,14 @@ jobs:
               --devtools-port-a "$DEVTOOLS_PORT_A" --devtools-port-b "$DEVTOOLS_PORT_B" \
               --no-mdns-bypass --require-mode relay \
               --file-mb 32 --timeout 300 --label ci-fallback --throughput-floor 2
+            RC=$?
+            echo "---- e2e 退出码 $RC ----"
+            echo "---- 服务端还活着吗 ----"
+            if pgrep -f "lan-share -p" >/dev/null; then echo "服务端仍在运行"; else echo "服务端已退出（崩溃或被杀）"; fi
+            echo "---- 服务端日志尾部 ----"
+            tail -40 /tmp/lanshare.log 2>/dev/null || true
             kill $SRV 2>/dev/null || true
+            exit $RC
           '
 
   # --------------------------------------------------------------- 发布
