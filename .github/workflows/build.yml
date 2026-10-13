@@ -27,7 +27,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        # 只跑 ubuntu。macOS 那一档不是刚需：功能测试用的是纯 POSIX 接口，
+        # 与 linux 完全同源，而 mac 的 runner 排队时间常常比整个测试本身还长，
+        # 结果就是发布一直被一个"排不上的 job"卡住（发版 job 在 needs 里等它）。
+        os: [ubuntu-latest]
 
     steps:
       - uses: actions/checkout@v4
