@@ -51,6 +51,11 @@ const SERVER_URL_A = arg('server-url-a', null) || SERVER_URL;
 const SERVER_URL_B = arg('server-url-b', null) || SERVER_URL;
 const DEVTOOLS_A = arg('devtools-host-a', '127.0.0.1');
 const DEVTOOLS_B = arg('devtools-host-b', '127.0.0.1');
+/* DevTools 端口：浏览器 A / B 各一个。netns 场景下 ci-realnet.sh 起的转发代理
+ * 必须按同样的端口转发（nsA→9331、nsB→9332），两边约定一致才连得上——之前
+ * 两个 ns 都按 9331 起代理，B 的 9332 没人转发，于是"DevTools 未就绪"。 */
+const DEVTOOLS_PORT_A = Number(arg('devtools-port-a', 9331));
+const DEVTOOLS_PORT_B = Number(arg('devtools-port-b', 9332));
 /* 吞吐下限（MB/s）：低于此值判失败，用于守住"中继/直连确实能用"的回归。0 表示不检查。 */
 const THROUGHPUT_FLOOR = Number(arg('throughput-floor', 0));
 
@@ -233,8 +238,14 @@ async function dumpConnDiag(page, peerId) {
     log(`服务端: A→${urlA}  B→${urlB}`);
 
     log('拉起两个浏览器…');
-    pageA = await launchBrowser({ port: 9331, wrap: WRAP_A, devtoolsHost: DEVTOOLS_A });
-    pageB = await launchBrowser({ port: 9332, wrap: WRAP_B, devtoolsHost: DEVTOOLS_B });
+    pageA = await launchBrowser({
+      port: DEVTOOLS_PORT_A, wrap: WRAP_A,
+      devtoolsHost: DEVTOOLS_A, devtoolsPort: DEVTOOLS_PORT_A,
+    });
+    pageB = await launchBrowser({
+      port: DEVTOOLS_PORT_B, wrap: WRAP_B,
+      devtoolsHost: DEVTOOLS_B, devtoolsPort: DEVTOOLS_PORT_B,
+    });
     await pageA.navigate(urlA);
     await pageB.navigate(urlB);
     await waitReady(pageA, 30000);
@@ -521,4 +532,9 @@ async function dumpConnDiag(page, peerId) {
     if (server) server.kill();
     try { fs.rmSync(dlDir, { recursive: true, force: true }); } catch (_) {}
   }
-})();
+})().then(() => {
+  /* 明确退出：失败后残留的 WebSocket / 浏览器子进程会把事件循环一直撑住，
+   * 只设 process.exitCode 而不退出的话，job 会空转到全局硬超时才结束
+   * （第一次跑就是 08:09 失败、08:16 才被硬超时收掉）。 */
+  process.exit(process.exitCode || 0);
+});

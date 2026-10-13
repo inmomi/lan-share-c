@@ -281,8 +281,10 @@ jobs:
             ip netns exec nsB curl -sf -o /dev/null --max-time 5 "http://$GW_B:$SERVER_PORT/" \
               && echo "nsB 可达服务端 OK" || { echo "::error::nsB 不可达服务端"; kill $SRV 2>/dev/null; exit 1; }
             node tools/p2p-e2e.js --server-url "$SERVER_URL_A" \
+              --server-url-b "$SERVER_URL_B" \
               --chrome-wrap-a "$WRAP_A" --chrome-wrap-b "$WRAP_B" \
               --devtools-host-a "$DEVTOOLS_A" --devtools-host-b "$DEVTOOLS_B" \
+              --devtools-port-a "$DEVTOOLS_PORT_A" --devtools-port-b "$DEVTOOLS_PORT_B" \
               --file-mb 64 --timeout 240 --label ci-lan --throughput-floor 8
             kill $SRV 2>/dev/null || true
           '
@@ -341,8 +343,10 @@ jobs:
             ip netns exec nsB curl -sf -o /dev/null --max-time 5 "http://$GW_B:$SERVER_PORT/" \
               && echo "nsB 可达服务端 OK" || { echo "::error::nsB 不可达服务端"; kill $SRV 2>/dev/null; exit 1; }
             node tools/p2p-e2e.js --server-url "$SERVER_URL_A" \
+              --server-url-b "$SERVER_URL_B" \
               --chrome-wrap-a "$WRAP_A" --chrome-wrap-b "$WRAP_B" \
               --devtools-host-a "$DEVTOOLS_A" --devtools-host-b "$DEVTOOLS_B" \
+              --devtools-port-a "$DEVTOOLS_PORT_A" --devtools-port-b "$DEVTOOLS_PORT_B" \
               --file-mb 64 --timeout 240 --label ci-isorel --throughput-floor 4
             kill $SRV 2>/dev/null || true
           '

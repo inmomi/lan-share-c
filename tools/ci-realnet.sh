@@ -33,7 +33,12 @@ GW_A=10.9.1.254
 GW_B=10.9.2.254
 VETH_A=vetha
 VETH_B=vethb
-DT_PORT=9331
+# 两个浏览器的 DevTools 端口，必须与 p2p-e2e.js 分配给 A / B 的调试端口一致
+# （A=9331、B=9332）。两个 ns 各有独立网络栈，Chrome 在各自 ns 内的 127.0.0.1
+# 上监听，代理在各自 ns 的 IP 上按**同一个端口**转发出来——之前两个 ns 都按
+# 9331 起代理，B 的 9332 没人转发，于是 B 的 DevTools 永远连不上。
+DT_PORT_A=9331
+DT_PORT_B=9332
 SERVER_PORT="${SERVER_PORT:-8471}"
 COTURN="${COTURN:-0}"
 ISOLATE=0
@@ -75,24 +80,37 @@ ip netns exec "$NS_B" ip route add default via "$GW_B"
 
 # 主机开启转发（让两个 ns 经主机互访，模拟同一 AP 下两台设备）
 sysctl -w net.ipv4.ip_forward=1 >/dev/null
+# 反向路径过滤可能把经 veth 转发的包丢掉，关掉省得再排查一轮
+sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null 2>&1 || true
+sysctl -w net.ipv4.conf.default.rp_filter=0 >/dev/null 2>&1 || true
 
-# ---- 可选：AP / 客户端隔离 ----
-# 把每个 ns 客户端限制为只能访问其网关（宿主机），于是：
-#   - nsA <-> nsB 直连被丢弃（设备间互访失败，对应"Wi-Fi 连不上"）；
-#   - 到宿主机（网关）的信令 / 中继仍可达（宿主机自身地址走 INPUT，不走 FORWARD）。
-# 这样直连必失败，只剩经宿主机 coturn 中继的路径，严格逼出"必须走中继"。
+# ---- 转发 / 隔离规则 ----
+# GitHub Runner 预装 Docker，而 Docker 默认把 FORWARD 链策略设成 DROP。
+# 不处理的话 nsA <-> nsB 一律不通（宿主机自己的地址走 INPUT 不受影响，于是
+# 表现为"到网关通、到对端不通"，第一次跑就被这个假象骗了）。
+# 一律用 -I FORWARD 1 插到链首，确保优先于 Docker 留下的规则生效。
 if [ "$ISOLATE" = "1" ]; then
-  iptables -A FORWARD -s "$IP_A" ! -d "$GW_A" -j DROP
-  iptables -A FORWARD -s "$IP_B" ! -d "$GW_B" -j DROP
+  # AP / 客户端隔离：每个 ns 只能访问自己的网关（宿主机），于是
+  #   - nsA <-> nsB 直连被丢弃（设备间互访失败，对应"Wi-Fi 连不上"）；
+  #   - 到宿主机（网关）的信令 / 中继仍可达（宿主机自身地址走 INPUT，不走 FORWARD）。
+  # 这样直连必失败，只剩经宿主机 coturn 中继的路径，严格逼出"必须走中继"。
+  iptables -I FORWARD 1 -s "$IP_A" ! -d "$GW_A" -j DROP
+  iptables -I FORWARD 1 -s "$IP_B" ! -d "$GW_B" -j DROP
   echo "隔离已启用：$IP_A / $IP_B 只能访问各自网关（宿主机），设备间直连被 DROP"
+else
+  # 直连：显式放行两个子网互访，绕开 Docker 设的 FORWARD DROP 策略。
+  iptables -I FORWARD 1 -s "$SUBNET_A" -d "$SUBNET_B" -j ACCEPT
+  iptables -I FORWARD 1 -s "$SUBNET_B" -d "$SUBNET_A" -j ACCEPT
+  echo "直连已放行：$SUBNET_A <-> $SUBNET_B 经宿主机转发（绕开 Docker 的 FORWARD DROP）"
 fi
 
-# ---- DevTools 代理：在每个 ns 内监听该 ns 的 IP，转发到 ns 内回环 127.0.0.1:$DT_PORT ----
-# 宿主机（测试进程）用 nsA IP 即可连到在 nsA 里跑的 Chrome 调试端口。
+# ---- DevTools 代理：在每个 ns 内监听该 ns 的 IP，转发到 ns 内回环的同端口 ----
+# 宿主机（测试进程）用 nsX 的 IP 即可连到在 nsX 里跑的 Chrome 调试端口。
+# 端口必须和浏览器一一对应：nsA→9331（浏览器 A）、nsB→9332（浏览器 B）。
 nohup ip netns exec "$NS_A" node "$SCRIPT_DIR/devtools-proxy.js" \
-  --listen "$IP_A:$DT_PORT" --target "127.0.0.1:$DT_PORT" >/tmp/proxy-a.log 2>&1 &
+  --listen "$IP_A:$DT_PORT_A" --target "127.0.0.1:$DT_PORT_A" >/tmp/proxy-a.log 2>&1 &
 nohup ip netns exec "$NS_B" node "$SCRIPT_DIR/devtools-proxy.js" \
-  --listen "$IP_B:$DT_PORT" --target "127.0.0.1:$DT_PORT" >/tmp/proxy-b.log 2>&1 &
+  --listen "$IP_B:$DT_PORT_B" --target "127.0.0.1:$DT_PORT_B" >/tmp/proxy-b.log 2>&1 &
 sleep 1
 
 # ---- 可选：coturn 中继 ----
@@ -139,7 +157,8 @@ fi
   echo "WRAP_B='ip netns exec $NS_B'"
   echo "DEVTOOLS_A='$IP_A'"
   echo "DEVTOOLS_B='$IP_B'"
-  echo "DEVTOOLS_PORT='$DT_PORT'"
+  echo "DEVTOOLS_PORT_A='$DT_PORT_A'"
+  echo "DEVTOOLS_PORT_B='$DT_PORT_B'"
   if [ -n "$TURN_JSON" ]; then
     echo "LAN_SHARE_TURN='$TURN_JSON'"
   fi
