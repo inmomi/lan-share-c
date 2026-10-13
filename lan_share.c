@@ -633,27 +633,38 @@ static void queue_mem(ls_client *c, const char *data, size_t len) {
      * 会撞在一起——旧实现开头的 out_reset() 会把第一条整帧丢掉，
      * 表现就是前端改名后收不到 self 回执。这里改成把未发送的部分挪到开头再追加。 */
     if (c->out.has && c->out.is_mem && c->out.buf) {
-        size_t rest = c->out.len - c->out.sent;
-        size_t need = rest + len + 1;
-        /* 尾部还放得下就直接追加：这是兜底通道的正常路径（帧小、发送快、
-         * 队列通常很快就空），一帧一次 memmove(残留) 在几百帧的规模下就是
-         * 几十 GB 的内存搬移，直接决定中转吞吐。 */
-        if (c->out.cap >= need && c->out.sent > 0) {
-            if (rest) memmove(c->out.buf, c->out.buf + c->out.sent, rest);
-            c->out.sent = 0;
-            c->out.len = rest;
-        }
-        if (c->out.cap >= need) {
+        /* 快路径：尾部还放得下就直接追加，一次 memmove 都不做。
+         * 这是兜底通道的正常路径（帧小、发送快、队列留不住）——原来每追加一帧
+         * 都要把"未发送部分"挪到开头，几百帧规模下就是几十 GB 的内存搬移，
+         * 实测把中转吞吐压到 3MB/s。 */
+        size_t need = c->out.len + len + 1;
+        if (need <= c->out.cap) {
             memcpy(c->out.buf + c->out.len, data, len);
             c->out.len += len;
             c->out.buf[c->out.len] = '\0';
             return;
         }
+        /* 尾部放不下：先回收已发送的空间再试一次。
+         * 这一步不能省——下面按 c->out.len 追加，而 len 是含已发送前缀的总长，
+         * 不先压缩的话，扩容算出来的容量只够"未发送部分 + 本次"，实际写入却从
+         * len 开始，sent > 0 时会写到缓冲区外面去（堆溢出）。 */
         {
-            char *nb = (char *)realloc(c->out.buf, need < c->out.cap * 2 ? c->out.cap * 2 : need);
-            if (!nb) return; /* 内存不足时保留原有内容，本次丢弃 */
-            c->out.buf = nb;
-            c->out.cap = need < c->out.cap * 2 ? c->out.cap * 2 : need;
+            size_t rest = c->out.len - c->out.sent;
+            if (c->out.sent > 0) {
+                if (rest) memmove(c->out.buf, c->out.buf + c->out.sent, rest);
+                c->out.sent = 0;
+                c->out.len = rest;
+            }
+            need = c->out.len + len + 1;
+            if (need > c->out.cap) {
+                size_t ncap = c->out.cap ? c->out.cap * 2 : need;
+                char *nb;
+                if (ncap < need) ncap = need;
+                nb = (char *)realloc(c->out.buf, ncap);
+                if (!nb) return; /* 内存不足时保留原有内容，本次丢弃 */
+                c->out.buf = nb;
+                c->out.cap = ncap;
+            }
         }
         memcpy(c->out.buf + c->out.len, data, len);
         c->out.len += len;
