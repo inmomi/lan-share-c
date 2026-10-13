@@ -230,7 +230,7 @@ CI 在 Ubuntu 和 macOS 上跑完整功能测试，并编译 Windows / Linux x64
   放心按 64KB 收。
 - **前端内嵌进二进制**。`tools/embed-web.js` 把 `public/` 的 HTML/JS/CSS 转成 `web_assets.h` 字节数组，启动时先找磁盘上的 `-w` 目录、找不到就回退到内嵌副本。这样拷一个二进制到路由器（`public/` 没跟着过去）也不会 404。改了前端记得重新生成，CI 每轮都会自己跑一遍并断言「无 `public/` 目录时 `/` 仍返回 200」。
 - **输出缓冲是追加而不是覆盖**。单线程 `select` 循环里 `send` 只是写进内核缓冲，真正 flush 往往在下一轮，连续两次排队（改名回执 `self` + `peers` 广播）会把前一条整帧丢掉。`queue_mem()` 因此先把未发送的部分挪到开头再追加。
-- **不配 STUN/TURN**。纯内网场景下 WebRTC 用本机内网 IP 的 host candidate 就能直连，完全离线可用。
+- **配了一个 STUN（不配 TURN）**。`iceServers` 现在是 `[{ urls: 'stun:stun.l.google.com:19302' }]`。原因：纯 host 候选会被 Chrome 默认伪装成 mDNS `.local` 名字，两台 Windows PC 在真实局域网里经常解析失败，导致绝大多数并行 lane 的 ICE 连通性检查过不了、只剩下 1 条能开，速度就卡在单关联的 ~5MB/s（回环上却能开满 32 条）。加了 STUN 后浏览器还会收集 srflx 候选（可达的 IPv4 UDP 端点），绕开 mDNS/IPv6 主机候选的不可达问题。**只加 STUN、不加 TURN，所以数据绝不经第三方中转。** 纯离线局域网下 STUN 请求会超时，但 host 候选照常使用、只是 ICE 稍慢一点；想彻底不连外网就把这行改回 `[]` 并重新 `embed-web.js`。
 - **响应头与文件体分流**。下载时 HTTP 头走高优先级缓冲先发出，再流式读盘，避免两者互相覆盖。
 - **UTF-8 文件名在 Windows 上走宽字符 API**。Windows 的 ANSI 版 `open`/`fopen` 会拿当前代码页（简体中文是 GBK 936）解释 UTF-8 字节，只要恰好拼出非法的 GBK 双字节组合就失败——症状很随机，例如"最.txt"能建而"中.txt"不能。所以 Windows 分支一律用 `_wopen` / `_wfopen` / `_wstat64` / `FindFirstFileW`。Linux 下路径是原始字节、内核不解释编码，无需转换。
 - **文件名安全**。上传前剥离路径、过滤控制字符，并校验最终路径仍在存储目录内，防止目录穿越。

@@ -216,10 +216,20 @@ function getConn(peerId) {
 }
 
 function makeLane(session, index) {
-  const pc = new RTCPeerConnection({ iceServers: [] });
+  /* 必须带 STUN：纯 host 候选会被 Chrome 默认伪装成 mDNS .local 名字，两台
+   * Windows PC 在真实局域网里经常解析失败，于是 32 条 lane 里绝大多数 ICE
+   * 连通性检查都过不了——表现就是回环(loopback)能开 32 条、真机千兆只开 1 条、
+   * 速度卡在单关联 ~5MB/s。加 STUN 后浏览器还会收集 srflx 候选（可达的 IPv4 UDP
+   * 端点），绕开 mDNS/IPv6 主机候选的不可达问题。注意只加 STUN、不加 TURN，
+   * 所以数据绝不会经第三方中转；纯离线局域网下 STUN 请求会超时，但 host 候选
+   * 照常使用，只是 ICE 稍慢一点。 */
+  const pc = new RTCPeerConnection({
+    iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
+  });
   const lane = {
     session, index, peerId: session.peerId,
     pc, dc: null, ready: null, role: null, speedtest: null,
+    pendingCands: [],   // 远端描述还没 set 之前到的候选，先攒着，setRemote 后补加
   };
 
   /* 信令带 ch，告诉对端这是哪一条 lane 的 offer / candidate */
@@ -272,7 +282,20 @@ function attachChannel(lane, dc) {
 
 async function initiate(peerId) {
   const conn = getConn(peerId);
-  await Promise.all(conn.lanes.map((lane) => initiateLane(conn, lane)));
+  const pending = conn.lanes.filter((l) => !l.dc);
+  /* 32 条 RTCPeerConnection 同时握手，在真实网卡/浏览器上会把 UDP 和 DTLS
+   * 打爆，大量握手失败——回环上无所谓，真机上就只开得出 1 条 lane。分小批错开
+   * 建立，给浏览器和网卡喘息，握手成功率立刻上来。每条 lane 是独立的关联，
+   * 错峰不影响数据并行，只是把"建链"这一步摊平了。 */
+  const WAVE = 4;
+  const GAP = 120;
+  for (let i = 0; i < pending.length; i += WAVE) {
+    const wave = pending.slice(i, i + WAVE);
+    await Promise.all(wave.map((l) => initiateLane(conn, l)));
+    if (i + WAVE < pending.length) {
+      await new Promise((r) => setTimeout(r, GAP));
+    }
+  }
   return conn;
 }
 
@@ -298,6 +321,7 @@ async function handleSignal(from, data) {
     lane.role = 'answerer';
     try {
       await lane.pc.setRemoteDescription(data.desc);
+      await flushPendingCands(lane);
       const answer = await lane.pc.createAnswer();
       await lane.pc.setLocalDescription(answer);
       sendSignal(from, { ch, desc: lane.pc.localDescription });
@@ -311,16 +335,36 @@ async function handleSignal(from, data) {
   if (data.desc && data.desc.type === 'answer') {
     try {
       await lane.pc.setRemoteDescription(data.desc);
+      await flushPendingCands(lane);
     } catch (_) { /* 冲突时对方迟到的 answer，忽略 */ }
     return;
   }
 
   if (data.candidate) {
     try {
-      await lane.pc.addIceCandidate(data.candidate);
+      if (lane.pc.remoteDescription && lane.pc.remoteDescription.type) {
+        await lane.pc.addIceCandidate(data.candidate);
+      } else {
+        /* 远端描述还没 set（offer/answer 还在路上，或 glare 互抢时候选比
+         * 描述先到），先缓存起来。真实网络下这很常见——候选一旦被直接
+         * addIceCandidate 且远端还没 set，会抛错被吞掉、这条候选就永久丢了，
+         * 该关联 ICE 就再也连不上。32 条里只剩 1 条能开的现象多半由此而来。 */
+        lane.pendingCands.push(data.candidate);
+      }
     } catch (err) {
       /* stale candidate, safe to ignore */
     }
+  }
+}
+
+/* 远端描述 set 完成后，把缓存的候选补加进去。错峰建链 + 缓存候选一起，
+ * 让 32 条 lane 在真实局域网里也能基本全部连上。 */
+async function flushPendingCands(lane) {
+  if (!lane.pendingCands.length) return;
+  const q = lane.pendingCands;
+  lane.pendingCands = [];
+  for (const c of q) {
+    try { await lane.pc.addIceCandidate(c); } catch (_) { /* stale */ }
   }
 }
 
