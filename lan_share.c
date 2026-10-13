@@ -404,8 +404,11 @@ typedef struct {
     unsigned char frag[WS_BUF];
     size_t fraglen;
     /* 帧级跟踪：每条连接只打前若干帧。帧流一旦错位，光看"分片缓冲超限"
-     * 这种结果级报错是查不出来的——必须看到 op/fin/len 才知道到底收到了什么。 */
-    int trace_left;
+     * 这种结果级报错是查不出来的——必须看到 op/fin/len 才知道到底收到了什么。
+     * 文本和二进制分开计数：信令（ICE 候选）会刷掉几十条小文本帧，
+     * 合用一个预算的话，兜底通道的大二进制帧一条都轮不到打印。 */
+    int trace_text;       /* 还能打印多少条文本帧 */
+    int trace_bin;        /* 还能打印多少条二进制/续帧 */
 
     int upfd;
     uint64_t upleft;
@@ -1704,7 +1707,8 @@ static long process_request(ls_client *c, const char *req, size_t len) {
         c->wlen = 0;
         c->frag_op = 0;
         c->fraglen = 0;
-        c->trace_left = 24;
+        c->trace_text = 6;
+        c->trace_bin = 16;
         /* 注意：这里绝不能清 c->hlen。调用方靠 `hlen -= used` 推进读指针，
          * 清零会导致下溢成巨大 size_t，随后越界写直接段错误。
          * 101 响应占用了输出缓冲，peers 广播必须等它发完再补发，
@@ -1977,12 +1981,15 @@ static void ws_consume(ls_client *c) {
         /* 前若干帧逐帧打出来。目的很具体：确认"收到的帧流到底是什么形状"——
          * 是不是分片的、首片和续帧各多大、有没有因为错位读出莫名其妙的 op。
          * 只看到"分片缓冲超限"这种结果级报错，是没法反推上面这些的。 */
-        if (c->trace_left > 0) {
-            c->trace_left--;
-            fprintf(stderr, "[lan-share] 帧 %s op=0x%x fin=%d len=%llu%s\n",
-                    c->id, opcode, fin, (unsigned long long)plen,
-                    c->trace_left == 0 ? "（后续不再逐帧打印）" : "");
-            fflush(stderr);
+        {
+            int *budget = (opcode == 0x2 || opcode == 0x0) ? &c->trace_bin : &c->trace_text;
+            if (*budget > 0) {
+                (*budget)--;
+                fprintf(stderr, "[lan-share] 帧 %s op=0x%x fin=%d len=%llu%s\n",
+                        c->id, opcode, fin, (unsigned long long)plen,
+                        *budget == 0 ? "（该类帧后续不再逐帧打印）" : "");
+                fflush(stderr);
+            }
         }
 
         if (opcode == 0x8) {
