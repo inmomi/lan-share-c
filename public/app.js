@@ -136,6 +136,8 @@ let ws = null;
 function connect() {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   ws = new WebSocket(`${proto}//${location.host}/ws`);
+  /* 兜底数据通道直接收 ArrayBuffer，省掉一次 Blob→ArrayBuffer 的异步转换 */
+  ws.binaryType = 'arraybuffer';
 
   ws.addEventListener('open', () => {
     const saved = loadSavedName();
@@ -147,6 +149,24 @@ function connect() {
   });
 
   ws.addEventListener('message', (event) => {
+    /* 二进制帧 = 兜底数据通道的文件字节。服务端按帧首的 id 转过来的，
+     * 这里按同一个 id 找到对端的兜底 lane，交给和 DataChannel 完全相同的
+     * onChannelMessage 处理——上层不区分数据是从哪一层来的。 */
+    if (typeof event.data !== 'string' && event.data) {
+      const frame = LSRelay.parseRelayFrame(event.data);
+      if (frame && frame.payload.byteLength) {
+        const lane = ensureRelay(frame.from);
+        lane.ackPending += frame.payload.byteLength;
+        /* 收到就回确认：发送端的 inflight 窗口靠它泄流，否则 pumpFile 会
+         * 一直卡在 waitDrain 上（表现是速度掉到 0 然后超时）。 */
+        if (lane.ackPending >= RELAY_ACK_EVERY) {
+          sendSignal(frame.from, { ch: 0, relayAck: lane.ackPending });
+          lane.ackPending = 0;
+        }
+        onChannelMessage(lane, frame.payload);
+      }
+      return;
+    }
     let msg;
     try {
       msg = JSON.parse(event.data);
@@ -180,6 +200,15 @@ function connect() {
 
   ws.addEventListener('close', () => {
     state.peers = [];
+    /* 兜底通道是挂在信令 WebSocket 上的：连接一断它就废了。必须显式关掉，
+     * 否则正在跑的传输会卡在 waitDrain 上（readyState 还是 open，却永远
+     * 发不出去），只能等 15s 硬超时。 */
+    for (const conn of state.conns.values()) {
+      if (conn.relay) {
+        conn.relay.dc.close();
+        conn.relay = null;
+      }
+    }
     renderPeers();
     setTimeout(connect, 2000);
   });
@@ -191,6 +220,93 @@ function send(obj) {
 
 function sendSignal(to, data) {
   send({ type: 'signal', to, data });
+}
+
+/* ==========================================================================
+ * 兜底数据通道（WebSocket 中转）——统一传输抽象的第二层
+ *
+ * 实现在 public/relay-channel.js（独立模块，能在 Node 里直接单测）。上层
+ * （file-offer / pumpFile / lane-end / progress）只认一套 DataChannel 式的
+ * 接口：send(string|ArrayBuffer) / readyState / bufferedAmount /
+ * bufferedAmountLowThreshold / addEventListener('message' | 'bufferedamountlow')。
+ * 底下是 WebRTC DataChannel 还是这条 WS 中转，对上层完全一样——所以
+ * 「Wi-Fi 点对点」「有线↔Wi-Fi」「AP 隔离」「mDNS 组播被拦」「UDP 被禁」
+ * 这些情况不必各写一套逻辑：ICE 建得起来就走 DataChannel，建不起来自动落到
+ * 这一层。
+ *
+ * 为什么必须有这一层：Chrome 默认把 host 候选伪装成 mDNS .local 名字，要靠
+ * 组播解析；家用路由器默认开 IGMP Snooping，无线侧经常收不到组播，候选就
+ * 永远解析不出来，ICE 一条都建不起来。而 WebSocket 走单播 TCP，且信令本来
+ * 就已经通了（页面就是从服务端加载的），所以它一定能通——代价只是多一跳、
+ * 没有多 lane 并行。
+ * ========================================================================== */
+
+const RELAY_ACK_EVERY = LSRelay.RELAY_ACK_EVERY;
+/* 直连宽限期：这段时间内一条 lane 都没开，就认定直连不可用、降级到兜底。
+ * 不能等到 LANE_OPEN_TIMEOUT(20s)——用户只会看到界面没反应。 */
+const DIRECT_GRACE_MS = 9000;
+/* 已经有 lane 打开之后，连续这么久没有新 lane 打开就开工（见 ensureChannel）。
+ * LANE_SETTLE_MAX_MS 是硬上限，防止一直有 lane 慢慢开而拖太久。 */
+const LANE_SETTLE_MS = 1500;
+const LANE_SETTLE_MAX_MS = 12000;
+
+/* 兜底通道的出站口：控制消息走信令 JSON，数据帧直接投给 WebSocket。
+ * 单独抽出来是为了让 RelayChannel 本身不依赖页面全局（ws / send），
+ * 这样它能在 Node 里被单测。 */
+function makeRelaySink(peerId) {
+  return {
+    peerId,
+    send(data) {
+      if (typeof data === 'string') {
+        /* file-offer / accept / lane-end / progress 走原来的信令通道，
+         * 服务端原样转发 JSON，不用额外开一条链路。 */
+        send({ type: 'signal', to: peerId, data: { ch: 0, relay: data } });
+        return;
+      }
+      if (!ws || ws.readyState !== WebSocket.OPEN) throw new Error('连接中断');
+      ws.send(data);
+    },
+    get bufferedAmount() {
+      return ws && ws.readyState === WebSocket.OPEN ? ws.bufferedAmount : 0;
+    },
+  };
+}
+
+/** 从本地 SDP 里数各类 ICE 候选，顺带看 host 候选是不是被伪装成 .local。
+ *  降级时把它打出来，一眼就能区分"根本没收集到可用的真实 IP 候选"和
+ *  "候选有了但对端不可达"——这两种的修法完全不同，之前只能靠猜。 */
+function candidateTypeStats(pc) {
+  const sdp = (pc && pc.localDescription && pc.localDescription.sdp) || '';
+  const types = {};
+  let obfuscated = 0;
+  for (const line of sdp.split('\r\n')) {
+    if (!line.startsWith('a=candidate:')) continue;
+    const f = line.split(' ');
+    const typ = f[f.length - 2];
+    const addr = f[4];
+    if (typ) types[typ] = (types[typ] || 0) + 1;
+    if (addr && /\.local$/.test(addr)) obfuscated++;
+  }
+  const counts = Object.keys(types).map((k) => `${k}:${types[k]}`).join(' ');
+  return {
+    text: (counts || '无候选') + (obfuscated ? ` · ${obfuscated} 条伪装成 .local` : ''),
+    types, obfuscated,
+  };
+}
+
+/** 拿到（或建好）到某个对端的兜底 lane。它不在 conn.lanes 里——那 32 条是
+ *  WebRTC 的，会被 retireLane 换掉；兜底 lane 与 WebSocket 同生命周期。 */
+function ensureRelay(peerId) {
+  const conn = getConn(peerId);
+  if (conn.relay) return conn.relay;
+  const dc = new LSRelay.RelayChannel(peerId, makeRelaySink(peerId));
+  conn.relay = {
+    session: conn, index: 0, peerId,
+    pc: null, dc, ready: Promise.resolve(dc),
+    role: 'relay', relay: true, speedtest: null,
+    pendingCands: [], ackPending: 0,
+  };
+  return conn.relay;
 }
 
 /* ------------------------------------------------------- peer connections */
@@ -221,7 +337,23 @@ function getConn(peerId) {
  * TURN 为可选：缺省（null）时纯 STUN + host，数据绝不经第三方；一旦服务端
  * 配了 TURN，AP / 客户端隔离下设备间直连被丢弃时即可走中继，不再"中继无效"。 */
 function buildIceServers() {
-  const servers = [{ urls: 'stun:stun.l.google.com:19302' }];
+  const servers = [];
+  /* 服务端在同一个端口上兼任局域网 STUN（UDP），给客户端发"自己真实内网 IP"
+   * 的自反射候选。Chrome 只对 host 候选做 mDNS 伪装，srflx 是真实 IP——
+   * 所以只要这个 STUN 可达，直连就不再依赖组播解析。
+   *
+   * 原来写死 stun.l.google.com 有两个问题：一是国内基本不可达，ICE 要等它超时
+   * 才继续（白等几秒）；二是即使可达，同一个局域网里两台设备拿到的 srflx 都是
+   * 路由器公网 IP，要靠 NAT 回环才能互通，对局域网直连毫无帮助。 */
+  if (typeof location !== 'undefined' && location.hostname) {
+    const host = location.hostname.includes(':')
+      ? `[${location.hostname}]`
+      : location.hostname;
+    const port = location.port || (location.protocol === 'https:' ? 443 : 80);
+    servers.push({ urls: `stun:${host}:${port}` });
+  } else {
+    servers.push({ urls: 'stun:stun.l.google.com:19302' });
+  }
   const extra = (typeof window !== 'undefined') && window.__LAN_SHARE_TURN__;
   if (Array.isArray(extra)) {
     for (const s of extra) {
@@ -330,6 +462,19 @@ async function initiateLane(session, lane) {
 }
 
 async function handleSignal(from, data) {
+  /* 兜底通道的两类消息走的是同一条信令链路，但不属于任何一条 WebRTC lane，
+   * 所以必须在按 ch 取 lane 之前先分流：
+   *   relay    = 对端发来的控制消息（file-offer / accept / lane-end / progress）
+   *   relayAck = 对端回的收字节确认，用来泄发送端的 inflight 窗口 */
+  if (data && typeof data.relay === 'string') {
+    onChannelMessage(ensureRelay(from), data.relay);
+    return;
+  }
+  if (data && data.relayAck) {
+    ensureRelay(from).dc.ack(Number(data.relayAck) || 0);
+    return;
+  }
+
   const conn = getConn(from);
   const ch = Math.max(0, Math.min(LANES - 1, Number(data.ch) || 0));
   const lane = conn.lanes[ch];
@@ -395,21 +540,65 @@ const LANE_OPEN_TIMEOUT = 20000;
 
 async function ensureChannel(peerId) {
   let conn = state.conns.get(peerId);
-  if (!conn || conn.lanes.some((l) => !l.dc)) conn = await initiate(peerId);
-  await Promise.all(conn.lanes.map((l) => (l.ready
-    ? Promise.race([
-      l.ready,
-      new Promise((r) => setTimeout(r, LANE_OPEN_TIMEOUT)),
-    ])
-    : Promise.resolve())));
-  const live = conn.lanes.filter((l) => l.dc && l.dc.readyState === 'open');
+  if (!conn) conn = getConn(peerId);
+  /* initiate 里 32 条 lane 是错开 150ms 逐条 offer 的（避免 mDNS 查询风暴），
+   * 全部发完要约 4.8s。不能等它全部 settle 再判断能不能直连——那样光"发现
+   * 直连不可用"就要二十几秒。这里让它跑着，同时轮询已经 open 的 lane。 */
+  let initiating = Promise.resolve(conn);
+  if (conn.lanes.some((l) => !l.dc)) initiating = initiate(peerId);
+
+  const graceEnd = Date.now() + DIRECT_GRACE_MS;
+  let live = [];
+  for (;;) {
+    live = conn.lanes.filter((l) => l.dc && l.dc.readyState === 'open');
+    if (live.length || Date.now() >= graceEnd) break;
+    await new Promise((r) => setTimeout(r, 200));
+  }
+
+  if (!live.length) {
+    /* 一条都没建起来：典型是 Chrome 把 host 候选伪装成 mDNS .local 名字、
+     * 而 AP / 有线无线桥接把组播拦了，候选永远解析不出来。原来这里直接抛
+     * "点对点通道未就绪"，用户看到的就是"传不了"——现在落到 WebSocket 兜底
+     * 通道，照样能传，只是单路、多一跳。 */
+    await initiating.catch(() => {});
+    /* 降级不是终点，得说清楚为什么：候选是根本没有、还是被伪装成 .local 之后
+     * 解析不出来。分别对应"UDP/端口被封"和"mDNS 组播不通"两种完全不同的网络。 */
+    const st = conn.lanes[0] ? candidateTypeStats(conn.lanes[0].pc) : { text: '无 pc' };
+    const ice = conn.lanes[0] && conn.lanes[0].pc ? conn.lanes[0].pc.iceConnectionState : '?';
+    console.log(`[lan-share] 直连未就绪（ice=${ice}，本地候选 ${st.text}），改用 WebSocket 兜底通道`);
+    toast('直连未建立，已改用服务器中转');
+    const relay = ensureRelay(peerId);
+    return { conn, live: [relay], mode: 'relay' };
+  }
+
+  /* 已经开了一部分，再等一会儿让其余 lane 赶上（多开几条换吞吐的收益）。
+   *
+   * 这里原来是 Promise.all 等每条 lane 的 ready、每条各带 20s 超时：只要
+   * 32 条里少开一条（真机上的常态），就要**白等整整 20 秒**才开始传，用户
+   * 看到的就是"点了发送没反应"。改成自适应收敛——连续 LANE_SETTLE_MS 没有
+   * 新的 lane 打开就走，既不会为开不了的 lane 干等，也能把谈好的都收进来。 */
+  let seen = -1;
+  let stableSince = Date.now();
+  const settleEnd = Date.now() + LANE_SETTLE_MAX_MS;
+  for (;;) {
+    live = conn.lanes.filter((l) => l.dc && l.dc.readyState === 'open');
+    if (live.length !== seen) {
+      seen = live.length;
+      stableSince = Date.now();
+    }
+    if (Date.now() - stableSince >= LANE_SETTLE_MS) break;
+    if (Date.now() >= settleEnd) break;
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  await initiating.catch(() => {});
+  live = conn.lanes.filter((l) => l.dc && l.dc.readyState === 'open');
   /* 没打开的 lane 退役掉：半开的 pc 留着只会漏资源，且下一次会在这里重建。
    * 先拷贝再遍历——retireLane 会往 conn.lanes 里写新对象。 */
   for (const l of conn.lanes.slice()) {
     if (!live.includes(l) && l.dc) retireLane(l);
   }
   if (!live.length) throw new Error('点对点通道未就绪');
-  return { conn, live };
+  return { conn, live, mode: 'p2p' };
 }
 
 /* ------------------------------------------------------------ data channel */
@@ -449,7 +638,8 @@ async function sendOne(peerId, file) {
   /* 这条链路用几条 lane：首次传输前探一次（probeLanes），之后按探测结果
    * 和实测表现动态调整。只广告真正会用的 lane——对端按交集数段数，
    * 广告 32 条却只用 16 条，对端会永远等不到收尾。 */
-  const want = await chooseLanes(conn, live);
+  /* 兜底通道只有一条，也不用探 lane 数（探测本身就是一次 4MB 往返） */
+  const want = live.length === 1 && live[0].relay ? 1 : await chooseLanes(conn, live);
   const chosen = live.slice(0, want);
 
   /* 控制消息走第一条活 lane，数据随后按范围铺到所用 lane 上。
@@ -483,7 +673,11 @@ async function sendOne(peerId, file) {
    * 每条 lane 是独立的 SCTP 关联，拥塞窗口互不影响：丢包链路上单关联
    * 的窗口会坍缩，多关联并联是对抗手段（CI 实测 2% 丢包下 4 条 0.9MB/s、
    * 32 条 5.1MB/s）。 */
-  const laneLabel = use.length + ' 路并行';
+  /* 走的是哪一层必须让用户看见：直连 = "N 路并行"，兜底 = "服务器中转"。
+   * 之前只有"点对点通道未就绪"一句报错，用户既不知道为什么、也没有退路。 */
+  const laneLabel = (use.length === 1 && use[0].relay)
+    ? '1 路 · 服务器中转（直连未建立）'
+    : use.length + ' 路并行';
   const ranges = splitRange(start, file.size, use.length);
   const laneSent = use.map(() => 0);
   const report = () => {
@@ -664,9 +858,14 @@ async function askReceive(lane, msg) {
    * 它拿本端活集合和回传的集合取交集后切段）。写死 LANES 会在 lane 死亡
    * 或文件很小、段数不足时永远等不到收尾。
    * 老版本对端不发 lanes 字段时退回本端数量（双方都全活时相等）。 */
-  const myLive = lane.session.lanes
-    .filter((l) => l.dc && l.dc.readyState === 'open')
-    .map((l) => l.index);
+  /* 兜底通道不在 session.lanes 里（它是 conn.relay），且整条链路只有它一条：
+   * 直接按 [0] 走，别拿 32 条 WebRTC lane 的开合状态去和它取交集——
+   * 那边可能一条都没开，交集算出来是 0，收端会误判成"没有可用通道"而拒绝。 */
+  const myLive = lane.relay
+    ? [0]
+    : lane.session.lanes
+      .filter((l) => l.dc && l.dc.readyState === 'open')
+      .map((l) => l.index);
   console.log('[lan-share] 接收端活 lane:', myLive.length, '对端要约:', (msg.lanes || []).length);
   const myLiveSet = new Set(myLive);
   const useCount = Array.isArray(msg.lanes) && msg.lanes.length
@@ -872,16 +1071,23 @@ function renderPeers() {
     let dotClass = 'dot';
     let note = '未连接';
     if (conn) {
-      const open = conn.lanes.filter((l) => l.dc && l.dc.readyState === 'open').length;
-      if (open === conn.lanes.length) {
-        dotClass = 'dot live';
-        note = `已直连 ×${open}`;
-      } else if (open > 0) {
+      if (conn.relay) {
+        /* 兜底通道不在 conn.lanes 里。走到这一层说明直连没建起来——明说出来，
+         * 别让用户看到一个"连接中"然后不知道到底连上没有。 */
         dotClass = 'dot busy';
-        note = `连接中 ${open}/${conn.lanes.length}`;
+        note = '服务器中转（直连未建立）';
       } else {
-        dotClass = 'dot busy';
-        note = '连接中';
+        const open = conn.lanes.filter((l) => l.dc && l.dc.readyState === 'open').length;
+        if (open === conn.lanes.length) {
+          dotClass = 'dot live';
+          note = `已直连 ×${open}`;
+        } else if (open > 0) {
+          dotClass = 'dot busy';
+          note = `连接中 ${open}/${conn.lanes.length}`;
+        } else {
+          dotClass = 'dot busy';
+          note = '连接中';
+        }
       }
     }
 
@@ -1331,7 +1537,12 @@ async function chooseLanes(conn, live) {
 async function speedP2p(peerId) {
   const { live } = await ensureChannel(peerId);
 
-  const diag = await linkDiag(live[0].pc);
+  /* 兜底通道没有 pc，取不到 ICE 候选对——直接说明当前走的是哪一层，
+   * 这正是用户想知道的："为什么没走直连"。 */
+  const diag = live[0].pc
+    ? await linkDiag(live[0].pc)
+    : { text: '服务器中转（WebSocket）：直连未建立，通常是 Chrome 的 mDNS '
+        + '候选被网络拦掉或 UDP 不通' };
   speedLog(`链路：${diag.text}`);
 
   const blob = new Blob([new Uint8Array(SPEED_BYTES)]);

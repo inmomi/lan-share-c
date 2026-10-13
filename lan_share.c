@@ -363,7 +363,10 @@ static int ls_remove_file(const char *p) {
  * 实测吞吐就卡在几 MB/s。改成 64KB 并配合下面"一次事件读完"的循环。 */
 #define IO_BUF          65536
 #define HEAD_BUF        8192
-#define WS_BUF          16384
+/* WS 缓冲同时也是单帧上限。兜底数据通道要发 32KB 的分块（1 字节 id 长度 +
+ * id + 载荷），16KB 装不下，放宽到 64KB。24 个客户端各 128KB（wbuf + frag），
+ * 静态区里按需占用，路由器上也吃得下。 */
+#define WS_BUF          65536
 #define NAME_MAX        64
 #define ID_MAX          40
 #define PATH_MAX_LOCAL  512
@@ -786,6 +789,63 @@ static void ws_send_text(ls_client *c, const char *text) {
     flen = ws_frame_build(0x1, text, tlen, frame, tlen + 16);
     if (flen) queue_mem(c, (const char *)frame, flen);
     free(frame);
+}
+
+/* 二进制帧下行（opcode 0x2）。这是"兜底数据通道"的载体：WebRTC 直连建不起来
+ * 时（典型是 Chrome 把 host 候选伪装成 mDNS .local 名字、而 Wi-Fi AP 或
+ * 有线/无线桥接把组播拦了，候选永远解析不出来），文件字节就走这里中转。
+ * 帧格式统一为 [1 字节: 对端 id 长度][id][payload]，收发双方用同一套解析。 */
+static void ws_send_binary(ls_client *c, const unsigned char *payload, size_t len,
+                           const char *peer_id) {
+    size_t idlen = peer_id ? strlen(peer_id) : 0;
+    unsigned char *frame;
+    size_t body, hlen, i;
+    if (idlen > 255) return;
+    body = 1 + idlen + len;
+    if (body > WS_BUF) return;
+    frame = (unsigned char *)malloc(body + 16);
+    if (!frame) return;
+    /* 先按 body 长度算出帧头占几个字节，再把 body 写到正确偏移上。
+     * 不能直接调 ws_frame_build(out == data)：它先写帧头再 memcpy 载荷，
+     * 同一个缓冲区上两步会互相覆盖，payload 的前几字节会被帧头吃掉。 */
+    hlen = (body < 126) ? 2 : (body < 65536 ? 4 : 10);
+    frame[0] = (unsigned char)(0x80 | 0x2);
+    if (hlen == 2) {
+        frame[1] = (unsigned char)body;
+    } else if (hlen == 4) {
+        frame[1] = 126;
+        frame[2] = (unsigned char)((body >> 8) & 0xFF);
+        frame[3] = (unsigned char)(body & 0xFF);
+    } else {
+        frame[1] = 127;
+        for (i = 0; i < 8; i++) frame[2 + i] = (unsigned char)(((uint64_t)body >> (56 - 8 * i)) & 0xFF);
+    }
+    frame[hlen] = (unsigned char)idlen;
+    if (idlen) memcpy(frame + hlen + 1, peer_id, idlen);
+    if (len) memcpy(frame + hlen + 1 + idlen, payload, len);
+    queue_mem(c, (const char *)frame, hlen + body);
+    free(frame);
+}
+
+/* 把一条二进制帧转给目标客户端。找不到就静默丢弃——对端可能刚断线，
+ * 上层有超时和重传兜着，没必要为了一个找不到的 id 关掉转发方的连接。 */
+static void forward_binary(ls_client *c, const unsigned char *payload, size_t len) {
+    char to[ID_MAX];
+    size_t idlen;
+    int i;
+    if (len < 1) return;
+    idlen = payload[0];
+    if (idlen == 0 || idlen > len - 1) return;
+    if (idlen >= sizeof to) return;
+    memcpy(to, payload + 1, idlen);
+    to[idlen] = '\0';
+    for (i = 0; i < MAX_CLIENTS; i++) {
+        if (!g_clients[i].used || g_clients[i].mode != MODE_WS) continue;
+        if (strcmp(g_clients[i].id, to) == 0) {
+            ws_send_binary(&g_clients[i], payload + 1 + idlen, len - 1 - idlen, c->id);
+            return;
+        }
+    }
 }
 
 /* ==========================================================================
@@ -1829,6 +1889,11 @@ static void ws_consume(ls_client *c) {
                 tmp[plen] = '\0';
                 handle_ws_message(c, tmp, (size_t)plen);
             }
+        } else if (opcode == 0x2) {
+            /* 兜底数据通道：把载荷按帧首的 id 转发给目标客户端。
+             * 载荷里不会再有分片语义（前端一次 send 就是一帧），所以这里不进
+             * frag 缓冲，直接转。 */
+            forward_binary(c, payload, (size_t)plen);
         } else if (opcode == 0x9) {
             unsigned char pong[16];
             size_t pl = ws_frame_build(0xA, NULL, 0, pong, sizeof pong);
@@ -1858,7 +1923,7 @@ static void client_readable(ls_client *c) {
      *     塞进 hbuf 会撑爆头缓冲、被当成畸形请求直接关连接（上传第一个分块时
      *     必现，症状是客户端 "socket hang up"）。所以一次只收"还放得下"的量，
      *     等 process_request 把模式切成 MODE_UPLOAD 之后再按 IO_BUF 尽量多收。
-     *   WS 态——wbuf 只有 WS_BUF(16KB)，同理按剩余空间收。
+     *   WS 态——wbuf 只有 WS_BUF 那么大（同时也是单帧上限），同理按剩余空间收。
      *   UPLOAD 态——数据直接写盘，没有中间缓冲，放心按 IO_BUF 收。 */
     for (rounds = 0; rounds < 64; rounds++) {
         size_t want;
@@ -2007,8 +2072,129 @@ static void usage(const char *prog) {
         prog, prog);
 }
 
+/* ==========================================================================
+ * 局域网 STUN（自反射候选）——服务端兼任，零配置
+ *
+ * 为什么需要它：Chrome 默认把 host 候选伪装成 mDNS .local 名字，对端必须靠
+ * 组播（224.0.0.251:5353）解析出真实 IP。普通家用路由器默认开 IGMP Snooping /
+ * 组播增强，无线侧经常收不到组播，候选就永远解析不出来，ICE 一条都建不起来——
+ * 表现就是"有线↔有线通，无线↔无线、有线↔无线都不通"，而且和应用层没关系。
+ *
+ * 关键点是 Chrome **不对 srflx 候选做 mDNS 伪装**：只要有一个可达的 STUN，
+ * 客户端就能拿到"自己真实内网 IP:端口"的候选，直连不依赖组播。
+ * 把 STUN 做进服务端（UDP 与 TCP 同端口号互不冲突），局域网里就永远有一个
+ * 可达的 STUN：不依赖外网（stun.l.google.com 在国内本来就不可达）、不需要
+ * 部署 coturn、纯离线也能用。
+ * ========================================================================== */
+
+#define STUN_MAGIC      0x2112A442u
+#define STUN_FP_XOR     0x5354554Eu
+
+/* STUN 指纹用的 CRC32（IEEE 802.3，反射多项式 0xEDB88320） */
+static unsigned long stun_crc32(const unsigned char *p, size_t n) {
+    unsigned long crc = 0xFFFFFFFFu;
+    size_t i;
+    int b;
+    for (i = 0; i < n; i++) {
+        crc ^= p[i];
+        for (b = 0; b < 8; b++) {
+            crc = (crc >> 1) ^ (0xEDB88320u & (unsigned long)(-(long)(crc & 1u)));
+        }
+    }
+    return crc ^ 0xFFFFFFFFu;
+}
+
+static void put16(unsigned char *p, unsigned short v) {
+    p[0] = (unsigned char)((v >> 8) & 0xFF);
+    p[1] = (unsigned char)(v & 0xFF);
+}
+
+static void put32(unsigned char *p, unsigned long v) {
+    p[0] = (unsigned char)((v >> 24) & 0xFF);
+    p[1] = (unsigned char)((v >> 16) & 0xFF);
+    p[2] = (unsigned char)((v >> 8) & 0xFF);
+    p[3] = (unsigned char)(v & 0xFF);
+}
+
+/* 只解析并应答 Binding Request（class=00, method=0x001）。
+ * 其余一律忽略——这是个单文件服务，不是通用 STUN 服务。 */
+static void stun_reply(int fd, const unsigned char *req, size_t rlen,
+                       const struct sockaddr_in *from, socklen_t alen) {
+    unsigned char out[128];
+    unsigned long cookie, type, crc;
+    unsigned long mapped_addr;
+    unsigned short mapped_port;
+    size_t pos;
+
+    if (rlen < 20) return;
+    if ((req[0] & 0xC0) != 0x00) return;         /* 前两位必须是 0 */
+    cookie = ((unsigned long)req[4] << 24) | ((unsigned long)req[5] << 16)
+           | ((unsigned long)req[6] << 8) | (unsigned long)req[7];
+    if (cookie != STUN_MAGIC) return;            /* RFC 3489 老格式，不处理 */
+    type = ((unsigned long)req[0] << 8) | (unsigned long)req[1];
+    if ((type & 0x0110u) != 0x0000u) return;     /* 只要请求 */
+    if ((type & 0x3EEFu) != 0x0001u) return;     /* 只要 Binding */
+
+    mapped_addr = (unsigned long)ntohl(from->sin_addr.s_addr);
+    mapped_port = (unsigned short)ntohs(from->sin_port);
+
+    /* 头：类型 Binding Response(0x0101) + 长度 + magic + 事务 ID 原样带回 */
+    put16(out, 0x0101);
+    put16(out + 2, 0);                            /* 长度稍后填 */
+    put32(out + 4, STUN_MAGIC);
+    memcpy(out + 8, req + 8, 12);
+    pos = 20;
+
+    /* MAPPED-ADDRESS（RFC 3489 客户端用） */
+    put16(out + pos, 0x0001);
+    put16(out + pos + 2, 8);
+    out[pos + 4] = 0;
+    out[pos + 5] = 0x01;                          /* IPv4 */
+    put16(out + pos + 6, mapped_port);
+    put32(out + pos + 8, mapped_addr);
+    pos += 12;
+
+    /* XOR-MAPPED-ADDRESS（RFC 5389，Chrome 认这个） */
+    put16(out + pos, 0x0020);
+    put16(out + pos + 2, 8);
+    out[pos + 4] = 0;
+    out[pos + 5] = 0x01;
+    put16(out + pos + 6, (unsigned short)(mapped_port ^ (unsigned short)((STUN_MAGIC >> 16) & 0xFFFF)));
+    put32(out + pos + 8, mapped_addr ^ STUN_MAGIC);
+    pos += 12;
+
+    /* FINGERPRINT：让应答完全符合 RFC 5389，省掉对端严格实现的兼容问题 */
+    put16(out + 2, (unsigned short)(pos - 20 + 8));
+    crc = stun_crc32(out, pos) ^ STUN_FP_XOR;
+    put16(out + pos, 0x8028);
+    put16(out + pos + 2, 4);
+    put32(out + pos + 4, crc);
+    pos += 8;
+    put16(out + 2, (unsigned short)(pos - 20));
+
+    sendto(fd, (const char *)out, (int)pos, 0,
+           (const struct sockaddr *)from, alen);
+}
+
+/* 一次可读事件里把队列里的 STUN 请求都答完（非阻塞 UDP） */
+static void handle_stun(int fd) {
+    unsigned char buf[2048];
+    struct sockaddr_in from;
+    socklen_t alen;
+    int n, round;
+
+    for (round = 0; round < 64; round++) {
+        alen = sizeof from;
+        memset(&from, 0, sizeof from);
+        n = (int)recvfrom(fd, (char *)buf, sizeof buf, 0, (struct sockaddr *)&from, &alen);
+        if (n <= 0) return;
+        stun_reply(fd, buf, (size_t)n, &from, alen);
+    }
+}
+
 int main(int argc, char **argv) {
     int listen_fd;
+    int stun_fd;
     struct sockaddr_in addr;
     int i;
     int one = 1;
@@ -2096,6 +2282,25 @@ int main(int argc, char **argv) {
         fprintf(stderr, "listen failed\n");
         return 1;
     }
+    /* 同一个端口号上再开一个 UDP socket 做 STUN。TCP 的 8080 和 UDP 的 8080
+     * 是两个独立的 socket，互不冲突，所以前端写 stun:<host>:<port> 就能命中，
+     * 用户不需要额外记一个端口、路由器上也不用多开一个洞。
+     * 起不来不致命——退化成"没有 STUN"，行为和以前一样，只是拿不到自反射候选。 */
+    stun_fd = (int)socket(AF_INET, SOCK_DGRAM, 0);
+    if (stun_fd >= 0) {
+        struct sockaddr_in saddr;
+        memset(&saddr, 0, sizeof saddr);
+        saddr.sin_family = AF_INET;
+        saddr.sin_addr.s_addr = htonl(INADDR_ANY);
+        saddr.sin_port = htons((unsigned short)g_port);
+        if (bind(stun_fd, (struct sockaddr *)&saddr, sizeof saddr) < 0) {
+            ls_closesock(stun_fd);
+            stun_fd = -1;
+        } else {
+            set_nonblock(stun_fd);
+        }
+    }
+
     srand((unsigned)time(NULL) ^ (unsigned)((uintptr_t)listen_fd * 2654435761u));
 
     printf("LAN Share (C) 已启动\n");
@@ -2103,7 +2308,10 @@ int main(int argc, char **argv) {
     printf("  文件库目录:  %s\n", g_upload_dir);
     printf("  前端目录:    %s\n", g_web_dir);
     printf("  浏览器打开:  http://<路由器IP>:%d\n", g_port);
-    printf("  设备间传文件走 WebRTC 直连，本程序只转发信令。\n\n");
+    printf("  设备间传文件走 WebRTC 直连，本程序只转发信令。\n");
+    printf("  局域网 STUN: %s（UDP %d，给客户端发真实内网 IP 的自反射候选，\n"
+           "                 绕开 Chrome 的 mDNS 伪装对组播的依赖）\n\n",
+           stun_fd >= 0 ? "已启用" : "未启用", g_port);
     fflush(stdout);
 
     for (;;) {
@@ -2115,6 +2323,10 @@ int main(int argc, char **argv) {
         FD_ZERO(&rfds);
         FD_ZERO(&wfds);
         FD_SET(listen_fd, &rfds);
+        if (stun_fd >= 0) {
+            FD_SET(stun_fd, &rfds);
+            if (stun_fd > maxfd) maxfd = stun_fd;
+        }
         for (i = 0; i < MAX_CLIENTS; i++) {
             if (!g_clients[i].used) continue;
             FD_SET(g_clients[i].fd, &rfds);
@@ -2131,6 +2343,7 @@ int main(int argc, char **argv) {
         }
 
         if (FD_ISSET(listen_fd, &rfds)) accept_all(listen_fd);
+        if (stun_fd >= 0 && FD_ISSET(stun_fd, &rfds)) handle_stun(stun_fd);
 
         for (i = 0; i < MAX_CLIENTS; i++) {
             if (!g_clients[i].used) continue;

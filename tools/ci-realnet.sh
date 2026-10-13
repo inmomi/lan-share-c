@@ -7,6 +7,8 @@
 # 用法（在已具有 root 的 CI step 内）：
 #   bash tools/ci-realnet.sh setup            # 两机直连（T1 happy path）
 #   bash tools/ci-realnet.sh setup isolate    # 隔离，设备间直连被丢弃（T2 需中继）
+#   bash tools/ci-realnet.sh setup noudp      # 禁两子网间 UDP（T3：只能走兜底通道）
+# 两个可叠加使用，例如 `setup isolate noudp`。
 #
 # 环境变量：
 #   COTURN=1        安装并起 coturn，并在 realnet.env 写入 LAN_SHARE_TURN
@@ -42,7 +44,11 @@ DT_PORT_B=9332
 SERVER_PORT="${SERVER_PORT:-8471}"
 COTURN="${COTURN:-0}"
 ISOLATE=0
-for a in "$@"; do [ "$a" = "isolate" ] && ISOLATE=1; done
+NOUDP=0
+for a in "$@"; do
+  [ "$a" = "isolate" ] && ISOLATE=1
+  [ "$a" = "noudp" ] && NOUDP=1
+done
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
@@ -106,6 +112,18 @@ else
   iptables -I FORWARD 1 -s "$SUBNET_A" -d "$SUBNET_B" -j ACCEPT
   iptables -I FORWARD 1 -s "$SUBNET_B" -d "$SUBNET_A" -j ACCEPT
   echo "直连已放行：$SUBNET_A <-> $SUBNET_B 经宿主机转发（绕开 Docker 的 FORWARD DROP）"
+fi
+
+# ---- noudp：禁掉两子网之间的 UDP，只留 TCP ----
+# WebRTC 的数据面是 UDP（ICE/DTLS/SCTP 全在 UDP 上），UDP 一断，直连无论
+# 有多少候选都不可能建起来。这一档专门验证"直连彻底不可用时还能不能传"：
+# 信令是 TCP（WebSocket），所以兜底通道必须仍然可用。
+# 真实世界里对应的是：禁 UDP 的企业网 /  Guest 网络 / 某些路由器的 UDP 限速
+# 与防火墙策略，以及无线侧 UDP 大面积丢包的场景。
+if [ "$NOUDP" = "1" ]; then
+  iptables -I FORWARD 1 -s "$SUBNET_A" -d "$SUBNET_B" -p udp -j DROP
+  iptables -I FORWARD 1 -s "$SUBNET_B" -d "$SUBNET_A" -p udp -j DROP
+  echo "已禁 UDP：$SUBNET_A <-> $SUBNET_B 的 UDP 全部丢弃，只留 TCP（验证兜底通道）"
 fi
 
 # ---- DevTools 代理：在每个 ns 内监听该 ns 的 IP，转发到 ns 内回环的同端口 ----
@@ -208,7 +226,10 @@ fi
   echo "SERVER_URL_B='http://$GW_B:$SERVER_PORT'"
   echo "GW_A='$GW_A'"
   echo "GW_B='$GW_B'"
+  echo "IP_A='$IP_A'"
+  echo "IP_B='$IP_B'"
   echo "ISOLATE='$ISOLATE'"
+  echo "NOUDP='$NOUDP'"
   echo "WRAP_A='ip netns exec $NS_A'"
   echo "WRAP_B='ip netns exec $NS_B'"
   echo "DEVTOOLS_A='$IP_A'"

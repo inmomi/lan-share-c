@@ -221,11 +221,18 @@ async function launchBrowser(options) {
     '--disable-extensions',
     '--disable-background-networking',
     '--disable-dev-shm-usage',
-    /* 关掉 mDNS 候选混淆，让 ICE 直接用真实内网 IP——测试里要的就是
-     * 确定能连上的 host candidate，不想再叠一层 mDNS 解析。 */
-    '--disable-features=WebRtcHideLocalIpsWithMdns',
     'about:blank',
   ];
+  /* 关掉 mDNS 候选混淆，让 ICE 直接用真实内网 IP。
+   *
+   * 但这条 flag 本身就是最大的测试盲区：用户手上的 Chrome **开着** mDNS 伪装，
+   * host 候选都是 xxx.local，必须靠组播解析；家用路由器默认开 IGMP Snooping，
+   * 无线侧收不到组播就一条候选都解析不出来——有线↔有线通、无线↔无线不通，
+   * 而带着这条 flag 的测试永远复现不出来。所以除对照用例外一律不加：
+   * mdnsBypass=false 表示"按真实浏览器的默认行为跑"。 */
+  if (opts.mdnsBypass !== false) {
+    args.splice(args.length - 1, 0, '--disable-features=WebRtcHideLocalIpsWithMdns');
+  }
   if (opts.extraArgs) args.unshift(...opts.extraArgs);
 
   /* wrap：命令前缀数组，用于把浏览器进程塞进 netns / 容器等隔离环境，

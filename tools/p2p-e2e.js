@@ -56,6 +56,18 @@ const DEVTOOLS_B = arg('devtools-host-b', '127.0.0.1');
  * 两个 ns 都按 9331 起代理，B 的 9332 没人转发，于是"DevTools 未就绪"。 */
 const DEVTOOLS_PORT_A = Number(arg('devtools-port-a', 9331));
 const DEVTOOLS_PORT_B = Number(arg('devtools-port-b', 9332));
+
+/* --no-mdns-bypass：按真实浏览器的默认行为跑（开 mDNS 候选伪装）。
+ * 默认不加这条时测试会关掉 mDNS 伪装，那等于把真机上最常见的故障机制
+ * 屏蔽掉——同一路由器同 SSID 的两台设备能看到对方却建不起直连，就是这个
+ * 机制在起作用。要复现它就必须开着 mDNS 跑。 */
+const MDNS_BYPASS = arg('no-mdns-bypass', null) !== true;
+
+/* --require-mode p2p|relay：断言最终走的是哪一层。
+ * 不能只断言"传完了"：兜底通道一加上，直连失败也能传完，T1 就会退化成
+ * "永远通过"。直连用例必须要求真的走 p2p，兜底用例必须要求真的降级了，
+ * 两边才有意义。 */
+const REQUIRE_MODE = String(arg('require-mode', 'any') || 'any');
 /* 吞吐下限（MB/s）：低于此值判失败，用于守住"中继/直连确实能用"的回归。0 表示不检查。 */
 const THROUGHPUT_FLOOR = Number(arg('throughput-floor', 0));
 
@@ -173,21 +185,26 @@ async function waitConnected(page, peerId, timeoutMs, minConnected) {
     const st = await page.evaluate(`(function(){
       const conn = state.conns.get(${JSON.stringify(peerId)});
       if (!conn) return { found: false };
-      return { found: true, lanes: conn.lanes.map(function(l){
+      return { found: true, relay: !!conn.relay, lanes: conn.lanes.map(function(l){
         return { cs: l.pc ? l.pc.connectionState : 'no-pc', ice: l.pc ? l.pc.iceConnectionState : 'no-pc' };
       }) };
     })()`);
     last = st;
+    /* 走兜底通道也算"通"：这一路的正确性由后面的真实文件传输 + 校验去卡，
+     * 而不是看有没有 WebRTC lane。直连失败本来就是被测场景之一。 */
+    if (st.found && st.relay) {
+      return { ok: true, connected: 0, total: st.lanes.length, lanes: st.lanes, mode: 'relay' };
+    }
     if (st.found && st.lanes.length) {
       /* 不把瞬时 failed 判死：app 的 retireLane 会把 failed 的 lane 换成全新
        * 的 pc（回到 new/connecting 重新建链），这种可自愈的抖动不该让闸门失败。 */
       const n = st.lanes.filter((l) => l.cs === 'connected').length;
-      if (n >= need) return { ok: true, connected: n, total: st.lanes.length, lanes: st.lanes };
+      if (n >= need) return { ok: true, connected: n, total: st.lanes.length, lanes: st.lanes, mode: 'p2p' };
     }
     if (Date.now() > deadline) {
       const lanes = st.found ? st.lanes : [];
       return {
-        ok: false, timeout: true,
+        ok: false, timeout: true, mode: 'none',
         connected: lanes.filter((l) => l.cs === 'connected').length,
         total: lanes.length, lanes,
       };
@@ -259,10 +276,12 @@ async function dumpConnDiag(page, peerId) {
     pageA = await launchBrowser({
       port: DEVTOOLS_PORT_A, wrap: WRAP_A,
       devtoolsHost: DEVTOOLS_A, devtoolsPort: DEVTOOLS_PORT_A,
+      mdnsBypass: MDNS_BYPASS,
     });
     pageB = await launchBrowser({
       port: DEVTOOLS_PORT_B, wrap: WRAP_B,
       devtoolsHost: DEVTOOLS_B, devtoolsPort: DEVTOOLS_PORT_B,
+      mdnsBypass: MDNS_BYPASS,
     });
     await pageA.navigate(urlA);
     await pageB.navigate(urlB);
@@ -322,7 +341,15 @@ async function dumpConnDiag(page, peerId) {
       log(`B 侧（发给 ${myId}）: ${JSON.stringify(await dumpConnDiag(pageB, myId))}`);
       throw new Error('WebRTC 连接未在 60s 内建立（netns 直连或中继路径不通）');
     }
-    log(`连接已建立: ${connState.connected}/${connState.total} 条 lane connected`);
+    if (connState.mode === 'relay') {
+      log('直连未建立，走兜底通道（WebSocket 中转）——本用例就是要验证这一路也能传');
+    } else {
+      log(`连接已建立: ${connState.connected}/${connState.total} 条 lane connected`);
+    }
+    if (REQUIRE_MODE !== 'any' && connState.mode !== REQUIRE_MODE) {
+      throw new Error(`本用例要求走 ${REQUIRE_MODE} 层，实际走的是 ${connState.mode} 层`);
+    }
+    log(`传输层: ${connState.mode}（要求 ${REQUIRE_MODE}）✓`);
 
     /* ---------------------------------------------------- 1. 内置测速 */
     log('\n--- 内置测速（speedP2p，与真实传输同一条 pumpFile 通路）---');

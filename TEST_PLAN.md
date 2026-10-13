@@ -52,6 +52,33 @@
   明显低于回环、高于单路，例如 LAN 模拟下 ≥ 10 MB/s）。兼顾用户"速度基本达到"
   的诉求，防止回退。
 
+### T5 — 直连彻底不可用 → WebSocket 兜底【新增，保底闸门】
+- `ci-realnet.sh setup noudp`：两子网之间只留 TCP，UDP 全丢（WebRTC 的数据面
+  是 UDP，ICE/DTLS/SCTP 全在上面，UDP 一断直连无论多少候选都不可能成）。
+- 验证：`--require-mode relay` 断言确实降级到了兜底通道，且文件仍完整传到、
+  SHA-256 一致。
+- 意义：回答"最坏情况下还能不能传"。没有这一档，前面几档全绿也可能只是
+  "恰好这条网能直连"。
+
+## 最大的盲区：测试自己关掉了 mDNS（2026-10-13 补）
+
+`tools/cdp.js` 里一直有 `--disable-features=WebRtcHideLocalIpsWithMdns`。
+Chrome 默认把 host 候选伪装成 `xxx.local` 的 mDNS 名字、靠组播解析；这条 flag
+把伪装关掉，ICE 就能直接拿到真实内网 IP——**于是测试永远复现不出真机上的
+故障**：
+
+- 真机：同路由器同 SSID 的两台设备能看到对方（信令是 TCP，通），但直连建不起来；
+- 测试：因为关了伪装，直连永远建得起来。
+
+修法两头一起：
+1. `launchBrowser` 新增 `mdnsBypass`（默认开，显式传 false 就是按真实浏览器的
+   默认行为跑）；`p2p-e2e.js` 用 `--no-mdns-bypass` 触发。T1 现在就带着它跑。
+2. 服务端自带局域网 STUN（UDP 同端口），给客户端发"自己真实内网 IP"的
+   srflx 候选。Chrome 不对 srflx 做 mDNS 伪装，所以直连不再依赖组播。
+
+配套：加了 `--require-mode p2p|relay`，断言最终走的是哪一层——否则兜底通道
+一上来，直连用例会退化成"永远通过"。
+
 ### T4 — 回归（保留现有）
 - loopback 双 Chrome 完整传输 + SHA 校验（现有 `p2p-e2e`）。
 - lossy 扫描（`tc netem` 2% / 0.5% 丢包下 lane 数与聚合随丢包上升）——保留。
@@ -74,7 +101,7 @@
 
 ## 通过标准（release gate）
 
-- T1、T2、T3 全绿，**特别是 T2（中继）必须通过**才能发版。
+- T1、T2、T3、T5 全绿，**特别是 T2（中继）和 T5（兜底）必须通过**才能发版。
 - `release` 仅在打 `v*` tag 且上述全绿时执行。
 
 ## 里程碑

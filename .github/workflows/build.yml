@@ -55,6 +55,12 @@ jobs:
           TRAVERSAL_PROBE: lan_share.c
         run: node test.js
 
+      # 兜底通道（WebSocket 中转）单测：帧格式 / 分块上限 / 背压窗口。
+      # 这些边界靠真机点文件点不出来——尤其是"单帧超过服务端 64KB 上限会被
+      # 整帧丢弃"这一条，现场只会表现为进度条卡死且没有任何报错。
+      - name: 兜底通道单测（relay-channel）
+        run: node tools/test-relay.js
+
       # 路由器上通常只有二进制一个文件，旁边没有 public/。
       # 前端必须已经编进去，否则打开页面就是 404 Not Found。
       # p2p-pump.js 也要在：app.js 顶层就解构 LSPump，缺了它整个页面直接白屏。
@@ -63,16 +69,17 @@ jobs:
           set -e
           ./lan-share -p 8097 -d ./uploads-solo -w ./no-such-dir >/dev/null 2>&1 &
           SRV=$!
-          code=000; pump=000
+          code=000; pump=000; relay=000
           for i in $(seq 1 40); do
             code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8097/ || echo 000)
             [ "$code" = "200" ] && break
             sleep 0.3
           done
           pump=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8097/p2p-pump.js || echo 000)
+          relay=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8097/relay-channel.js || echo 000)
           kill $SRV 2>/dev/null || true
-          echo "无 public 目录时 GET / -> $code, /p2p-pump.js -> $pump"
-          if [ "$code" != "200" ] || [ "$pump" != "200" ]; then
+          echo "无 public 目录时 GET / -> $code, /p2p-pump.js -> $pump, /relay-channel.js -> $relay"
+          if [ "$code" != "200" ] || [ "$pump" != "200" ] || [ "$relay" != "200" ]; then
             echo "::error::内嵌前端未生效，只拷二进制到路由器会打不开页面"
             exit 1
           fi
@@ -264,7 +271,11 @@ jobs:
       # netns 搭建 + 浏览器测试需要 root。注意：sudo 默认会把 PATH 重置为
       # secure_path，不含 setup-node 装的 node，所以用 `env PATH="$PATH"` 把当前
       # （含 node）的 PATH 透传进去；CHROME_PATH 经 sudo -E 透传。
-      - name: netns 两机直连 + 浏览器 e2e（T1，吞吐下限 8MB/s）
+      # --no-mdns-bypass：按真实浏览器的默认行为跑（开 mDNS 候选伪装）。
+      # 之前测试一直关着它，等于把真机上最常见的故障机制屏蔽掉——同一路由器
+      # 同 SSID 的两台设备能看到对方却建不起直连，就是 mDNS 解析不出来。
+      # 开着它还能直连，靠的是服务端自带的局域网 STUN 给的 srflx 真实 IP 候选。
+      - name: netns 两机直连 + 浏览器 e2e（T1，吞吐下限 8MB/s，必须走直连）
         run: |
           set -e
           sudo -E env PATH="$PATH" bash -c '
@@ -285,6 +296,7 @@ jobs:
               --chrome-wrap-a "$WRAP_A" --chrome-wrap-b "$WRAP_B" \
               --devtools-host-a "$DEVTOOLS_A" --devtools-host-b "$DEVTOOLS_B" \
               --devtools-port-a "$DEVTOOLS_PORT_A" --devtools-port-b "$DEVTOOLS_PORT_B" \
+              --no-mdns-bypass --require-mode p2p \
               --file-mb 64 --timeout 240 --label ci-lan --throughput-floor 8
             kill $SRV 2>/dev/null || true
           '
@@ -361,14 +373,84 @@ jobs:
               --chrome-wrap-a "$WRAP_A" --chrome-wrap-b "$WRAP_B" \
               --devtools-host-a "$DEVTOOLS_A" --devtools-host-b "$DEVTOOLS_B" \
               --devtools-port-a "$DEVTOOLS_PORT_A" --devtools-port-b "$DEVTOOLS_PORT_B" \
+              --require-mode p2p \
               --file-mb 64 --timeout 240 --label ci-isorel --throughput-floor 4
+            kill $SRV 2>/dev/null || true
+          '
+
+  # ---------------------------- 直连彻底不可用 → WebSocket 兜底（T3，保底闸门）
+  # 禁掉两子网之间的 UDP，同时开着 mDNS 伪装：ICE 无论有多少候选都不可能建起来。
+  # 这一档回答的是"最坏情况下还能不能传"——信令是 TCP，兜底通道走同一条链，
+  # 所以必须仍然能把文件完整传到、且字节校验一致。少了这一档，前面几档全绿
+  # 也可能只是"恰好这条网能直连"。
+  relay-fallback:
+    name: 直连不可用 → WebSocket 兜底（必须仍能传）
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: 生成内嵌前端资源
+        run: node tools/embed-web.js
+
+      - name: 编译
+        run: cc -O2 -std=c99 -Wall -o lan-share lan_share.c
+
+      - name: 安装 / 定位 Chrome
+        run: |
+          set -e
+          if ! command -v google-chrome-stable >/dev/null 2>&1; then
+            cd "$RUNNER_TEMP"
+            curl -fsSL --max-time 300 -o chrome.deb \
+              "https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb"
+            sudo apt-get install -y -qq ./chrome.deb
+          fi
+          FOUND=""
+          for c in google-chrome-stable google-chrome chromium chromium-browser; do
+            if command -v "$c" >/dev/null 2>&1; then FOUND=$(command -v "$c"); break; fi
+          done
+          if [ -z "$FOUND" ]; then echo "::error::Chrome 装上了但不在 PATH 里"; exit 1; fi
+          export CHROME_PATH="$FOUND"
+          echo "CHROME_PATH=$FOUND" >> "$GITHUB_ENV"
+          "$FOUND" --version
+
+      - name: 禁 UDP + 开 mDNS 伪装，验证兜底通道（T3，下限 2MB/s）
+        run: |
+          set -e
+          sudo -E env PATH="$PATH" bash -c '
+            set -e
+            export CHROME_PATH="$CHROME_PATH"
+            COTURN=0 bash tools/ci-realnet.sh setup noudp
+            set -a; . ./realnet.env; set +a
+            ./lan-share -p "$SERVER_PORT" -d ./uploads -w ./public >/tmp/lanshare.log 2>&1 &
+            SRV=$!
+            sleep 1
+            ip netns exec nsA curl -sf -o /dev/null --max-time 5 "http://$GW_A:$SERVER_PORT/" \
+              && echo "nsA 可达服务端 OK" || { echo "::error::nsA 不可达服务端"; kill $SRV 2>/dev/null; exit 1; }
+            ip netns exec nsB curl -sf -o /dev/null --max-time 5 "http://$GW_B:$SERVER_PORT/" \
+              && echo "nsB 可达服务端 OK" || { echo "::error::nsB 不可达服务端"; kill $SRV 2>/dev/null; exit 1; }
+            # UDP 必须真的被禁掉，否则这一档就变成普通直连用例了
+            ip netns exec nsA timeout 5 bash -c "echo > /dev/udp/$IP_B/9999" 2>/dev/null \
+              && echo "::error::UDP 没禁掉，本用例失去意义" || echo "UDP 已禁：nsA -> nsB 的 UDP 不通（符合预期）"
+            echo "---- 服务端启动日志 ----"
+            head -20 /tmp/lanshare.log 2>/dev/null || true
+            node tools/p2p-e2e.js --server-url "$SERVER_URL_A" \
+              --server-url-b "$SERVER_URL_B" \
+              --chrome-wrap-a "$WRAP_A" --chrome-wrap-b "$WRAP_B" \
+              --devtools-host-a "$DEVTOOLS_A" --devtools-host-b "$DEVTOOLS_B" \
+              --devtools-port-a "$DEVTOOLS_PORT_A" --devtools-port-b "$DEVTOOLS_PORT_B" \
+              --no-mdns-bypass --require-mode relay \
+              --file-mb 32 --timeout 300 --label ci-fallback --throughput-floor 2
             kill $SRV 2>/dev/null || true
           '
 
   # --------------------------------------------------------------- 发布
   release:
     name: 发布 Release
-    needs: [test, build, two-host-lan, isolated-relay]
+    needs: [test, build, two-host-lan, isolated-relay, relay-fallback]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     timeout-minutes: 10
