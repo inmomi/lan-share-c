@@ -198,7 +198,17 @@ function connect() {
     }
   });
 
-  ws.addEventListener('close', () => {
+  ws.addEventListener('close', (event) => {
+    /* 记下关闭原因。信令一断兜底通道就跟着废，正在跑的传输会以"连接中断"
+     * 收场——但那条报错完全不说明是谁断的。code 1006（异常断开）/ 1009
+     * （消息过大）/ 1001（对端离开）分别指向完全不同的原因，没有它只能猜。 */
+    window.__wsClose = {
+      code: event ? event.code : -1,
+      reason: event ? event.reason : '',
+      clean: event ? event.wasClean : null,
+      at: Date.now(),
+      sent: ws ? ws.bufferedAmount : -1,
+    };
     state.peers = [];
     /* 兜底通道是挂在信令 WebSocket 上的：连接一断它就废了。必须显式关掉，
      * 否则正在跑的传输会卡在 waitDrain 上（readyState 还是 open，却永远

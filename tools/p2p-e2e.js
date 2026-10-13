@@ -363,10 +363,43 @@ async function dumpConnDiag(page, peerId) {
     const runs = [];
     for (let i = 0; i < 2; i++) {
       const t0 = Date.now();
-      const sp = await pageA.evaluate(`(async () => {
-        const r = await speedP2p(${JSON.stringify(targetFromA)});
-        return JSON.parse(JSON.stringify(r));
-      })()`);
+      let sp;
+      try {
+        sp = await pageA.evaluate(`(async () => {
+          const r = await speedP2p(${JSON.stringify(targetFromA)});
+          return JSON.parse(JSON.stringify(r));
+        })()`);
+      } catch (err) {
+        /* 测速失败时把"传输层是怎么断的"挖出来一起打。只报一句"连接中断"
+         * 完全定位不了：信令 WebSocket 断了、兜底通道被换掉、还是对端先挂，
+         * 三种原因在日志里长得一模一样。 */
+        log(`  测速失败: ${err.message}`);
+        for (const [tag, pg] of [['A', pageA], ['B', pageB]]) {
+          try {
+            const d = await pg.evaluate(`(function(){
+              const conn = state.conns.get(${JSON.stringify(targetFromA)});
+              const wsState = ws ? ws.readyState : -1;
+              return JSON.stringify({
+                wsState: wsState,
+                wsBuffered: ws ? ws.bufferedAmount : -1,
+                wsClose: window.__wsClose || null,
+                relay: conn && conn.relay ? {
+                  ready: conn.relay.dc.readyState,
+                  inflight: conn.relay.dc.inflight,
+                  buffered: conn.relay.dc.bufferedAmount,
+                  ackPending: conn.relay.ackPending,
+                } : null,
+                lanes: conn ? conn.lanes.filter(function(l){
+                  return l.pc && (l.pc.connectionState === 'connected'
+                    || l.pc.connectionState === 'failed');
+                }).length : -1,
+              });
+            })()`);
+            log(`  ${tag} 侧传输层状态: ${d}`);
+          } catch (e2) { log(`  ${tag} 侧状态读取失败: ${e2.message}`); }
+        }
+        throw err;
+      }
       const spSecs = ((Date.now() - t0) / 1000).toFixed(1);
       runs.push(sp);
       log(`  [第 ${i + 1} 次${i === 0 ? '（冷连接）' : '（热连接）'}]`);
