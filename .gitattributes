@@ -1,0 +1,5 @@
+# 统一换行符。Makefile 在 CRLF 下 GNU make 会把 tab 后的 \r 当成命令的一部分而报错，
+# 所以源码与构建文件一律走 LF；Windows 批处理保留 CRLF。
+* text=auto eol=lf
+*.bat text eol=crlf
+*.cmd text eol=crlf
