@@ -450,6 +450,9 @@ jobs:
             fi
             echo "---- 服务端启动日志 ----"
             head -20 /tmp/lanshare.log 2>/dev/null || true
+            # 必须临时关掉 set -e：否则 e2e 一失败脚本立刻退出，下面这些
+            # 诊断永远打不出来，就只能靠猜。
+            set +e
             node tools/p2p-e2e.js --server-url "$SERVER_URL_A" \
               --server-url-b "$SERVER_URL_B" \
               --chrome-wrap-a "$WRAP_A" --chrome-wrap-b "$WRAP_B" \
@@ -458,6 +461,7 @@ jobs:
               --no-mdns-bypass --require-mode relay \
               --file-mb 32 --timeout 300 --label ci-fallback --throughput-floor 2
             RC=$?
+            set -e
             echo "---- e2e 退出码 $RC ----"
             echo "---- 服务端还活着吗 ----"
             if pgrep -f "lan-share -p" >/dev/null; then echo "服务端仍在运行"; else echo "服务端已退出（崩溃或被杀）"; fi
