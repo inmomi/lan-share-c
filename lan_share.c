@@ -400,9 +400,12 @@ typedef struct {
 
     unsigned char wbuf[WS_BUF];
     size_t wlen;
-    int frag_op;
+    int frag_op;          /* 正在拼接的分片消息首帧 opcode（0 = 没有） */
     unsigned char frag[WS_BUF];
     size_t fraglen;
+    /* 帧级跟踪：每条连接只打前若干帧。帧流一旦错位，光看"分片缓冲超限"
+     * 这种结果级报错是查不出来的——必须看到 op/fin/len 才知道到底收到了什么。 */
+    int trace_left;
 
     int upfd;
     uint64_t upleft;
@@ -1699,7 +1702,9 @@ static long process_request(ls_client *c, const char *req, size_t len) {
 
         c->mode = MODE_WS;
         c->wlen = 0;
+        c->frag_op = 0;
         c->fraglen = 0;
+        c->trace_left = 24;
         /* 注意：这里绝不能清 c->hlen。调用方靠 `hlen -= used` 推进读指针，
          * 清零会导致下溢成巨大 size_t，随后越界写直接段错误。
          * 101 响应占用了输出缓冲，peers 广播必须等它发完再补发，
@@ -1708,7 +1713,12 @@ static long process_request(ls_client *c, const char *req, size_t len) {
         fprintf(stderr, "[lan-share] WS 就绪 id=%s ip=%s（当前 WS 连接 %d 个）\n",
                 c->id, c->ip, count_ws_clients());
         fflush(stderr);
-        return (long)len;
+        /* 只吃掉请求头。原来返回 len（"整段都算我吃了"），如果客户端把第一帧
+         * 和握手塞在同一个 TCP 段里带过来，那部分字节会被调用方的 memmove
+         * 直接丢掉——第一帧没了，此后整个帧流错位，后面全是莫名其妙的报错。
+         * 返回 header_end 让调用方把剩余字节挪到缓冲区开头，再由 WS 通路接手
+         * （见 client_readable 里 MODE_WS 的分支）。 */
+        return (long)header_end;
     }
 
     if (strcmp(method, "GET") == 0 && strcmp(path, "/api/files") == 0) {
@@ -1898,6 +1908,24 @@ static void handle_ws_message(ls_client *c, const char *msg, size_t len) {
     }
 }
 
+/* 一条完整的 WS 消息该去哪：文本 = 信令 JSON，二进制 = 兜底通道的字节。
+ * opcode 是这条消息的**首帧** opcode（分片消息也一样），分片拼接由调用方负责，
+ * 所以到这里必须已经是一整条消息——二进制尤其重要，因为下游要靠载荷开头的
+ * [idlen][id] 前缀决定转发给谁，半条消息的载荷前缀是坏的。 */
+static void handle_ws_data_frame(ls_client *c, int opcode,
+                                 const unsigned char *payload, size_t plen) {
+    if (opcode == 0x1) {
+        /* 单线程服务，handle_ws_message 不会绕回 ws_consume，静态缓冲安全；
+         * 用它省掉 128KB 的栈占用（原来每收一条文本帧都要在栈上开一份）。 */
+        static char tmp[WS_BUF + 1];
+        memcpy(tmp, payload, plen);
+        tmp[plen] = '\0';
+        handle_ws_message(c, tmp, plen);
+    } else {
+        forward_binary(c, payload, plen);
+    }
+}
+
 static void ws_consume(ls_client *c) {
     for (;;) {
         unsigned char *b = c->wbuf;
@@ -1946,6 +1974,17 @@ static void ws_consume(ls_client *c) {
             for (i = 0; i < (size_t)plen; i++) payload[i] ^= mask[i % 4];
         }
 
+        /* 前若干帧逐帧打出来。目的很具体：确认"收到的帧流到底是什么形状"——
+         * 是不是分片的、首片和续帧各多大、有没有因为错位读出莫名其妙的 op。
+         * 只看到"分片缓冲超限"这种结果级报错，是没法反推上面这些的。 */
+        if (c->trace_left > 0) {
+            c->trace_left--;
+            fprintf(stderr, "[lan-share] 帧 %s op=0x%x fin=%d len=%llu%s\n",
+                    c->id, opcode, fin, (unsigned long long)plen,
+                    c->trace_left == 0 ? "（后续不再逐帧打印）" : "");
+            fflush(stderr);
+        }
+
         if (opcode == 0x8) {
             /* 对端说了再见：按规范回一个关闭帧再关，否则它看到的是 1006
              * （异常断开），和网络掉线长得一模一样，查起来白费功夫。 */
@@ -1959,34 +1998,46 @@ static void ws_consume(ls_client *c) {
         }
 
         if (opcode == 0x0) {
-            if (c->fraglen + (size_t)plen > WS_BUF) {
-                client_close_why(c, "分片缓冲超限");
-                return;
+            /* 续帧。只有前面确实开了一段分片消息才有意义；
+             * 没有起始帧的续帧是协议错误，丢掉就好，别为一条坏帧断链。 */
+            if (c->frag_op != 0) {
+                if ((size_t)plen >= WS_BUF - c->fraglen) {
+                    client_close_why(c, "分片缓冲超限");
+                    return;
+                }
+                memcpy(c->frag + c->fraglen, payload, (size_t)plen);
+                c->fraglen += (size_t)plen;
+                if (fin) {
+                    int op = c->frag_op;
+                    c->frag_op = 0;
+                    handle_ws_data_frame(c, op, c->frag, c->fraglen);
+                    c->fraglen = 0;
+                }
             }
-            memcpy(c->frag + c->fraglen, payload, (size_t)plen);
-            c->fraglen += (size_t)plen;
-            if (fin && c->frag_op == 0x1) {
-                c->frag[c->fraglen] = '\0';
-                handle_ws_message(c, (const char *)c->frag, c->fraglen);
+        } else if (opcode == 0x1 || opcode == 0x2) {
+            if (fin) {
+                /* 完整消息。上一段落了一半的分片消息按协议不该出现，
+                 * 丢掉半截继续——不能因为对端发错一帧就断掉整条连接。 */
+                c->frag_op = 0;
                 c->fraglen = 0;
-            }
-        } else if (opcode == 0x1) {
-            if (!fin) {
-                c->frag_op = 0x1;
-                c->fraglen = 0;
+                handle_ws_data_frame(c, opcode, payload, (size_t)plen);
+            } else {
+                /* 分片消息的第一片。
+                 *
+                 * 关键：二进制（0x2）也会分片，必须和文本一样攒起来。
+                 * 原来只认文本首帧，二进制的续帧全落进 frag 又永远等不到
+                 * frag_op==0x1 的清零条件，于是 fraglen 一路涨到 WS_BUF、
+                 * 把整条连接关掉——T5 的"分片缓冲超限"就是这么来的。
+                 * 网上那句"浏览器一次 send 就是一帧"是错的：Chrome 发大消息
+                 * 时会自己切成多片（首片带原 opcode，其余是续帧）。 */
+                if ((size_t)plen >= WS_BUF) {
+                    client_close_why(c, "分片首片就超限");
+                    return;
+                }
+                c->frag_op = opcode;
                 memcpy(c->frag, payload, (size_t)plen);
                 c->fraglen = (size_t)plen;
-            } else {
-                char tmp[WS_BUF + 1];
-                memcpy(tmp, payload, (size_t)plen);
-                tmp[plen] = '\0';
-                handle_ws_message(c, tmp, (size_t)plen);
             }
-        } else if (opcode == 0x2) {
-            /* 兜底数据通道：把载荷按帧首的 id 转发给目标客户端。
-             * 载荷里不会再有分片语义（前端一次 send 就是一帧），所以这里不进
-             * frag 缓冲，直接转。 */
-            forward_binary(c, payload, (size_t)plen);
         } else if (opcode == 0x9) {
             unsigned char pong[16];
             size_t pl = ws_frame_build(0xA, NULL, 0, pong, sizeof pong);
@@ -2079,8 +2130,24 @@ static void client_readable(ls_client *c) {
                 memmove(c->hbuf, c->hbuf + used, c->hlen - (size_t)used);
                 c->hlen -= (size_t)used;
                 c->hbuf[c->hlen] = '\0';
+                if (c->mode == MODE_WS) {
+                    /* 升级成功。请求头后面可能紧跟着帧字节（客户端把握手和
+                     * 第一帧塞进同一个 TCP 段），它们现在躺在 hbuf 里，必须
+                     * 交给 wbuf——否则第一帧被静默吞掉，之后整个帧流错位。 */
+                    if (c->hlen) {
+                        if (c->wlen + c->hlen > WS_BUF) {
+                            client_close_why(c, "WS 接收缓冲放不下");
+                            return;
+                        }
+                        memcpy(c->wbuf + c->wlen, c->hbuf, c->hlen);
+                        c->wlen += c->hlen;
+                        c->hlen = 0;
+                    }
+                    ws_consume(c);
+                    return;
+                }
                 if (c->hlen == 0) return;
-                if (c->mode != MODE_HTTP) return;
+                if (c->mode != MODE_HTTP) return;   /* MODE_UPLOAD：本体已进写盘通路 */
             }
         }
 
