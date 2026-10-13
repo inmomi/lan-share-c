@@ -117,18 +117,18 @@ EOF
   echo "coturn 已启动，TURN 配置已生成（中继地址 $GW_A:3478）"
 fi
 
-# ---- 写出 realnet.env ----
+# ---- 写出 realnet.env（值含空格的必须加引号，否则 source 时会被当成命令执行）----
 {
   echo "SERVER_PORT=$SERVER_PORT"
-  echo "SERVER_URL_A=http://$GW_A:$SERVER_PORT"
-  echo "SERVER_URL_B=http://$GW_B:$SERVER_PORT"
-  echo "WRAP_A=ip netns exec $NS_A"
-  echo "WRAP_B=ip netns exec $NS_B"
-  echo "DEVTOOLS_A=$IP_A"
-  echo "DEVTOOLS_B=$IP_B"
-  echo "DEVTOOLS_PORT=$DT_PORT"
+  echo "SERVER_URL_A='http://$GW_A:$SERVER_PORT'"
+  echo "SERVER_URL_B='http://$GW_B:$SERVER_PORT'"
+  echo "WRAP_A='ip netns exec $NS_A'"
+  echo "WRAP_B='ip netns exec $NS_B'"
+  echo "DEVTOOLS_A='$IP_A'"
+  echo "DEVTOOLS_B='$IP_B'"
+  echo "DEVTOOLS_PORT='$DT_PORT'"
   if [ -n "$TURN_JSON" ]; then
-    echo "LAN_SHARE_TURN=$TURN_JSON"
+    echo "LAN_SHARE_TURN='$TURN_JSON'"
   fi
 } > realnet.env
 
