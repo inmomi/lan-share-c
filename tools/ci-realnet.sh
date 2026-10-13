@@ -119,23 +119,42 @@ if [ "$COTURN" = "1" ]; then
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -qq
   apt-get install -y -qq coturn
+  # apt 的 postinst 可能把默认的 coturn 服务也拉起来占住 3478，导致我们自己
+  # 起的 turnserver 绑定失败（errno=98 EADDRINUSE）。起之前先停干净。
+  systemctl stop coturn 2>/dev/null || true
+  pkill -f turnserver 2>/dev/null || true
+  sleep 1
   cat > /tmp/turn.conf <<EOF
 listening-ip=0.0.0.0
 listening-port=3478
-relay-ip=0.0.0.0
+relay-ip=$GW_A
 min-port=49152
 max-port=65535
 user=lan:sharepass
 realm=lan-share.local
+lt-cred-mech
+# 只做明文 UDP/TCP 中继。不关 TLS/DTLS 的话 coturn 还会在 3478 上再绑一个
+# TLS 监听，和自己先绑好的明文监听撞成 EADDRINUSE（日志里就是一串
+# "Cannot bind TLS/TCP listener socket ... errno=98"）。
+no-tls
+no-dtls
 no-cli
 EOF
   nohup turnserver -c /tmp/turn.conf >/tmp/turn.log 2>&1 &
-  sleep 2
+  sleep 3
+  # 确认真的在听：不然后面 Chrome 的 ICE 只是静默超时，查不出是 coturn 没起
+  if command -v ss >/dev/null 2>&1; then
+    if ss -lunp 2>/dev/null | grep -q ':3478'; then echo "coturn 已监听 3478/UDP";
+    else echo "::warning::coturn 未监听 3478/UDP"; fi
+  fi
   # TURN 预检：从 nsA 里真跑一次中继分配，确认 coturn 可达且凭据可用。
   # Chrome 侧 ICE 失败是静默的（只表现为连不上），先在这里把
   # "coturn 本身有问题" 和 "WebRTC 路径有问题" 区分开。
   if command -v turnutils_uclient >/dev/null 2>&1; then
-    if ip netns exec "$NS_A" timeout 20 turnutils_uclient -u lan -w sharepass "$GW_A" \
+    # -y：用客户端本机地址当 peer 地址。不加 -e/-y 的话 uclient 直接报
+    # "Either -e peer_address or -y must be specified"，那是探针参数错，不是
+    # coturn 有问题——第一次跑就被这个假失败误导过。
+    if ip netns exec "$NS_A" timeout 20 turnutils_uclient -y -u lan -w sharepass "$GW_A" \
         >/tmp/turn-probe.log 2>&1; then
       echo "TURN 预检 OK：nsA 能向 $GW_A 成功分配中继"
     else
