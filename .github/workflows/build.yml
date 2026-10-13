@@ -346,9 +346,14 @@ jobs:
             # 页面里 window.__LAN_SHARE_TURN__ 一直是 null，靠这里定位是
             # "服务端没拿到环境变量" 还是 "拿到了但替换没命中"。必须放在 e2e
             # 之前——set -e 下 e2e 一失败就退出了，放后面永远打不出来。
-            echo "---- 服务端返回首页里的 TURN 注入片段 ----"
-            ip netns exec nsA curl -s "http://$GW_A:$SERVER_PORT/" \
-              | grep -o '__LAN_SHARE_TURN__.\{0,120\}' || echo "(首页里没找到 __LAN_SHARE_TURN__)"
+            # 注意：整个脚本被包在 bash -c '...' 里，里面绝对不能用单引号，
+            # 否则会提前闭合外层引号（第一次就是这么打歪的）。一律用双引号。
+            echo "---- 服务端返回首页：占位符是否还在 / 是否已注入 TURN ----"
+            ip netns exec nsA curl -s "http://$GW_A:$SERVER_PORT/" > /tmp/served-index.html
+            wc -c < /tmp/served-index.html
+            grep -c "TURN_CONFIG" /tmp/served-index.html || echo "(首页已无 TURN_CONFIG 占位符，说明替换过)"
+            grep -o "turn:[^\"]*" /tmp/served-index.html | head -2 || echo "(首页里没有 turn: URL)"
+            grep -o "window.__LAN_SHARE_TURN__.\{0,90\}" /tmp/served-index.html || echo "(没抓到赋值语句)"
             echo "---- 服务端启动日志 /tmp/lanshare.log ----"
             head -25 /tmp/lanshare.log 2>/dev/null || true
             node tools/p2p-e2e.js --server-url "$SERVER_URL_A" \
