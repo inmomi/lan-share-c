@@ -285,9 +285,9 @@ const peerNames = (page) => page.evaluate('state.peers.map(p => p.name)');
 
     /* 等接收端把文件存下来 */
     const saved = await pageB.waitForDownload(fileName, TIMEOUT_MS);
-    /* 真正的端到端速率要算到"文件落盘"为止：发送端的 done 只代表字节
-     * 交进了 DataChannel 队列（队列上限 16MB，能吸收好几秒的数据），
-     * 那之后的排空时间才是链路真实速率的一部分。 */
+    /* 真正的端到端速率要算到"文件落盘"为止。发送端的 done 现在代表对端
+     * 已组装落盘（收到 file-done 回执），与 waitForDownload 命中的时间点
+     * 几乎重合，所以下面的"交付速率"和"端到端"会收敛到同一个数。 */
     const e2eSecs = (Date.now() - sendStart) / 1000;
     if (!saved) {
       fail('接收端没有出现下载文件');
@@ -307,8 +307,8 @@ const peerNames = (page) => page.evaluate('state.peers.map(p => p.name)');
         fail(`文件内容不一致（第一个差异在 ${firstBad} 字节，即第 ${Math.floor(firstBad / (FILE_MB * 1024 * 1024 / 4))} 段附近）`);
       } else {
         log(`  接收端: ${(got.length / 1048576).toFixed(1)} MB 落盘，SHA-256 一致 ✓`);
-        log(`  交付速率 : ${(FILE_MB / sendSecs).toFixed(2)} MB/s（发送端字节入队到 done）`);
-        log(`  端到端   : ${(FILE_MB / e2eSecs).toFixed(2)} MB/s（入队到对端落盘，这才是真实速率）`);
+        log(`  交付速率 : ${(FILE_MB / sendSecs).toFixed(2)} MB/s（发起到对端回执 done）`);
+        log(`  端到端   : ${(FILE_MB / e2eSecs).toFixed(2)} MB/s（发起到对端落盘，这才是真实速率）`);
       }
     }
 

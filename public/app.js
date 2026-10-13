@@ -451,9 +451,11 @@ async function sendOne(peerId, file) {
     conn.lanePref = live.length;
   }
 
-  /* 全部 lane-end 都已发出，对端收齐即组装落盘——此时进度条直接拉满，
-   * 不用等最后一条 progress 回执（它可能还在链路上）。 */
-  updateTransfer(tid, { status: '已送达', sent: file.size, acked: file.size, done: true });
+  /* 全部 lane-end 都已发出，本端不再发数据。但"已送达"要等对端 file-done
+   * 回执才算数——此刻对端可能还有几十 MB 在队列里没落盘，这里把进度拉满、
+   * acked 也拉满，会让发送端显示冲到接收端前面一大截、速率飙上天（就是
+   * 用户看到的"做过山车"）。所以只标 sent，进度仍由对端回执驱动。 */
+  updateTransfer(tid, { status: '已发出，等待对端保存', sent: file.size });
 }
 
 function enqueueSend(peerId, file) {
@@ -484,8 +486,19 @@ function onChannelMessage(lane, data) {
       askReceive(lane, msg);
     } else if (msg.t === 'progress') {
       /* 对端汇报实收字节数。发送端的进度条和速率以它为准——
-       * 本端的 sent 只是"交给发送队列"的字节，会被高水位吸收而虚高。 */
-      updateTransfer(msg.tid, { acked: Number(msg.received) || 0 });
+       * 本端的 sent 只是"交给发送队列"的字节，会被高水位吸收而虚高。
+       * 对端在 16/32 条 lane 上各发各的 progress，跨 lane 没有顺序保证：
+       * 晚到的旧值会把 acked 拉回去（进度条缩水、速率算出负数再被压成 0），
+       * 显示就"做过山车"。所以 acked 只增不减。 */
+      const pr = state.transfers.get(msg.tid);
+      const received = Number(msg.received) || 0;
+      if (pr && (pr.acked == null || received >= pr.acked)) {
+        updateTransfer(msg.tid, { acked: received });
+      }
+    } else if (msg.t === 'file-done') {
+      /* 对端已组装落盘，发送端这才算真正送达——而不是本端把字节交给
+       * 发送队列就当完事（那种假完成会让发送端进度冲到接收端前面一大截）。 */
+      updateTransfer(msg.tid, { acked: Number(msg.received) || 0, status: '已送达', done: true });
     } else if (msg.t === 'file-accept' || msg.t === 'file-reject') {
       const resolve = state.pendingAccept.get(msg.tid);
       if (resolve) {
@@ -499,7 +512,7 @@ function onChannelMessage(lane, data) {
       const inc = state.incoming;
       if (inc && inc.tid === msg.tid) {
         inc.lanesDone = (inc.lanesDone || 0) + 1;
-        if (inc.lanesDone >= inc.expectedLanes) finishReceive();
+        if (inc.lanesDone >= inc.expectedLanes) finishReceive(lane);
       }
     } else if (msg.t === 'text') {
       toast(`来自 ${peerName(lane.peerId)}：${msg.text}`);
@@ -639,7 +652,7 @@ function markInterrupted(lane) {
   }
 }
 
-function finishReceive() {
+function finishReceive(lane) {
   const inc = state.incoming;
   state.incoming = null;
   if (!inc) return;
@@ -659,6 +672,14 @@ function finishReceive() {
   a.remove();
   setTimeout(() => URL.revokeObjectURL(url), 60000);
   updateTransfer(inc.tid, { status: '已保存', sent: inc.size, done: true });
+  /* 回执发送端：本机已落盘。它据此把发送端状态从"已发出"改成"已送达"，
+   * 而不是发送端自己把队列清空就当完事。通道若正好在关，对端靠 progress
+   * 到 size 也能判送达（见 updateTransfer 的收口）。 */
+  if (lane && lane.dc && lane.dc.readyState === 'open') {
+    try {
+      lane.dc.send(JSON.stringify({ t: 'file-done', tid: inc.tid, received: inc.size }));
+    } catch (_) { /* 忽略：收尾回执失败不致命 */ }
+  }
   toast(`已接收「${inc.name}」`);
 }
 
@@ -703,10 +724,21 @@ function addTransfer(info) {
 function updateTransfer(tid, patch) {
   const rec = state.transfers.get(tid);
   if (!rec) return;
+  const hadAck = rec.acked != null;
   Object.assign(rec, patch);
+
+  /* 发送端：对端实收达到文件大小才算真正送达。progress 到 size 或
+   * file-done 都会走到这，统一在这里收口，不要各写一份。 */
+  if (rec.acked != null && rec.size && rec.acked >= rec.size && !rec.done && !rec.failed) {
+    rec.done = true;
+    if (rec.status !== '已送达') rec.status = '已送达';
+  }
 
   const shown = rec.acked != null ? rec.acked : rec.sent;
   if (typeof patch.sent === 'number' || typeof patch.acked === 'number') {
+    /* 第一次收到对端回执：速率基线从"入队字节"切到"实收字节"。之前 sent
+     * 是虚高的入队速率，直接沿用会把切过去那一瞬算成负数速率。 */
+    if (rec.acked != null && !hadAck) rec.lastTs = 0;
     const now = Date.now();
     if (!rec.lastTs) {
       rec.lastTs = now;
@@ -714,7 +746,10 @@ function updateTransfer(tid, patch) {
     } else {
       const dt = (now - rec.lastTs) / 1000;
       if (dt >= 0.4) {
-        rec.speed = Math.max(0, (shown - rec.lastSent) / dt);
+        const inst = Math.max(0, (shown - rec.lastSent) / dt);
+        /* 指数平滑压掉单次 progress 跳变：实收速率本身很稳，但 progress 是
+         * 1MB 一条、又在多条 lane 上乱序到，瞬时值会跳。 */
+        rec.speed = rec.speed > 0 ? rec.speed * 0.6 + inst * 0.4 : inst;
         rec.lastTs = now;
         rec.lastSent = shown;
       }
