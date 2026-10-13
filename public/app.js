@@ -163,7 +163,7 @@ function connect() {
           sendSignal(frame.from, { ch: 0, relayAck: lane.ackPending });
           lane.ackPending = 0;
         }
-        onChannelMessage(lane, frame.payload);
+        lane.dc.deliver(frame.payload);
       }
       return;
     }
@@ -300,13 +300,19 @@ function ensureRelay(peerId) {
   const conn = getConn(peerId);
   if (conn.relay) return conn.relay;
   const dc = new LSRelay.RelayChannel(peerId, makeRelaySink(peerId));
-  conn.relay = {
+  const lane = {
     session: conn, index: 0, peerId,
     pc: null, dc, ready: Promise.resolve(dc),
     role: 'relay', relay: true, speedtest: null,
     pendingCands: [], ackPending: 0,
   };
-  return conn.relay;
+  /* 和 attachChannel 的做法保持一致：收到的数据派发成 dc 上的 'message' 事件，
+   * 再由它进 onChannelMessage。这样 waitAccept / laneSpeedtest 挂在 dc 上的
+   * 应答监听器，在兜底通道上和 DataChannel 上行为完全相同——否则对端回了
+   * speedtest-ready 也没人听见，表现就是"对端没有回应测速请求"。 */
+  dc.addEventListener('message', (e) => onChannelMessage(lane, e.data));
+  conn.relay = lane;
+  return lane;
 }
 
 /* ------------------------------------------------------- peer connections */
@@ -467,7 +473,7 @@ async function handleSignal(from, data) {
    *   relay    = 对端发来的控制消息（file-offer / accept / lane-end / progress）
    *   relayAck = 对端回的收字节确认，用来泄发送端的 inflight 窗口 */
   if (data && typeof data.relay === 'string') {
-    onChannelMessage(ensureRelay(from), data.relay);
+    ensureRelay(from).dc.deliver(data.relay);
     return;
   }
   if (data && data.relayAck) {

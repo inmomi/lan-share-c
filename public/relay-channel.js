@@ -137,6 +137,14 @@
         this._sync();
     };
 
+    /** 收到一帧/一条控制消息时调用：派发成 'message' 事件。
+     *  必须走事件而不是直接调上层函数——waitAccept / laneSpeedtest 的应答监听器
+     *  是挂在 dc.addEventListener('message') 上的，绕过事件它们就永远收不到，
+     *  表现是"对端没有回应"（实际上对端回了，只是没人听见）。 */
+    RelayChannel.prototype.deliver = function (data) {
+        this._emit('message', { data: data });
+    };
+
     RelayChannel.prototype.close = function () {
         this.readyState = 'closed';
     };
