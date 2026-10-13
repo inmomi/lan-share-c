@@ -307,6 +307,16 @@ async function dumpConnDiag(page, peerId) {
       /* 两侧都要看：A 停在 have-local-offer 说明 offer 发出去了但没等到 answer，
        * 而 B 侧 noConn 就说明 offer 根本没送到——两种原因修法完全不同。 */
       const myId = await pageA.evaluate('state.myId');
+      /* 最关键的一条：TURN 到底有没有真的进到页面里。没进去的话隔离场景下
+       * 就只剩被 DROP 的 host 候选，必然连不上，而日志上和"中继配错了"长得一样。 */
+      const iceA = await pageA.evaluate(
+        'JSON.stringify({ injected: window.__LAN_SHARE_TURN__ || null,'
+        + ' built: (typeof buildIceServers === "function") ? buildIceServers() : "no-fn" })');
+      const iceB = await pageB.evaluate(
+        'JSON.stringify({ injected: window.__LAN_SHARE_TURN__ || null,'
+        + ' built: (typeof buildIceServers === "function") ? buildIceServers() : "no-fn" })');
+      log(`A 页 ICE 配置: ${iceA}`);
+      log(`B 页 ICE 配置: ${iceB}`);
       log(`连接未建立: ${JSON.stringify(connState)}`);
       log(`A 侧（发给 ${targetFromA}）: ${JSON.stringify(await dumpConnDiag(pageA, targetFromA))}`);
       log(`B 侧（发给 ${myId}）: ${JSON.stringify(await dumpConnDiag(pageB, myId))}`);

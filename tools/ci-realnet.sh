@@ -151,19 +151,23 @@ EOF
   # Chrome 侧 ICE 失败是静默的（只表现为连不上），先在这里把
   # "coturn 本身有问题" 和 "WebRTC 路径有问题" 区分开。
   if command -v turnutils_uclient >/dev/null 2>&1; then
+    # 两个 ns 都要测：任一端分不到中继端口，这条链路就废了。
     # -y：用客户端本机地址当 peer 地址。不加 -e/-y 的话 uclient 直接报
     # "Either -e peer_address or -y must be specified"，那是探针参数错，不是
     # coturn 有问题——第一次跑就被这个假失败误导过。
-    if ip netns exec "$NS_A" timeout 20 turnutils_uclient -y -u lan -w sharepass "$GW_A" \
-        >/tmp/turn-probe.log 2>&1; then
-      echo "TURN 预检 OK：nsA 能向 $GW_A 成功分配中继"
-    else
-      echo "::warning::TURN 预检失败（nsA 分配中继失败）"
-      echo "---- /tmp/turn-probe.log ----"
-      tail -n 20 /tmp/turn-probe.log 2>/dev/null || true
-      echo "---- /tmp/turn.log ----"
-      tail -n 20 /tmp/turn.log 2>/dev/null || true
-    fi
+    for pair in "$NS_A:$IP_A" "$NS_B:$IP_B"; do
+      ns="${pair%%:*}"; ip="${pair##*:}"
+      if ip netns exec "$ns" timeout 20 turnutils_uclient -y -u lan -w sharepass "$GW_A" \
+          >"/tmp/turn-probe-$ns.log" 2>&1; then
+        echo "TURN 预检 OK：$ns($ip) 能向 $GW_A 成功分配中继"
+      else
+        echo "::warning::TURN 预检失败：$ns($ip) 分配中继失败"
+        echo "---- /tmp/turn-probe-$ns.log ----"
+        tail -n 20 "/tmp/turn-probe-$ns.log" 2>/dev/null || true
+        echo "---- /tmp/turn.log ----"
+        tail -n 20 /tmp/turn.log 2>/dev/null || true
+      fi
+    done
   else
     echo "（未找到 turnutils_uclient，跳过 TURN 预检）"
   fi
