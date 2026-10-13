@@ -51,14 +51,14 @@ function check(name, cond, extra) {
 (function testChunkCap() {
     const sink = { frames: [], bufferedAmount: 0, send(d) { this.frames.push(d); } };
     const ch = new LSRelay.RelayChannel('peer', sink);
-    /* 故意发一块 256KB——服务端 WS_BUF 是 64KB，整帧超限会被直接丢掉，
-     * 表现是进度条卡死不动而没有任何报错。这里必须被切成 ≤32KB 的小块。 */
+    /* 故意发一块 256KB——服务端 WS_BUF 是 128KB，整帧超限会被直接丢掉，
+     * 表现是进度条卡死不动而没有任何报错。这里必须被切成 ≤64KB 的小块。 */
     const big = new Uint8Array(256 * 1024);
     ch.send(big.buffer);
     const sizes = sink.frames.map((f) => f.byteLength);
     const maxFrame = Math.max.apply(null, sizes);
     check('大块被切成小帧', sink.frames.length > 1, `${sink.frames.length} 帧`);
-    check('单帧不超过 32KB+id 头', maxFrame <= LSRelay.RELAY_CHUNK + 64, `最大帧 ${maxFrame} 字节`);
+    check('单帧不超过 64KB+id 头', maxFrame <= LSRelay.RELAY_CHUNK + 64, `最大帧 ${maxFrame} 字节`);
     check('切块后字节总数不变',
         sizes.reduce((a, b) => a + b, 0) === 256 * 1024 + sink.frames.length * (1 + 4),
         `合计 ${sizes.reduce((a, b) => a + b, 0)}`);
@@ -114,7 +114,7 @@ async function testPumpOverRelay() {
         onProgress: (sent) => { last = sent; },
     });
     check('pumpFile 走兜底通道发满全程', last === SIZE, `${last}/${SIZE}`);
-    check('兜底通道单块取 32KB', pump.chunkSizeFor({ relay: true }) === 32 * 1024,
+    check('兜底通道单块取 64KB', pump.chunkSizeFor({ relay: true }) === 64 * 1024,
         String(pump.chunkSizeFor({ relay: true })));
 }
 

@@ -30,8 +30,8 @@
      * 不限的话发送端会把服务端和接收端的内存吃光。 */
     /* 接收端每收到这么多字节回一次确认 */
     var RELAY_ACK_EVERY = 512 * 1024;
-    /* 单块上限：服务端单帧上限 WS_BUF(64KB) 还要扣 1 字节 id 长度和 id 本身 */
-    var RELAY_CHUNK = 32 * 1024;
+    /* 单块上限：服务端单帧上限 WS_BUF(128KB) 还要扣 1 字节 id 长度和 id 本身 */
+    var RELAY_CHUNK = 64 * 1024;
 
     /** 二进制帧封装：[1 字节 id 长度][id][payload]，与服务端 ws_send_binary 对齐。 */
     function prefixRelayFrame(peerId, buf) {

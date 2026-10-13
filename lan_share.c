@@ -363,10 +363,10 @@ static int ls_remove_file(const char *p) {
  * 实测吞吐就卡在几 MB/s。改成 64KB 并配合下面"一次事件读完"的循环。 */
 #define IO_BUF          65536
 #define HEAD_BUF        8192
-/* WS 缓冲同时也是单帧上限。兜底数据通道要发 32KB 的分块（1 字节 id 长度 +
- * id + 载荷），16KB 装不下，放宽到 64KB。24 个客户端各 128KB（wbuf + frag），
+/* WS 缓冲同时也是单帧上限。兜底数据通道要发 64KB 的分块（1 字节 id 长度 +
+ * id + 载荷），16KB 装不下，放宽到 128KB。24 个客户端各 256KB（wbuf + frag），
  * 静态区里按需占用，路由器上也吃得下。 */
-#define WS_BUF          65536
+#define WS_BUF          131072
 #define NAME_MAX        64
 #define ID_MAX          40
 #define PATH_MAX_LOCAL  512
@@ -377,6 +377,10 @@ typedef struct {
     char *buf;
     size_t len;
     size_t sent;
+    /* 已分配的字节数。有了它才能在"还有空间"时直接追加，不必每次都把未发送
+     * 的部分挪到开头——兜底通道每秒要转发上百个 32KB 帧，每次都 memmove 一份
+     * 可能几 MB 的残留，实测把端到端吞吐压到 3MB/s。 */
+    size_t cap;
     int is_mem;
     FILE *file;
     uint64_t total;
@@ -630,15 +634,30 @@ static void queue_mem(ls_client *c, const char *data, size_t len) {
      * 表现就是前端改名后收不到 self 回执。这里改成把未发送的部分挪到开头再追加。 */
     if (c->out.has && c->out.is_mem && c->out.buf) {
         size_t rest = c->out.len - c->out.sent;
-        char *nb;
-        if (rest) memmove(c->out.buf, c->out.buf + c->out.sent, rest);
-        nb = (char *)realloc(c->out.buf, rest + len + 1);
-        if (!nb) return; /* 内存不足时保留原有内容，本次丢弃 */
-        c->out.buf = nb;
-        memcpy(c->out.buf + rest, data, len);
-        c->out.buf[rest + len] = '\0';
-        c->out.len = rest + len;
-        c->out.sent = 0;
+        size_t need = rest + len + 1;
+        /* 尾部还放得下就直接追加：这是兜底通道的正常路径（帧小、发送快、
+         * 队列通常很快就空），一帧一次 memmove(残留) 在几百帧的规模下就是
+         * 几十 GB 的内存搬移，直接决定中转吞吐。 */
+        if (c->out.cap >= need && c->out.sent > 0) {
+            if (rest) memmove(c->out.buf, c->out.buf + c->out.sent, rest);
+            c->out.sent = 0;
+            c->out.len = rest;
+        }
+        if (c->out.cap >= need) {
+            memcpy(c->out.buf + c->out.len, data, len);
+            c->out.len += len;
+            c->out.buf[c->out.len] = '\0';
+            return;
+        }
+        {
+            char *nb = (char *)realloc(c->out.buf, need < c->out.cap * 2 ? c->out.cap * 2 : need);
+            if (!nb) return; /* 内存不足时保留原有内容，本次丢弃 */
+            c->out.buf = nb;
+            c->out.cap = need < c->out.cap * 2 ? c->out.cap * 2 : need;
+        }
+        memcpy(c->out.buf + c->out.len, data, len);
+        c->out.len += len;
+        c->out.buf[c->out.len] = '\0';
         return;
     }
     out_reset(c);
@@ -647,6 +666,7 @@ static void queue_mem(ls_client *c, const char *data, size_t len) {
     memcpy(c->out.buf, data, len);
     c->out.buf[len] = '\0';
     c->out.len = len;
+    c->out.cap = len + 1;
     c->out.sent = 0;
     c->out.is_mem = 1;
     c->out.has = 1;
@@ -684,6 +704,7 @@ static void queue_response(ls_client *c, int code, const char *ctype,
     out_reset(c);
     c->out.buf = buf;
     c->out.len = total;
+    c->out.cap = total + 1;
     c->out.sent = 0;
     c->out.is_mem = 1;
     c->out.has = 1;

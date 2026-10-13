@@ -37,9 +37,9 @@
      * 稳定在 13MB/s——荡的是表，不是链路）。CI sweep 会盯住掉头。 */
     const DRAIN_LIMIT = 2 * 1024 * 1024;
     const LOW_WATER = 1024 * 1024;
-    /* 兜底通道（WebSocket 中转）的单块大小。服务端单帧上限 WS_BUF = 64KB，
-     * 帧里还要扣 1 字节 id 长度 + id，32KB 留足余量。 */
-    const RELAY_CHUNK = 32 * 1024;
+    /* 兜底通道（WebSocket 中转）的单块大小。服务端单帧上限 WS_BUF = 128KB，
+     * 帧里还要扣 1 字节 id 长度 + id，64KB 留足余量。 */
+    const RELAY_CHUNK = 64 * 1024;
     /* 一次从磁盘读多少字节，再在内存里切成 MAX_CHUNK。
      * 必须远大于 MAX_CHUNK，否则省不掉 IPC 次数；也不必太大。 */
     const READ_BLOCK = 8 * 1024 * 1024;
@@ -114,9 +114,9 @@
     /** 单条消息大小，以对端协商出来的 maxMessageSize 为准。
      *  取不到时退回 RFC 8841 的缺省 64KB，不要想当然按本端能力发大块。 */
     function chunkSizeFor(conn) {
-        /* 兜底通道（WebSocket 中转，没有 pc）按 32KB 分块：服务端单帧上限是
-         * WS_BUF(64KB)，帧里还要扣掉 1 字节 id 长度和 id 本身，按协商上限
-         * 64KB 发会整帧超限被丢掉——表现是进度条卡死不动。 */
+        /* 兜底通道（WebSocket 中转，没有 pc）按 64KB 分块：服务端单帧上限是
+         * WS_BUF(128KB)，帧里还要扣掉 1 字节 id 长度和 id 本身，按 sctp 协商
+         * 上限 256KB 发会整帧超限被丢掉——表现是进度条卡死不动。 */
         if (conn && conn.relay) return RELAY_CHUNK;
         const cap = conn && conn.pc && conn.pc.sctp ? conn.pc.sctp.maxMessageSize : 0;
         if (!cap || !Number.isFinite(cap)) return 64 * 1024;
