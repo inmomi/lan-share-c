@@ -302,6 +302,34 @@ async function dumpConnDiag(page, peerId) {
     await waitReady(pageA, 30000);
     await waitReady(pageB, 30000);
 
+    log('\n--- 共享剪贴板 UI（双页面同步）---');
+    const clipboardText = `clipboard-e2e-${LABEL}-${Date.now()}`;
+    await pageA.evaluate(`(function(){
+      document.querySelector('.tab[data-tab="clipboard"]').click();
+      document.getElementById('clipboardText').value = ${JSON.stringify(clipboardText)};
+      document.getElementById('publishClipboardText').click();
+      return true;
+    })()`);
+    let clipboardPublished = false;
+    const clipDeadline = Date.now() + 15000;
+    while (Date.now() < clipDeadline) {
+      clipboardPublished = await pageA.evaluate(
+        `document.getElementById('clipboardStatus').textContent.startsWith('更新于')`);
+      if (clipboardPublished) break;
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    }
+    if (!clipboardPublished) throw new Error('共享剪贴板发布超时');
+    await pageB.evaluate(`document.querySelector('.tab[data-tab="clipboard"]').click()`);
+    const clipboardSeen = await pageB.evaluate(`(async () => {
+      await refreshClipboard(true);
+      return document.getElementById('clipboardPreview').textContent;
+    })()`);
+    if (clipboardSeen !== clipboardText) {
+      throw new Error(`另一页面没有看到共享文字: ${JSON.stringify(clipboardSeen)}`);
+    }
+    await pageA.evaluate("fetch('/api/clipboard', { method: 'DELETE' })");
+    log('两页面共享剪贴板同步成功 ✓');
+
     const idsA = await peerIds(pageA);
     const idsB = await peerIds(pageB);
     const namesB = await peerNames(pageB);
