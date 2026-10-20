@@ -1879,6 +1879,12 @@ static void finish_clipboard(ls_client *c) {
                    "{\"error\":\"path too long\"}", sizeof("{\"error\":\"path too long\"}") - 1);
         return;
     }
+    /* 槽位是按"没有有效 meta"挑出来的，但可能残留上次中途失败（进程被杀 /
+     * 掉电）留下的数据文件——那种文件没有 meta 指向它，谁也读不到。
+     * POSIX 的 rename 会直接覆盖，Windows 的 _wrename 不会：不先清掉，
+     * 这个槽位以后每次上传都报 save failed。 */
+    ls_remove_file(data);
+    ls_remove_file(meta_path);
     memset(&meta, 0, sizeof meta);
     meta.id = slot;
     snprintf(meta.kind, sizeof meta.kind, "%s", c->clip_kind);

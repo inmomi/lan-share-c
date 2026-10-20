@@ -217,6 +217,72 @@ async function testClipboard() {
     check('共享图片二进制逐字节一致', imageGet.status === 200
         && imageGet.headers['content-type'] === 'image/png' && imageGet.body.equals(image));
 
+    /* ---------------- 历史记录（最多 32 条 / 128 MiB，超出淘汰最老） ---------------- */
+    const hist = await json('GET', '/api/clipboard');
+    const items = (hist.json && hist.json.items) || [];
+    check('剪贴板返回历史条目', items.length === 2, `items=${items.length}`);
+    check('历史按更新时间倒序',
+        items.length === 2 && items[0].updated > items[1].updated,
+        items.map((i) => i.updated).join(' > '));
+    check('最新一条与顶层字段一致',
+        items.length === 2 && items[0].id === hist.json.id && items[0].name === hist.json.name);
+    check('历史条目带 id/大小/类型',
+        items.length === 2 && items.every((i) => Number.isInteger(i.id) && i.id >= 0
+            && i.size > 0 && (i.kind === 'text' || i.kind === 'image')),
+        JSON.stringify(items));
+
+    /* 历史里"不是最新"的那条也要能按 id 取回来，否则历史只是看得见摸不着 */
+    const oldItem = items.length === 2 ? items[1] : { id: -1 };
+    const oldData = await req('GET', `/api/clipboard/data?id=${oldItem.id}`);
+    check('可按 id 取回旧的历史内容',
+        oldData.status === 200 && oldData.body.equals(text), `status=${oldData.status}`);
+
+    /* 不带 id 仍然是"最新一条"：老页面 / 老脚本不能被这次改动打断 */
+    const latestData = await req('GET', '/api/clipboard/data');
+    check('不带 id 时仍返回最新一条',
+        latestData.status === 200 && latestData.body.equals(image), `status=${latestData.status}`);
+
+    const badId = await req('GET', '/api/clipboard/data?id=999');
+    check('越界 id 返回 404', badId.status === 404, `status=${badId.status}`);
+
+    const delOne = await json('DELETE', `/api/clipboard?id=${oldItem.id}`);
+    check('按 id 删除只删一条',
+        delOne.status === 200 && delOne.json && delOne.json.removed === 1,
+        JSON.stringify(delOne.json));
+    const afterOne = await json('GET', '/api/clipboard');
+    const afterOneItems = (afterOne.json && afterOne.json.items) || [];
+    check('删除后历史只剩最新一条',
+        afterOneItems.length === 1 && afterOneItems[0].id === imageUp.json.id,
+        JSON.stringify(afterOneItems));
+
+    /* 条数上限：第 33 条必须挤掉最老的一条，而不是报错或无限增长 */
+    await json('DELETE', '/api/clipboard');
+    const HIST_TOTAL = 33;
+    let lastPost = null;
+    for (let i = 0; i < HIST_TOTAL; i++) {
+        lastPost = await json('POST', `/api/clipboard?kind=text&name=h${i}.txt`,
+            Buffer.from(`history-${i}`, 'utf8'));
+        if (lastPost.status !== 200) break;
+    }
+    check('连续写入 33 条历史都不报错',
+        !!lastPost && lastPost.status === 200, lastPost ? `status=${lastPost.status}` : 'no response');
+    const capped = await json('GET', '/api/clipboard');
+    const cappedItems = (capped.json && capped.json.items) || [];
+    check('历史条数被压在 32 条以内', cappedItems.length === 32, `items=${cappedItems.length}`);
+    check('最老的一条被淘汰掉',
+        !cappedItems.some((i) => i.name === 'h0.txt'),
+        cappedItems.map((i) => i.name).slice(-1)[0]);
+    check('最新一条仍在且排在最前',
+        !!cappedItems[0] && cappedItems[0].name === 'h32.txt',
+        cappedItems[0] ? cappedItems[0].name : 'empty');
+    /* 淘汰最老之后那一格是被复用的：必须真的装着新内容，不能只剩一份元数据 */
+    const reuseData = cappedItems[0]
+        ? await req('GET', `/api/clipboard/data?id=${cappedItems[0].id}`) : null;
+    check('被复用的槽位内容正确',
+        !!reuseData && reuseData.status === 200
+        && reuseData.body.equals(Buffer.from('history-32', 'utf8')),
+        reuseData ? `status=${reuseData.status}` : 'no item');
+
     const invalid = await json('POST', '/api/clipboard?kind=image&mime=image%2Fsvg%2Bxml', image, {
         'Content-Type': 'image/svg+xml',
     });

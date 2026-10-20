@@ -64,6 +64,21 @@ jobs:
       - name: 兜底通道单测（relay-channel）
         run: node tools/test-relay.js
 
+      # 剪贴板历史的空间淘汰：这一条必须在"真的写不下"的文件系统上跑，
+      # 普通磁盘跑一整轮也走不到 ENOSPC 那个分支。挂 1 MiB 的 tmpfs，
+      # 反复写入 320 KiB 的条目，正确行为是淘汰最老的一条继续服务，
+      # 而不是把上传打成 500（也顺手确认被复用的槽位内容没被截断）。
+      - name: 剪贴板历史淘汰（tmpfs 逼出 ENOSPC）
+        run: |
+          set -e
+          MOUNT=/mnt/clipsmall
+          sudo mkdir -p "$MOUNT"
+          sudo mount -t tmpfs -o size=1M tmpfs "$MOUNT"
+          trap 'sudo umount "$MOUNT" || true' EXIT
+          sudo chown "$(id -u):$(id -g)" "$MOUNT"
+          node tools/test-clipboard-evict.js --bin ./lan-share --dir "$MOUNT" \
+            --port 8123 --item-bytes 327680 --items 10
+
       # 路由器上通常只有二进制一个文件，旁边没有 public/。
       # 前端必须已经编进去，否则打开页面就是 404 Not Found。
       # p2p-pump.js 也要在：app.js 顶层就解构 LSPump，缺了它整个页面直接白屏。
