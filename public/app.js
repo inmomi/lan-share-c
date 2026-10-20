@@ -894,9 +894,11 @@ async function askReceive(lane, msg) {
       .filter((l) => l.dc && l.dc.readyState === 'open')
       .map((l) => l.index);
   console.log('[lan-share] 接收端活 lane:', myLive.length, '对端要约:', (msg.lanes || []).length);
-  const myLiveSet = new Set(myLive);
+  const sharedLive = Array.isArray(msg.lanes) && msg.lanes.length
+    ? myLive.filter((i) => msg.lanes.includes(i))
+    : myLive;
   const useCount = Array.isArray(msg.lanes) && msg.lanes.length
-    ? msg.lanes.filter((i) => myLiveSet.has(i)).length
+    ? sharedLive.length
     : LANES;
   if (useCount <= 0) {
     lane.dc.send(JSON.stringify({ t: 'file-reject', tid: msg.tid }));
@@ -916,7 +918,7 @@ async function askReceive(lane, msg) {
     /* 这次传输实际在用的通道。判"中断"时必须拿它过滤——直连建不起来时文件走
      * 兜底通道，而同期那 32 条 WebRTC lane 还在陆续 ICE 失败被判死刑，它们的
      * 死活跟这次传输毫无关系（详见 markInterrupted）。 */
-    lanes: new Set(lane.relay ? [lane] : myLive.map((i) => lane.session.lanes[i])),
+    lanes: new Set(lane.relay ? [lane] : sharedLive.map((i) => lane.session.lanes[i])),
     expectedLanes: splitRange(already, msg.size, useCount).length,
     received: already,
     /* progress 回执的节流状态：每 1MB 或 500ms 报一次实收字节数 */

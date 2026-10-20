@@ -1350,7 +1350,10 @@ static void serve_static(ls_client *c, const char *rel) {
 }
 
 /* range 是 Range 请求头的值（可能为 NULL 或空串）。
- * 只支持 bytes=start[-end]；多段区间（逗号分隔）直接忽略走全量。 */
+ * 支持单段 bytes=start[-end] 与 bytes=-suffix；多段区间忽略并走全量。 */
+static int parse_byte_range(const char *range, uint64_t size,
+                            uint64_t *start, uint64_t *end);
+
 static void api_download(ls_client *c, const char *name, const char *range) {
     char safe[NAME_MAX * 4];
     char path[PATH_MAX_LOCAL];
@@ -1379,17 +1382,7 @@ static void api_download(ls_client *c, const char *name, const char *range) {
     sz = file_size(path);
 
     if (range && range[0] != '\0') {
-        unsigned long long a = 0;
-        unsigned long long b = 0;
-        if (sscanf(range, "bytes=%llu-%llu", &a, &b) == 2) {
-            start = (uint64_t)a;
-            end = (uint64_t)b;
-            has_range = 1;
-        } else if (sscanf(range, "bytes=%llu-", &a) == 1) {
-            start = (uint64_t)a;
-            end = sz - 1;
-            has_range = 1;
-        }
+        has_range = parse_byte_range(range, sz, &start, &end);
     }
     if (has_range) {
         if (end > sz - 1) end = sz - 1;
@@ -1516,6 +1509,56 @@ static int extract_query_value(const char *query, const char *key, char *out, si
         p++;
     }
     return 0;
+}
+
+/* 解析单段 bytes Range。返回 1 表示语法有效，0 表示忽略不支持/畸形值。 */
+static int parse_byte_range(const char *range, uint64_t size,
+                            uint64_t *start, uint64_t *end) {
+    const char *p;
+    uint64_t first = 0, second = 0;
+    int have_first = 0, have_second = 0;
+
+    if (strncmp(range, "bytes=", 6) != 0) return 0;
+    p = range + 6;
+    if (*p == '-') {
+        p++;
+        if (*p < '0' || *p > '9') return 0;
+        while (*p >= '0' && *p <= '9') {
+            unsigned digit = (unsigned)(*p++ - '0');
+            if (second > (UINT64_MAX - digit) / 10) return 0;
+            second = second * 10 + digit;
+        }
+        if (*p != '\0') return 0;
+        if (size == 0 || second == 0) {
+            *start = size;
+            *end = size ? size - 1 : 0;
+        } else {
+            *start = second >= size ? 0 : size - second;
+            *end = size - 1;
+        }
+        return 1;
+    }
+
+    while (*p >= '0' && *p <= '9') {
+        unsigned digit = (unsigned)(*p++ - '0');
+        if (first > (UINT64_MAX - digit) / 10) return 0;
+        first = first * 10 + digit;
+        have_first = 1;
+    }
+    if (!have_first || *p++ != '-') return 0;
+    if (*p != '\0') {
+        while (*p >= '0' && *p <= '9') {
+            unsigned digit = (unsigned)(*p++ - '0');
+            if (second > (UINT64_MAX - digit) / 10) return 0;
+            second = second * 10 + digit;
+            have_second = 1;
+        }
+        if (!have_second || *p != '\0') return 0;
+    }
+
+    *start = first;
+    *end = have_second ? second : (size ? size - 1 : 0);
+    return 1;
 }
 
 static const char *find_header(const char *req, size_t len, const char *key) {

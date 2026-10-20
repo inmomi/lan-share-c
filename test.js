@@ -55,6 +55,19 @@ function normalizeSpawn(cmd) {
     return parts.join(' ');
 }
 
+function stopChild(child) {
+    if (!child) return;
+    if (process.platform === 'win32') {
+        spawn('taskkill', ['/F', '/T', '/PID', String(child.pid)], { stdio: 'ignore' });
+        return;
+    }
+    try {
+        process.kill(-child.pid, 'SIGTERM');
+    } catch (_) {
+        child.kill('SIGTERM');
+    }
+}
+
 /* SPAWN 模式下等待服务端口就绪，最多等 20 秒 */
 async function waitReady(host, port, timeoutMs) {
     const deadline = Date.now() + timeoutMs;
@@ -590,6 +603,17 @@ async function testRange() {
     check('闭区间 Range 长度为 10', r2.body.length === 10, `${r2.body.length}`);
     check('闭区间 Range 内容一致', r2.body.equals(data.subarray(10, 20)));
 
+    const suffix = await req('GET', '/api/download?name=' + name, null, { Range: 'bytes=-3' });
+    check('suffix Range 返回最后 3 字节',
+        suffix.status === 206 && suffix.body.equals(data.subarray(total - 3)),
+        `status=${suffix.status} ${suffix.headers['content-range']}`);
+
+    const malformed = await req('GET', '/api/download?name=' + name, null,
+        { Range: 'bytes=3-junk' });
+    check('畸形 Range 被忽略并返回完整文件',
+        malformed.status === 200 && malformed.body.equals(data),
+        `status=${malformed.status}`);
+
     const r3 = await req('GET', '/api/download?name=' + name, null, { Range: `bytes=${total}-` });
     check('越界 Range 返回 416', r3.status === 416, `status=${r3.status}`);
 
@@ -1007,6 +1031,7 @@ async function testNameMemory() {
          * 统一走 shell 是为了让 SPAWN 支持 "./lan-share -p 8080 -d ./uploads" 这种带参数的写法。 */
         child = spawn(cmd, [], {
             shell: true,
+            detached: process.platform !== 'win32',
             stdio: ['ignore', 'pipe', 'pipe'],
         });
         child.stdout.on('data', (d) => process.stdout.write(`[srv] ${d}`));
@@ -1014,7 +1039,7 @@ async function testNameMemory() {
         const ready = await waitReady(base.hostname, Number(base.port || 80), 20000);
         if (!ready) {
             console.log(`FAIL  服务未能在 20 秒内就绪: ${cmd}`);
-            child.kill();
+            stopChild(child);
             process.exit(1);
         }
     }
@@ -1041,7 +1066,7 @@ async function testNameMemory() {
     }
 
     if (child) {
-        child.kill();
+        stopChild(child);
         await sleep(200);
     }
     console.log(`\n===== 通过 ${passed} / 失败 ${failed} =====`);
