@@ -36,6 +36,7 @@ const state = {
   transfers: new Map(),
   targetPeer: null,
   clipboardUpdated: null,
+  clipboardSelectedId: null,
   modalResolve: null,
   modalAccept: null,
   /* 接收方未完成的半成品，按 fileId 存。通道断了不清空，
@@ -1466,24 +1467,52 @@ async function publishClipboard(kind, mime, name, blob) {
   }
 }
 
-async function refreshClipboard(force) {
+function renderClipboardHistory(items, selectedId) {
+  const list = $('clipboardHistory');
+  list.replaceChildren();
+  $('clipboardHistoryCount').textContent = `${items.length} 条`;
+  if (!items.length) {
+    const empty = document.createElement('li');
+    empty.className = 'clipboard-history-empty';
+    empty.textContent = '暂无历史记录';
+    list.appendChild(empty);
+    return;
+  }
+  for (const item of items) {
+    const row = document.createElement('li');
+    row.className = 'clipboard-history-item';
+    if (Number(item.id) === Number(selectedId)) row.classList.add('selected');
+    const select = document.createElement('button');
+    select.type = 'button';
+    select.className = 'clipboard-history-select';
+    select.textContent = `${item.kind === 'image' ? '图片' : '文字'} · ${item.name}`
+      + ` · ${humanSize(item.size)} · ${new Date(item.updated).toLocaleString()}`;
+    select.addEventListener('click', () => showClipboardItem(item, items));
+    const remove = document.createElement('button');
+    remove.type = 'button';
+    remove.className = 'clipboard-history-delete';
+    remove.textContent = '删除';
+    remove.addEventListener('click', async () => {
+      const res = await fetch(`/api/clipboard?id=${item.id}`, { method: 'DELETE' });
+      if (!res.ok) {
+        toast('删除历史记录失败');
+        return;
+      }
+      state.clipboardUpdated = null;
+      await refreshClipboard(true);
+    });
+    row.append(select, remove);
+    list.appendChild(row);
+  }
+}
+
+async function showClipboardItem(meta, items) {
   const status = $('clipboardStatus');
   try {
-    const res = await fetch('/api/clipboard', { cache: 'no-store' });
-    if (res.status === 404) {
-      state.clipboardUpdated = null;
-      $('clipboardPreview').replaceChildren();
-      $('copyClipboardText').classList.add('hidden');
-      $('downloadClipboardImage').classList.add('hidden');
-      status.textContent = '剪贴板为空';
-      return;
-    }
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const meta = await res.json();
-    if (!force && meta.updated === state.clipboardUpdated) return;
-    state.clipboardUpdated = meta.updated;
-    const data = await fetch(`/api/clipboard/data?v=${meta.updated}`, { cache: 'no-store' });
+    const data = await fetch(`/api/clipboard/data?id=${meta.id}&v=${meta.updated}`, { cache: 'no-store' });
     if (!data.ok) throw new Error(`HTTP ${data.status}`);
+    state.clipboardSelectedId = Number(meta.id);
+    renderClipboardHistory(items || [], state.clipboardSelectedId);
     $('clipboardPreview').replaceChildren();
     $('copyClipboardText').classList.add('hidden');
     $('downloadClipboardImage').classList.add('hidden');
@@ -1517,7 +1546,7 @@ async function refreshClipboard(force) {
     } else if (meta.kind === 'image') {
       const image = document.createElement('img');
       image.className = 'clipboard-image-preview';
-      image.src = `/api/clipboard/data?v=${meta.updated}`;
+      image.src = `/api/clipboard/data?id=${meta.id}&v=${meta.updated}`;
       image.alt = meta.name;
       $('clipboardPreview').appendChild(image);
       const link = $('downloadClipboardImage');
@@ -1526,6 +1555,34 @@ async function refreshClipboard(force) {
       link.classList.remove('hidden');
     }
     status.textContent = `更新于 ${new Date(meta.updated).toLocaleTimeString()}`;
+  } catch (_) {
+    status.textContent = '无法读取历史记录';
+  }
+}
+
+async function refreshClipboard(force) {
+  const status = $('clipboardStatus');
+  try {
+    const res = await fetch('/api/clipboard', { cache: 'no-store' });
+    if (res.status === 404) {
+      state.clipboardUpdated = null;
+      state.clipboardSelectedId = null;
+      renderClipboardHistory([], null);
+      $('clipboardPreview').replaceChildren();
+      $('copyClipboardText').classList.add('hidden');
+      $('downloadClipboardImage').classList.add('hidden');
+      status.textContent = '剪贴板为空';
+      return;
+    }
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const meta = await res.json();
+    const items = Array.isArray(meta.items) ? meta.items : [meta];
+    renderClipboardHistory(items, state.clipboardSelectedId || meta.id);
+    if (!force && meta.updated === state.clipboardUpdated) return;
+    state.clipboardUpdated = meta.updated;
+    const selected = items.find((item) => Number(item.id) === Number(state.clipboardSelectedId))
+      || items[0];
+    await showClipboardItem(selected, items);
   } catch (_) {
     status.textContent = '无法连接服务端';
   }

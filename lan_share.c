@@ -28,6 +28,8 @@
 #include <string.h>
 #include <ctype.h>
 #include <stdint.h>
+#include <limits.h>
+#include <errno.h>
 #include <stdarg.h>
 #include <time.h>
 #include <fcntl.h>
@@ -421,6 +423,7 @@ typedef struct {
     uint64_t up_base;            /* 本次请求之前的已收字节（offset） */
     uint64_t up_reqlen;          /* 本次请求体的字节数 */
     char up_final[NAME_MAX * 4]; /* 收满后要落成的文件名 */
+    int clip_id;
     char clip_kind[8];
     char clip_mime[80];
     char clip_name[NAME_MAX * 4];
@@ -1084,8 +1087,11 @@ static void parts_dir_path(char *out, size_t outsz) {
 }
 
 #define CLIPBOARD_MAX (16u * 1024u * 1024u)
+#define CLIPBOARD_HISTORY_ITEMS 32
+#define CLIPBOARD_HISTORY_BYTES (128ULL * 1024ULL * 1024ULL)
 
 typedef struct {
+    int id;
     char kind[8];
     char mime[80];
     char name[NAME_MAX * 4];
@@ -1113,6 +1119,17 @@ static unsigned long long clipboard_next_updated(void) {
     return now;
 }
 
+static void clipboard_slot_leaf(int id, const char *suffix, char *out, size_t outsz) {
+    snprintf(out, outsz, "item-%02d.%s", id, suffix);
+}
+
+static int clipboard_slot_path(int id, const char *suffix, char *out, size_t outsz) {
+    char leaf[32];
+    if (id < 0 || id >= CLIPBOARD_HISTORY_ITEMS) return -1;
+    clipboard_slot_leaf(id, suffix, leaf, sizeof leaf);
+    return clipboard_file_path(leaf, out, outsz);
+}
+
 static int clipboard_mime_allowed(const char *kind, const char *mime) {
     if (strcmp(kind, "text") == 0) return strcmp(mime, "text/plain") == 0;
     if (strcmp(kind, "image") != 0) return 0;
@@ -1125,11 +1142,9 @@ static void trim_line(char *s) {
     while (n > 0 && (s[n - 1] == '\r' || s[n - 1] == '\n')) s[--n] = '\0';
 }
 
-static int read_clipboard_meta(ls_clipboard_meta *meta) {
-    char path[PATH_MAX_LOCAL];
+static int read_clipboard_meta_path(const char *path, ls_clipboard_meta *meta) {
     char line[32];
     FILE *f;
-    if (clipboard_file_path("meta", path, sizeof path) != 0) return 0;
     f = ls_fopen_rb(path);
     if (!f) return 0;
     memset(meta, 0, sizeof *meta);
@@ -1153,26 +1168,130 @@ static int read_clipboard_meta(ls_clipboard_meta *meta) {
     return clipboard_mime_allowed(meta->kind, meta->mime) && meta->name[0] != '\0';
 }
 
+static int read_clipboard_slot(int id, ls_clipboard_meta *meta) {
+    char leaf[32], path[PATH_MAX_LOCAL];
+    if (id < 0 || id >= CLIPBOARD_HISTORY_ITEMS) return 0;
+    clipboard_slot_leaf(id, "meta", leaf, sizeof leaf);
+    if (clipboard_file_path(leaf, path, sizeof path) != 0 ||
+        !read_clipboard_meta_path(path, meta)) return 0;
+    meta->id = id;
+    return 1;
+}
+
+static int read_clipboard_meta(ls_clipboard_meta *meta) {
+    ls_clipboard_meta candidate;
+    int i, found = 0;
+    memset(meta, 0, sizeof *meta);
+    for (i = 0; i < CLIPBOARD_HISTORY_ITEMS; i++) {
+        if (read_clipboard_slot(i, &candidate) &&
+            (!found || candidate.updated > meta->updated)) {
+            *meta = candidate;
+            found = 1;
+        }
+    }
+    return found;
+}
+
+static int clipboard_evict_oldest(void) {
+    ls_clipboard_meta candidate;
+    int i, oldest = -1;
+    unsigned long long oldest_updated = ULLONG_MAX;
+    char path[PATH_MAX_LOCAL];
+
+    for (i = 0; i < CLIPBOARD_HISTORY_ITEMS; i++) {
+        if (read_clipboard_slot(i, &candidate) && candidate.updated < oldest_updated) {
+            oldest = i;
+            oldest_updated = candidate.updated;
+        }
+    }
+    if (oldest < 0) return 0;
+    if (clipboard_slot_path(oldest, "data", path, sizeof path) == 0) ls_remove_file(path);
+    if (clipboard_slot_path(oldest, "meta", path, sizeof path) == 0) ls_remove_file(path);
+    return 1;
+}
+
+static int clipboard_make_room(uint64_t incoming, int *slot) {
+    ls_clipboard_meta meta;
+    unsigned count;
+    uint64_t total;
+    int i;
+    for (;;) {
+        count = 0;
+        total = 0;
+        for (i = 0; i < CLIPBOARD_HISTORY_ITEMS; i++) {
+            if (read_clipboard_slot(i, &meta)) {
+                count++;
+                total += meta.size;
+            }
+        }
+        if (count < CLIPBOARD_HISTORY_ITEMS && total + incoming <= CLIPBOARD_HISTORY_BYTES) {
+            for (i = 0; i < CLIPBOARD_HISTORY_ITEMS; i++) {
+                if (!read_clipboard_slot(i, &meta)) {
+                    *slot = i;
+                    return 1;
+                }
+            }
+        }
+        if (!clipboard_evict_oldest()) return 0;
+    }
+}
+
+static long clipboard_write_retry(int fd, const void *data, size_t len) {
+    const char *p = (const char *)data;
+    size_t off = 0;
+    while (off < len) {
+        long n = ls_write(fd, p + off, len - off);
+        if (n > 0) {
+            off += (size_t)n;
+        } else if (errno == ENOSPC && clipboard_evict_oldest()) {
+            continue;
+        } else {
+            return -1;
+        }
+    }
+    return (long)off;
+}
+
 static int write_clipboard_meta(const ls_clipboard_meta *meta, const char *path) {
     char body[768];
     int len = snprintf(body, sizeof body, "%s\n%s\n%s\n%llu\n%llu\n",
         meta->kind, meta->mime, meta->name,
         (unsigned long long)meta->size, meta->updated);
     int fd;
-    size_t off = 0;
     if (len <= 0 || (size_t)len >= sizeof body) return -1;
     fd = ls_openwrite_at(path, 0, 0);
     if (fd < 0) return -1;
-    while (off < (size_t)len) {
-        long n = ls_write(fd, body + off, (size_t)len - off);
-        if (n <= 0) {
-            ls_closefile(fd);
-            return -1;
-        }
-        off += (size_t)n;
+    if (clipboard_write_retry(fd, body, (size_t)len) != len) {
+        ls_closefile(fd);
+        return -1;
     }
     ls_closefile(fd);
     return 0;
+}
+
+static void clipboard_migrate_legacy(void) {
+    ls_clipboard_meta meta;
+    char legacy_data[PATH_MAX_LOCAL], legacy_meta[PATH_MAX_LOCAL];
+    char new_data[PATH_MAX_LOCAL], new_meta[PATH_MAX_LOCAL], temp_meta[PATH_MAX_LOCAL];
+    int slot;
+
+    if (clipboard_file_path("meta", legacy_meta, sizeof legacy_meta) != 0 ||
+        clipboard_file_path("data", legacy_data, sizeof legacy_data) != 0 ||
+        !read_clipboard_meta_path(legacy_meta, &meta) || !file_exists(legacy_data)) return;
+    if (!clipboard_make_room(meta.size, &slot)) return;
+    if (clipboard_slot_path(slot, "data", new_data, sizeof new_data) != 0 ||
+        clipboard_slot_path(slot, "meta", new_meta, sizeof new_meta) != 0 ||
+        clipboard_slot_path(slot, "meta.tmp", temp_meta, sizeof temp_meta) != 0) return;
+
+    meta.id = slot;
+    if (write_clipboard_meta(&meta, temp_meta) != 0) return;
+    if (ls_rename_file(legacy_data, new_data) != 0 ||
+        ls_rename_file(temp_meta, new_meta) != 0) {
+        ls_remove_file(temp_meta);
+        return;
+    }
+    ls_remove_file(legacy_meta);
+    if (meta.updated > g_clipboard_updated) g_clipboard_updated = meta.updated;
 }
 
 static void ensure_clipboard_dir(void) {
@@ -1183,6 +1302,7 @@ static void ensure_clipboard_dir(void) {
 #else
     mkdir(dir, 0755);
 #endif
+    clipboard_migrate_legacy();
 }
 
 /* 半成品文件名取 name|size 的 SHA-1 十六进制。
@@ -1589,33 +1709,71 @@ static void api_delete(ls_client *c, const char *name) {
 }
 
 static void api_clipboard_meta(ls_client *c) {
-    ls_clipboard_meta meta;
+    ls_clipboard_meta items[CLIPBOARD_HISTORY_ITEMS];
+    ls_clipboard_meta latest;
+    char *body;
     char esc[NAME_MAX * 8];
-    char body[768];
-    int n;
-    if (!read_clipboard_meta(&meta)) {
+    size_t cap = 32768, len = 0;
+    int count = 0, i, j;
+
+    for (i = 0; i < CLIPBOARD_HISTORY_ITEMS; i++) {
+        if (read_clipboard_slot(i, &items[count])) count++;
+    }
+    if (count == 0) {
         queue_response(c, 404, "application/json; charset=utf-8",
                        "{\"error\":\"empty\"}", sizeof("{\"error\":\"empty\"}") - 1);
         return;
     }
-    json_escape(meta.name, esc, sizeof esc);
-    n = snprintf(body, sizeof body,
-        "{\"kind\":\"%s\",\"mime\":\"%s\",\"name\":\"%s\",\"size\":%llu,\"updated\":%llu}",
-        meta.kind, meta.mime, esc, (unsigned long long)meta.size, meta.updated);
-    if (n > 0) queue_response(c, 200, "application/json; charset=utf-8", body, (size_t)n);
+    for (i = 0; i < count; i++) {
+        for (j = i + 1; j < count; j++) {
+            if (items[j].updated > items[i].updated) {
+                ls_clipboard_meta tmp = items[i];
+                items[i] = items[j];
+                items[j] = tmp;
+            }
+        }
+    }
+    latest = items[0];
+    body = (char *)malloc(cap);
+    if (!body) {
+        queue_response(c, 500, "application/json; charset=utf-8", "{\"error\":\"out of memory\"}",
+                       sizeof("{\"error\":\"out of memory\"}") - 1);
+        return;
+    }
+    json_escape(latest.name, esc, sizeof esc);
+    len = body_append(body, len, cap,
+        "{\"kind\":\"%s\",\"mime\":\"%s\",\"name\":\"%s\",\"size\":%llu,\"updated\":%llu,\"id\":%d,\"items\":[",
+        latest.kind, latest.mime, esc, (unsigned long long)latest.size,
+        latest.updated, latest.id);
+    for (i = 0; i < count; i++) {
+        json_escape(items[i].name, esc, sizeof esc);
+        len = body_append(body, len, cap,
+            "%s{\"id\":%d,\"kind\":\"%s\",\"mime\":\"%s\",\"name\":\"%s\",\"size\":%llu,\"updated\":%llu}",
+            i ? "," : "", items[i].id, items[i].kind, items[i].mime, esc,
+            (unsigned long long)items[i].size, items[i].updated);
+    }
+    len = body_append(body, len, cap, "]}");
+    queue_response(c, 200, "application/json; charset=utf-8", body, len);
+    free(body);
 }
 
-static void api_clipboard_data(ls_client *c) {
+static void api_clipboard_data(ls_client *c, int id) {
     ls_clipboard_meta meta;
     char path[PATH_MAX_LOCAL];
+    char leaf[32];
     char head[512];
     FILE *f;
     int n;
-    if (!read_clipboard_meta(&meta)) {
+    if (id < 0) {
+        if (!read_clipboard_meta(&meta)) id = -1;
+        else id = meta.id;
+    }
+    if (id < 0 || !read_clipboard_slot(id, &meta)) {
         queue_response(c, 404, "text/plain; charset=utf-8", "Not Found", 9);
         return;
     }
-    if (clipboard_file_path("data", path, sizeof path) != 0) {
+    clipboard_slot_leaf(id, "data", leaf, sizeof leaf);
+    if (clipboard_file_path(leaf, path, sizeof path) != 0) {
         queue_response(c, 500, "text/plain; charset=utf-8", "Path Too Long", sizeof("Path Too Long") - 1);
         return;
     }
@@ -1643,27 +1801,43 @@ static void api_clipboard_data(ls_client *c) {
     c->out.has = 1;
 }
 
-static void api_clipboard_delete(ls_client *c) {
+static void api_clipboard_delete(ls_client *c, int id) {
     ls_clipboard_meta current;
-    char data[PATH_MAX_LOCAL];
-    char meta[PATH_MAX_LOCAL];
-    if (!read_clipboard_meta(&current)) {
-        queue_response(c, 404, "application/json; charset=utf-8",
-                       "{\"error\":\"empty\"}", sizeof("{\"error\":\"empty\"}") - 1);
-        return;
+    char data[PATH_MAX_LOCAL], meta[PATH_MAX_LOCAL];
+    char body[96];
+    int i, removed = 0;
+    if (id >= 0) {
+        if (!read_clipboard_slot(id, &current)) {
+            queue_response(c, 404, "application/json; charset=utf-8",
+                           "{\"error\":\"not found\"}", sizeof("{\"error\":\"not found\"}") - 1);
+            return;
+        }
+        if (clipboard_slot_path(id, "data", data, sizeof data) != 0 ||
+            clipboard_slot_path(id, "meta", meta, sizeof meta) != 0) {
+            queue_response(c, 500, "application/json; charset=utf-8",
+                           "{\"error\":\"path too long\"}", sizeof("{\"error\":\"path too long\"}") - 1);
+            return;
+        }
+        if (ls_remove_file(data) != 0 || ls_remove_file(meta) != 0) {
+            queue_response(c, 500, "application/json; charset=utf-8",
+                           "{\"error\":\"delete failed\"}", sizeof("{\"error\":\"delete failed\"}") - 1);
+            return;
+        }
+        removed = 1;
+    } else {
+        for (i = 0; i < CLIPBOARD_HISTORY_ITEMS; i++) {
+            if (!read_clipboard_slot(i, &current)) continue;
+            if (clipboard_slot_path(i, "data", data, sizeof data) == 0) ls_remove_file(data);
+            if (clipboard_slot_path(i, "meta", meta, sizeof meta) == 0) ls_remove_file(meta);
+            removed++;
+        }
+        clipboard_file_path("data", data, sizeof data);
+        clipboard_file_path("meta", meta, sizeof meta);
+        ls_remove_file(data);
+        ls_remove_file(meta);
     }
-    if (clipboard_file_path("data", data, sizeof data) != 0 ||
-        clipboard_file_path("meta", meta, sizeof meta) != 0) {
-        queue_response(c, 500, "application/json; charset=utf-8",
-                   "{\"error\":\"path too long\"}", sizeof("{\"error\":\"path too long\"}") - 1);
-        return;
-    }
-    if (ls_remove_file(data) != 0 || ls_remove_file(meta) != 0) {
-        queue_response(c, 500, "application/json; charset=utf-8",
-                   "{\"error\":\"delete failed\"}", sizeof("{\"error\":\"delete failed\"}") - 1);
-        return;
-    }
-    queue_response(c, 200, "application/json; charset=utf-8", "{\"ok\":true}", sizeof("{\"ok\":true}") - 1);
+    snprintf(body, sizeof body, "{\"ok\":true,\"removed\":%d}", removed);
+    queue_response(c, 200, "application/json; charset=utf-8", body, strlen(body));
 }
 
 static void finish_clipboard(ls_client *c) {
@@ -1672,6 +1846,7 @@ static void finish_clipboard(ls_client *c) {
     char meta_path[PATH_MAX_LOCAL];
     char meta_tmp[PATH_MAX_LOCAL];
     char response[256];
+    int slot;
     int n;
 
     if (c->upfd >= 0) {
@@ -1687,9 +1862,17 @@ static void finish_clipboard(ls_client *c) {
         return;
     }
 
-    if (clipboard_file_path("data", data, sizeof data) != 0 ||
-        clipboard_file_path("meta", meta_path, sizeof meta_path) != 0 ||
-        clipboard_file_path("meta.tmp", meta_tmp, sizeof meta_tmp) != 0) {
+    if (!clipboard_make_room(c->up_reqlen, &slot)) {
+        ls_remove_file(c->upname);
+        c->upname[0] = '\0';
+        queue_response(c, 507, "application/json; charset=utf-8",
+                       "{\"error\":\"clipboard history full\"}",
+                       sizeof("{\"error\":\"clipboard history full\"}") - 1);
+        return;
+    }
+    if (clipboard_slot_path(slot, "data", data, sizeof data) != 0 ||
+        clipboard_slot_path(slot, "meta", meta_path, sizeof meta_path) != 0 ||
+        clipboard_slot_path(slot, "meta.tmp", meta_tmp, sizeof meta_tmp) != 0) {
         ls_remove_file(c->upname);
         c->upname[0] = '\0';
         queue_response(c, 500, "application/json; charset=utf-8",
@@ -1697,6 +1880,7 @@ static void finish_clipboard(ls_client *c) {
         return;
     }
     memset(&meta, 0, sizeof meta);
+    meta.id = slot;
     snprintf(meta.kind, sizeof meta.kind, "%s", c->clip_kind);
     snprintf(meta.mime, sizeof meta.mime, "%s", c->clip_mime);
     snprintf(meta.name, sizeof meta.name, "%s", c->clip_name);
@@ -1710,9 +1894,8 @@ static void finish_clipboard(ls_client *c) {
                    "{\"error\":\"metadata write failed\"}", sizeof("{\"error\":\"metadata write failed\"}") - 1);
         return;
     }
-    ls_remove_file(data);
-    ls_remove_file(meta_path);
     if (ls_rename_file(c->upname, data) != 0 || ls_rename_file(meta_tmp, meta_path) != 0) {
+        ls_remove_file(data);
         ls_remove_file(c->upname);
         ls_remove_file(meta_tmp);
         c->upname[0] = '\0';
@@ -1722,8 +1905,8 @@ static void finish_clipboard(ls_client *c) {
     }
     c->upname[0] = '\0';
     n = snprintf(response, sizeof response,
-        "{\"ok\":true,\"kind\":\"%s\",\"size\":%llu}",
-        meta.kind, (unsigned long long)meta.size);
+        "{\"ok\":true,\"id\":%d,\"kind\":\"%s\",\"size\":%llu}",
+        meta.id, meta.kind, (unsigned long long)meta.size);
     if (n > 0) queue_response(c, 200, "application/json; charset=utf-8", response, (size_t)n);
 }
 
@@ -2015,11 +2198,17 @@ static long process_request(ls_client *c, const char *req, size_t len) {
         return (long)len;
     }
     if (strcmp(method, "GET") == 0 && strcmp(path, "/api/clipboard/data") == 0) {
-        api_clipboard_data(c);
+        char idstr[16];
+        idstr[0] = '\0';
+        extract_query_value(query, "id", idstr, sizeof idstr);
+        api_clipboard_data(c, idstr[0] ? atoi(idstr) : -1);
         return (long)len;
     }
     if (strcmp(method, "DELETE") == 0 && strcmp(path, "/api/clipboard") == 0) {
-        api_clipboard_delete(c);
+        char idstr[16];
+        idstr[0] = '\0';
+        extract_query_value(query, "id", idstr, sizeof idstr);
+        api_clipboard_delete(c, idstr[0] ? atoi(idstr) : -1);
         return (long)len;
     }
     if (strcmp(method, "POST") == 0 && strcmp(path, "/api/clipboard") == 0) {
@@ -2065,7 +2254,7 @@ static long process_request(ls_client *c, const char *req, size_t len) {
             return (long)len;
         }
         if ((uint64_t)bodylen > content_len) bodylen = (size_t)content_len;
-        if (bodylen && ls_write(fd, req + header_end, bodylen) != (long)bodylen) {
+        if (bodylen && clipboard_write_retry(fd, req + header_end, bodylen) != (long)bodylen) {
             ls_closefile(fd);
             ls_remove_file(temp);
             queue_response(c, 500, "application/json; charset=utf-8",
@@ -2460,7 +2649,7 @@ static void client_readable(ls_client *c) {
             int clipboard = (c->mode == MODE_CLIPBOARD);
             size_t w = (size_t)n;
             if ((uint64_t)w > c->upleft) w = (size_t)c->upleft;
-            if (ls_write(c->upfd, buf, w) != (long)w) {
+            if ((clipboard ? clipboard_write_retry(c->upfd, buf, w) : ls_write(c->upfd, buf, w)) != (long)w) {
                 client_close_why(c, clipboard ? "剪贴板写盘失败" : "上传写盘失败");
                 return;
             }
