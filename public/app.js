@@ -37,6 +37,8 @@ const state = {
   targetPeer: null,
   clipboardUpdated: null,
   clipboardSelectedId: null,
+  /* 剪贴板预览的渲染序号：并发的两次刷新只有最后一次能落 DOM */
+  clipboardRenderSeq: 0,
   modalResolve: null,
   modalAccept: null,
   /* 接收方未完成的半成品，按 fileId 存。通道断了不清空，
@@ -1508,16 +1510,24 @@ function renderClipboardHistory(items, selectedId) {
 
 async function showClipboardItem(meta, items) {
   const status = $('clipboardStatus');
+  /* 每次渲染领一个序号，等 await 回来时只有"最后一次"有权动 DOM。
+   * 切换标签页会 refreshClipboard(true)，2 秒轮询又会自己来一发，两次
+   * 渲染同时在飞是常态；没有这个守卫，两边各 append 一个 <pre>，
+   * 预览区就会出现两份内容（netns T1 的浏览器 e2e 就是这么红的）。 */
+  const seq = ++state.clipboardRenderSeq;
   try {
     const data = await fetch(`/api/clipboard/data?id=${meta.id}&v=${meta.updated}`, { cache: 'no-store' });
     if (!data.ok) throw new Error(`HTTP ${data.status}`);
+    /* 正文也先读干净，再一次性改 DOM：replaceChildren 与 appendChild 之间
+     * 不能再夹 await，否则旧的那次渲染会把新的一次清掉又补一份。 */
+    const text = meta.kind === 'text' ? await data.text() : null;
+    if (seq !== state.clipboardRenderSeq) return;
     state.clipboardSelectedId = Number(meta.id);
     renderClipboardHistory(items || [], state.clipboardSelectedId);
     $('clipboardPreview').replaceChildren();
     $('copyClipboardText').classList.add('hidden');
     $('downloadClipboardImage').classList.add('hidden');
     if (meta.kind === 'text') {
-      const text = await data.text();
       const pre = document.createElement('pre');
       pre.className = 'clipboard-text-preview';
       pre.textContent = text;
