@@ -25,6 +25,7 @@
 
 <nav class="tabs">
   <button class="tab active" data-tab="p2p">设备直传</button>
+  <button class="tab" data-tab="clipboard">共享剪贴板</button>
   <button class="tab" data-tab="vault">服务端文件库</button>
   <button class="tab" data-tab="speed">网速测试</button>
 </nav>
@@ -34,6 +35,39 @@
     <p class="hint">点击设备卡片选择文件，或把文件直接拖到卡片上。这条路径走浏览器点对点通道，文件内容不经过服务端。</p>
     <div id="peerGrid" class="peer-grid"></div>
     <div id="transferList" class="transfer-list"></div>
+  </section>
+
+  <section id="pane-clipboard" class="pane">
+    <p class="hint">所有在线设备共享同一份服务端剪贴板。发布文字或图片后，其他设备会自动看到最新内容。</p>
+    <div class="clipboard-layout">
+      <section class="clipboard-compose">
+        <label for="clipboardText">发布文字</label>
+        <textarea id="clipboardText" rows="7" placeholder="输入要共享的文字"></textarea>
+        <div class="clip-actions">
+          <button id="publishClipboardText" class="btn primary">发布文字</button>
+          <button id="clearClipboard" class="btn">清空共享内容</button>
+        </div>
+        <div id="clipboardImageDrop" class="clipboard-image-drop" tabindex="0">
+          <span>粘贴、拖入图片，或</span>
+          <button id="pickClipboardImage" class="btn">选择图片</button>
+          <small>PNG、JPEG、GIF、WebP，最大 16 MiB</small>
+        </div>
+      </section>
+      <section class="clipboard-current">
+        <div class="clipboard-current-head">
+          <strong>当前共享内容</strong>
+          <span id="clipboardStatus">正在读取</span>
+        </div>
+        <div id="clipboardPreview" class="clipboard-preview"></div>
+        <button id="copyClipboardText" class="btn hidden">复制文字</button>
+        <a id="downloadClipboardImage" class="btn hidden" download>下载图片</a>
+        <div class="clipboard-history-head">
+          <strong>历史记录</strong>
+          <span id="clipboardHistoryCount">0 条</span>
+        </div>
+        <ul id="clipboardHistory" class="clipboard-history"></ul>
+      </section>
+    </div>
   </section>
 
   <section id="pane-vault" class="pane">
@@ -77,6 +111,7 @@
 
 <input id="peerPicker" type="file" multiple hidden>
 <input id="vaultPicker" type="file" multiple hidden>
+<input id="clipboardImagePicker" type="file" accept="image/png,image/jpeg,image/gif,image/webp" hidden>
 
 <div id="toasts" class="toasts"></div>
 

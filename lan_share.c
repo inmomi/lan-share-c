@@ -28,6 +28,8 @@
 #include <string.h>
 #include <ctype.h>
 #include <stdint.h>
+#include <limits.h>
+#include <errno.h>
 #include <stdarg.h>
 #include <time.h>
 #include <fcntl.h>
@@ -371,7 +373,7 @@ static int ls_remove_file(const char *p) {
 #define ID_MAX          40
 #define PATH_MAX_LOCAL  512
 
-enum { MODE_HTTP = 0, MODE_WS = 1, MODE_UPLOAD = 2 };
+enum { MODE_HTTP = 0, MODE_WS = 1, MODE_UPLOAD = 2, MODE_CLIPBOARD = 3 };
 
 typedef struct {
     char *buf;
@@ -421,6 +423,10 @@ typedef struct {
     uint64_t up_base;            /* 本次请求之前的已收字节（offset） */
     uint64_t up_reqlen;          /* 本次请求体的字节数 */
     char up_final[NAME_MAX * 4]; /* 收满后要落成的文件名 */
+    int clip_id;
+    char clip_kind[8];
+    char clip_mime[80];
+    char clip_name[NAME_MAX * 4];
 
     char pend[IO_BUF];
     size_t pendlen;
@@ -703,8 +709,11 @@ static void queue_response(ls_client *c, int code, const char *ctype,
     size_t total;
 
     if (code == 200) reason = "OK";
+    else if (code == 400) reason = "Bad Request";
+    else if (code == 409) reason = "Conflict";
     else if (code == 404) reason = "Not Found";
     else if (code == 405) reason = "Method Not Allowed";
+    else if (code == 413) reason = "Payload Too Large";
     else reason = "Error";
 
     hl = snprintf(head, sizeof head,
@@ -896,12 +905,6 @@ static void forward_binary(ls_client *c, const unsigned char *payload, size_t le
     memcpy(to, payload + 1, idlen);
     to[idlen] = '\0';
     c->relay_in += len;
-    /* 每 8MB 打一行进度。只报"连接中断"是没用的，得知道断之前双方各走了多远。 */
-    if (c->relay_in / (8u << 20) != (c->relay_in - len) / (8u << 20)) {
-        fprintf(stderr, "[lan-share] 中转进度 %s→%s：已转发 %llu MB\n",
-                c->id, to, (unsigned long long)(c->relay_in / (1u << 20)));
-        fflush(stderr);
-    }
     for (i = 0; i < MAX_CLIENTS; i++) {
         if (!g_clients[i].used || g_clients[i].mode != MODE_WS) continue;
         if (strcmp(g_clients[i].id, to) == 0) {
@@ -992,6 +995,7 @@ static void client_close_why(ls_client *c, const char *why) {
         ls_closefile(c->upfd);
         c->upfd = -1;
     }
+    if (c->mode == MODE_CLIPBOARD && c->upname[0]) ls_remove_file(c->upname);
     out_reset(c);
     if (c->fd >= 0) ls_closesock(c->fd);
     memset(c, 0, sizeof *c);
@@ -1080,6 +1084,225 @@ static uint64_t file_size(const char *path) {
  * 这样文件列表里不会冒出没传完的东西。 */
 static void parts_dir_path(char *out, size_t outsz) {
     snprintf(out, outsz, "%s/.lanshare-parts", g_upload_dir);
+}
+
+#define CLIPBOARD_MAX (16u * 1024u * 1024u)
+#define CLIPBOARD_HISTORY_ITEMS 32
+#define CLIPBOARD_HISTORY_BYTES (128ULL * 1024ULL * 1024ULL)
+
+typedef struct {
+    int id;
+    char kind[8];
+    char mime[80];
+    char name[NAME_MAX * 4];
+    uint64_t size;
+    unsigned long long updated;
+} ls_clipboard_meta;
+
+static unsigned long long g_clipboard_updated;
+
+static int clipboard_dir_path(char *out, size_t outsz) {
+    int n = snprintf(out, outsz, "%s/.lanshare-clipboard", g_upload_dir);
+    return n > 0 && (size_t)n < outsz ? 0 : -1;
+}
+
+static int clipboard_file_path(const char *leaf, char *out, size_t outsz) {
+    char dir[PATH_MAX_LOCAL];
+    if (clipboard_dir_path(dir, sizeof dir) != 0) return -1;
+    return path_join(dir, leaf, out, outsz);
+}
+
+static unsigned long long clipboard_next_updated(void) {
+    unsigned long long now = (unsigned long long)time(NULL) * 1000ULL;
+    if (now <= g_clipboard_updated) now = g_clipboard_updated + 1;
+    g_clipboard_updated = now;
+    return now;
+}
+
+static void clipboard_slot_leaf(int id, const char *suffix, char *out, size_t outsz) {
+    snprintf(out, outsz, "item-%02d.%s", id, suffix);
+}
+
+static int clipboard_slot_path(int id, const char *suffix, char *out, size_t outsz) {
+    char leaf[32];
+    if (id < 0 || id >= CLIPBOARD_HISTORY_ITEMS) return -1;
+    clipboard_slot_leaf(id, suffix, leaf, sizeof leaf);
+    return clipboard_file_path(leaf, out, outsz);
+}
+
+static int clipboard_mime_allowed(const char *kind, const char *mime) {
+    if (strcmp(kind, "text") == 0) return strcmp(mime, "text/plain") == 0;
+    if (strcmp(kind, "image") != 0) return 0;
+    return strcmp(mime, "image/png") == 0 || strcmp(mime, "image/jpeg") == 0 ||
+           strcmp(mime, "image/gif") == 0 || strcmp(mime, "image/webp") == 0;
+}
+
+static void trim_line(char *s) {
+    size_t n = strlen(s);
+    while (n > 0 && (s[n - 1] == '\r' || s[n - 1] == '\n')) s[--n] = '\0';
+}
+
+static int read_clipboard_meta_path(const char *path, ls_clipboard_meta *meta) {
+    char line[32];
+    FILE *f;
+    f = ls_fopen_rb(path);
+    if (!f) return 0;
+    memset(meta, 0, sizeof *meta);
+    if (!fgets(meta->kind, sizeof meta->kind, f) ||
+        !fgets(meta->mime, sizeof meta->mime, f) ||
+        !fgets(meta->name, sizeof meta->name, f) ||
+        !fgets(line, sizeof line, f)) {
+        fclose(f);
+        return 0;
+    }
+    trim_line(meta->kind);
+    trim_line(meta->mime);
+    trim_line(meta->name);
+    meta->size = (uint64_t)strtoull(line, NULL, 10);
+    if (!fgets(line, sizeof line, f)) {
+        fclose(f);
+        return 0;
+    }
+    meta->updated = strtoull(line, NULL, 10);
+    fclose(f);
+    return clipboard_mime_allowed(meta->kind, meta->mime) && meta->name[0] != '\0';
+}
+
+static int read_clipboard_slot(int id, ls_clipboard_meta *meta) {
+    char leaf[32], path[PATH_MAX_LOCAL];
+    if (id < 0 || id >= CLIPBOARD_HISTORY_ITEMS) return 0;
+    clipboard_slot_leaf(id, "meta", leaf, sizeof leaf);
+    if (clipboard_file_path(leaf, path, sizeof path) != 0 ||
+        !read_clipboard_meta_path(path, meta)) return 0;
+    meta->id = id;
+    return 1;
+}
+
+static int read_clipboard_meta(ls_clipboard_meta *meta) {
+    ls_clipboard_meta candidate;
+    int i, found = 0;
+    memset(meta, 0, sizeof *meta);
+    for (i = 0; i < CLIPBOARD_HISTORY_ITEMS; i++) {
+        if (read_clipboard_slot(i, &candidate) &&
+            (!found || candidate.updated > meta->updated)) {
+            *meta = candidate;
+            found = 1;
+        }
+    }
+    return found;
+}
+
+static int clipboard_evict_oldest(void) {
+    ls_clipboard_meta candidate;
+    int i, oldest = -1;
+    unsigned long long oldest_updated = ULLONG_MAX;
+    char path[PATH_MAX_LOCAL];
+
+    for (i = 0; i < CLIPBOARD_HISTORY_ITEMS; i++) {
+        if (read_clipboard_slot(i, &candidate) && candidate.updated < oldest_updated) {
+            oldest = i;
+            oldest_updated = candidate.updated;
+        }
+    }
+    if (oldest < 0) return 0;
+    if (clipboard_slot_path(oldest, "data", path, sizeof path) == 0) ls_remove_file(path);
+    if (clipboard_slot_path(oldest, "meta", path, sizeof path) == 0) ls_remove_file(path);
+    return 1;
+}
+
+static int clipboard_make_room(uint64_t incoming, int *slot) {
+    ls_clipboard_meta meta;
+    unsigned count;
+    uint64_t total;
+    int i;
+    for (;;) {
+        count = 0;
+        total = 0;
+        for (i = 0; i < CLIPBOARD_HISTORY_ITEMS; i++) {
+            if (read_clipboard_slot(i, &meta)) {
+                count++;
+                total += meta.size;
+            }
+        }
+        if (count < CLIPBOARD_HISTORY_ITEMS && total + incoming <= CLIPBOARD_HISTORY_BYTES) {
+            for (i = 0; i < CLIPBOARD_HISTORY_ITEMS; i++) {
+                if (!read_clipboard_slot(i, &meta)) {
+                    *slot = i;
+                    return 1;
+                }
+            }
+        }
+        if (!clipboard_evict_oldest()) return 0;
+    }
+}
+
+static long clipboard_write_retry(int fd, const void *data, size_t len) {
+    const char *p = (const char *)data;
+    size_t off = 0;
+    while (off < len) {
+        long n = ls_write(fd, p + off, len - off);
+        if (n > 0) {
+            off += (size_t)n;
+        } else if (errno == ENOSPC && clipboard_evict_oldest()) {
+            continue;
+        } else {
+            return -1;
+        }
+    }
+    return (long)off;
+}
+
+static int write_clipboard_meta(const ls_clipboard_meta *meta, const char *path) {
+    char body[768];
+    int len = snprintf(body, sizeof body, "%s\n%s\n%s\n%llu\n%llu\n",
+        meta->kind, meta->mime, meta->name,
+        (unsigned long long)meta->size, meta->updated);
+    int fd;
+    if (len <= 0 || (size_t)len >= sizeof body) return -1;
+    fd = ls_openwrite_at(path, 0, 0);
+    if (fd < 0) return -1;
+    if (clipboard_write_retry(fd, body, (size_t)len) != len) {
+        ls_closefile(fd);
+        return -1;
+    }
+    ls_closefile(fd);
+    return 0;
+}
+
+static void clipboard_migrate_legacy(void) {
+    ls_clipboard_meta meta;
+    char legacy_data[PATH_MAX_LOCAL], legacy_meta[PATH_MAX_LOCAL];
+    char new_data[PATH_MAX_LOCAL], new_meta[PATH_MAX_LOCAL], temp_meta[PATH_MAX_LOCAL];
+    int slot;
+
+    if (clipboard_file_path("meta", legacy_meta, sizeof legacy_meta) != 0 ||
+        clipboard_file_path("data", legacy_data, sizeof legacy_data) != 0 ||
+        !read_clipboard_meta_path(legacy_meta, &meta) || !file_exists(legacy_data)) return;
+    if (!clipboard_make_room(meta.size, &slot)) return;
+    if (clipboard_slot_path(slot, "data", new_data, sizeof new_data) != 0 ||
+        clipboard_slot_path(slot, "meta", new_meta, sizeof new_meta) != 0 ||
+        clipboard_slot_path(slot, "meta.tmp", temp_meta, sizeof temp_meta) != 0) return;
+
+    meta.id = slot;
+    if (write_clipboard_meta(&meta, temp_meta) != 0) return;
+    if (ls_rename_file(legacy_data, new_data) != 0 ||
+        ls_rename_file(temp_meta, new_meta) != 0) {
+        ls_remove_file(temp_meta);
+        return;
+    }
+    ls_remove_file(legacy_meta);
+    if (meta.updated > g_clipboard_updated) g_clipboard_updated = meta.updated;
+}
+
+static void ensure_clipboard_dir(void) {
+    char dir[PATH_MAX_LOCAL];
+    if (clipboard_dir_path(dir, sizeof dir) != 0) return;
+#ifdef _WIN32
+    _mkdir(dir);
+#else
+    mkdir(dir, 0755);
+#endif
+    clipboard_migrate_legacy();
 }
 
 /* 半成品文件名取 name|size 的 SHA-1 十六进制。
@@ -1350,7 +1573,10 @@ static void serve_static(ls_client *c, const char *rel) {
 }
 
 /* range 是 Range 请求头的值（可能为 NULL 或空串）。
- * 只支持 bytes=start[-end]；多段区间（逗号分隔）直接忽略走全量。 */
+ * 支持单段 bytes=start[-end] 与 bytes=-suffix；多段区间忽略并走全量。 */
+static int parse_byte_range(const char *range, uint64_t size,
+                            uint64_t *start, uint64_t *end);
+
 static void api_download(ls_client *c, const char *name, const char *range) {
     char safe[NAME_MAX * 4];
     char path[PATH_MAX_LOCAL];
@@ -1379,17 +1605,7 @@ static void api_download(ls_client *c, const char *name, const char *range) {
     sz = file_size(path);
 
     if (range && range[0] != '\0') {
-        unsigned long long a = 0;
-        unsigned long long b = 0;
-        if (sscanf(range, "bytes=%llu-%llu", &a, &b) == 2) {
-            start = (uint64_t)a;
-            end = (uint64_t)b;
-            has_range = 1;
-        } else if (sscanf(range, "bytes=%llu-", &a) == 1) {
-            start = (uint64_t)a;
-            end = sz - 1;
-            has_range = 1;
-        }
+        has_range = parse_byte_range(range, sz, &start, &end);
     }
     if (has_range) {
         if (end > sz - 1) end = sz - 1;
@@ -1492,6 +1708,214 @@ static void api_delete(ls_client *c, const char *name) {
     queue_response(c, 200, "application/json; charset=utf-8", body, strlen(body));
 }
 
+static void api_clipboard_meta(ls_client *c) {
+    ls_clipboard_meta items[CLIPBOARD_HISTORY_ITEMS];
+    ls_clipboard_meta latest;
+    char *body;
+    char esc[NAME_MAX * 8];
+    size_t cap = 32768, len = 0;
+    int count = 0, i, j;
+
+    for (i = 0; i < CLIPBOARD_HISTORY_ITEMS; i++) {
+        if (read_clipboard_slot(i, &items[count])) count++;
+    }
+    if (count == 0) {
+        queue_response(c, 404, "application/json; charset=utf-8",
+                       "{\"error\":\"empty\"}", sizeof("{\"error\":\"empty\"}") - 1);
+        return;
+    }
+    for (i = 0; i < count; i++) {
+        for (j = i + 1; j < count; j++) {
+            if (items[j].updated > items[i].updated) {
+                ls_clipboard_meta tmp = items[i];
+                items[i] = items[j];
+                items[j] = tmp;
+            }
+        }
+    }
+    latest = items[0];
+    body = (char *)malloc(cap);
+    if (!body) {
+        queue_response(c, 500, "application/json; charset=utf-8", "{\"error\":\"out of memory\"}",
+                       sizeof("{\"error\":\"out of memory\"}") - 1);
+        return;
+    }
+    json_escape(latest.name, esc, sizeof esc);
+    len = body_append(body, len, cap,
+        "{\"kind\":\"%s\",\"mime\":\"%s\",\"name\":\"%s\",\"size\":%llu,\"updated\":%llu,\"id\":%d,\"items\":[",
+        latest.kind, latest.mime, esc, (unsigned long long)latest.size,
+        latest.updated, latest.id);
+    for (i = 0; i < count; i++) {
+        json_escape(items[i].name, esc, sizeof esc);
+        len = body_append(body, len, cap,
+            "%s{\"id\":%d,\"kind\":\"%s\",\"mime\":\"%s\",\"name\":\"%s\",\"size\":%llu,\"updated\":%llu}",
+            i ? "," : "", items[i].id, items[i].kind, items[i].mime, esc,
+            (unsigned long long)items[i].size, items[i].updated);
+    }
+    len = body_append(body, len, cap, "]}");
+    queue_response(c, 200, "application/json; charset=utf-8", body, len);
+    free(body);
+}
+
+static void api_clipboard_data(ls_client *c, int id) {
+    ls_clipboard_meta meta;
+    char path[PATH_MAX_LOCAL];
+    char leaf[32];
+    char head[512];
+    FILE *f;
+    int n;
+    if (id < 0) {
+        if (!read_clipboard_meta(&meta)) id = -1;
+        else id = meta.id;
+    }
+    if (id < 0 || !read_clipboard_slot(id, &meta)) {
+        queue_response(c, 404, "text/plain; charset=utf-8", "Not Found", 9);
+        return;
+    }
+    clipboard_slot_leaf(id, "data", leaf, sizeof leaf);
+    if (clipboard_file_path(leaf, path, sizeof path) != 0) {
+        queue_response(c, 500, "text/plain; charset=utf-8", "Path Too Long", sizeof("Path Too Long") - 1);
+        return;
+    }
+    f = ls_fopen_rb(path);
+    if (!f) {
+        queue_response(c, 404, "text/plain; charset=utf-8", "Not Found", 9);
+        return;
+    }
+    n = snprintf(head, sizeof head,
+        "HTTP/1.1 200 OK\r\nContent-Type: %s%s\r\nContent-Length: %llu\r\n"
+        "Cache-Control: no-store\r\nConnection: keep-alive\r\n\r\n",
+        meta.mime, strcmp(meta.kind, "text") == 0 ? "; charset=utf-8" : "",
+        (unsigned long long)meta.size);
+    if (n <= 0 || (size_t)n > sizeof c->pend) {
+        fclose(f);
+        return;
+    }
+    out_reset(c);
+    memcpy(c->pend, head, (size_t)n);
+    c->pendlen = (size_t)n;
+    c->out.file = f;
+    c->out.is_mem = 0;
+    c->out.total = meta.size;
+    c->out.sent = 0;
+    c->out.has = 1;
+}
+
+static void api_clipboard_delete(ls_client *c, int id) {
+    ls_clipboard_meta current;
+    char data[PATH_MAX_LOCAL], meta[PATH_MAX_LOCAL];
+    char body[96];
+    int i, removed = 0;
+    if (id >= 0) {
+        if (!read_clipboard_slot(id, &current)) {
+            queue_response(c, 404, "application/json; charset=utf-8",
+                           "{\"error\":\"not found\"}", sizeof("{\"error\":\"not found\"}") - 1);
+            return;
+        }
+        if (clipboard_slot_path(id, "data", data, sizeof data) != 0 ||
+            clipboard_slot_path(id, "meta", meta, sizeof meta) != 0) {
+            queue_response(c, 500, "application/json; charset=utf-8",
+                           "{\"error\":\"path too long\"}", sizeof("{\"error\":\"path too long\"}") - 1);
+            return;
+        }
+        if (ls_remove_file(data) != 0 || ls_remove_file(meta) != 0) {
+            queue_response(c, 500, "application/json; charset=utf-8",
+                           "{\"error\":\"delete failed\"}", sizeof("{\"error\":\"delete failed\"}") - 1);
+            return;
+        }
+        removed = 1;
+    } else {
+        for (i = 0; i < CLIPBOARD_HISTORY_ITEMS; i++) {
+            if (!read_clipboard_slot(i, &current)) continue;
+            if (clipboard_slot_path(i, "data", data, sizeof data) == 0) ls_remove_file(data);
+            if (clipboard_slot_path(i, "meta", meta, sizeof meta) == 0) ls_remove_file(meta);
+            removed++;
+        }
+        clipboard_file_path("data", data, sizeof data);
+        clipboard_file_path("meta", meta, sizeof meta);
+        ls_remove_file(data);
+        ls_remove_file(meta);
+    }
+    snprintf(body, sizeof body, "{\"ok\":true,\"removed\":%d}", removed);
+    queue_response(c, 200, "application/json; charset=utf-8", body, strlen(body));
+}
+
+static void finish_clipboard(ls_client *c) {
+    ls_clipboard_meta meta;
+    char data[PATH_MAX_LOCAL];
+    char meta_path[PATH_MAX_LOCAL];
+    char meta_tmp[PATH_MAX_LOCAL];
+    char response[256];
+    int slot;
+    int n;
+
+    if (c->upfd >= 0) {
+        ls_closefile(c->upfd);
+        c->upfd = -1;
+    }
+    c->mode = MODE_HTTP;
+    if (file_size(c->upname) != c->up_reqlen) {
+        ls_remove_file(c->upname);
+        c->upname[0] = '\0';
+        queue_response(c, 500, "application/json; charset=utf-8",
+                   "{\"error\":\"write failed\"}", sizeof("{\"error\":\"write failed\"}") - 1);
+        return;
+    }
+
+    if (!clipboard_make_room(c->up_reqlen, &slot)) {
+        ls_remove_file(c->upname);
+        c->upname[0] = '\0';
+        queue_response(c, 507, "application/json; charset=utf-8",
+                       "{\"error\":\"clipboard history full\"}",
+                       sizeof("{\"error\":\"clipboard history full\"}") - 1);
+        return;
+    }
+    if (clipboard_slot_path(slot, "data", data, sizeof data) != 0 ||
+        clipboard_slot_path(slot, "meta", meta_path, sizeof meta_path) != 0 ||
+        clipboard_slot_path(slot, "meta.tmp", meta_tmp, sizeof meta_tmp) != 0) {
+        ls_remove_file(c->upname);
+        c->upname[0] = '\0';
+        queue_response(c, 500, "application/json; charset=utf-8",
+                   "{\"error\":\"path too long\"}", sizeof("{\"error\":\"path too long\"}") - 1);
+        return;
+    }
+    /* 槽位是按"没有有效 meta"挑出来的，但可能残留上次中途失败（进程被杀 /
+     * 掉电）留下的数据文件——那种文件没有 meta 指向它，谁也读不到。
+     * POSIX 的 rename 会直接覆盖，Windows 的 _wrename 不会：不先清掉，
+     * 这个槽位以后每次上传都报 save failed。 */
+    ls_remove_file(data);
+    ls_remove_file(meta_path);
+    memset(&meta, 0, sizeof meta);
+    meta.id = slot;
+    snprintf(meta.kind, sizeof meta.kind, "%s", c->clip_kind);
+    snprintf(meta.mime, sizeof meta.mime, "%s", c->clip_mime);
+    snprintf(meta.name, sizeof meta.name, "%s", c->clip_name);
+    meta.size = c->up_reqlen;
+    meta.updated = clipboard_next_updated();
+
+    if (write_clipboard_meta(&meta, meta_tmp) != 0) {
+        ls_remove_file(c->upname);
+        c->upname[0] = '\0';
+        queue_response(c, 500, "application/json; charset=utf-8",
+                   "{\"error\":\"metadata write failed\"}", sizeof("{\"error\":\"metadata write failed\"}") - 1);
+        return;
+    }
+    if (ls_rename_file(c->upname, data) != 0 || ls_rename_file(meta_tmp, meta_path) != 0) {
+        ls_remove_file(data);
+        ls_remove_file(c->upname);
+        ls_remove_file(meta_tmp);
+        c->upname[0] = '\0';
+        queue_response(c, 500, "application/json; charset=utf-8",
+                   "{\"error\":\"save failed\"}", sizeof("{\"error\":\"save failed\"}") - 1);
+        return;
+    }
+    c->upname[0] = '\0';
+    n = snprintf(response, sizeof response,
+        "{\"ok\":true,\"id\":%d,\"kind\":\"%s\",\"size\":%llu}",
+        meta.id, meta.kind, (unsigned long long)meta.size);
+    if (n > 0) queue_response(c, 200, "application/json; charset=utf-8", response, (size_t)n);
+}
+
 /* ==========================================================================
  * HTTP 解析
  * ========================================================================== */
@@ -1516,6 +1940,56 @@ static int extract_query_value(const char *query, const char *key, char *out, si
         p++;
     }
     return 0;
+}
+
+/* 解析单段 bytes Range。返回 1 表示语法有效，0 表示忽略不支持/畸形值。 */
+static int parse_byte_range(const char *range, uint64_t size,
+                            uint64_t *start, uint64_t *end) {
+    const char *p;
+    uint64_t first = 0, second = 0;
+    int have_first = 0, have_second = 0;
+
+    if (strncmp(range, "bytes=", 6) != 0) return 0;
+    p = range + 6;
+    if (*p == '-') {
+        p++;
+        if (*p < '0' || *p > '9') return 0;
+        while (*p >= '0' && *p <= '9') {
+            unsigned digit = (unsigned)(*p++ - '0');
+            if (second > (UINT64_MAX - digit) / 10) return 0;
+            second = second * 10 + digit;
+        }
+        if (*p != '\0') return 0;
+        if (size == 0 || second == 0) {
+            *start = size;
+            *end = size ? size - 1 : 0;
+        } else {
+            *start = second >= size ? 0 : size - second;
+            *end = size - 1;
+        }
+        return 1;
+    }
+
+    while (*p >= '0' && *p <= '9') {
+        unsigned digit = (unsigned)(*p++ - '0');
+        if (first > (UINT64_MAX - digit) / 10) return 0;
+        first = first * 10 + digit;
+        have_first = 1;
+    }
+    if (!have_first || *p++ != '-') return 0;
+    if (*p != '\0') {
+        while (*p >= '0' && *p <= '9') {
+            unsigned digit = (unsigned)(*p++ - '0');
+            if (second > (UINT64_MAX - digit) / 10) return 0;
+            second = second * 10 + digit;
+            have_second = 1;
+        }
+        if (!have_second || *p != '\0') return 0;
+    }
+
+    *start = first;
+    *end = have_second ? second : (size ? size - 1 : 0);
+    return 1;
 }
 
 static const char *find_header(const char *req, size_t len, const char *key) {
@@ -1723,6 +2197,86 @@ static long process_request(ls_client *c, const char *req, size_t len) {
          * 返回 header_end 让调用方把剩余字节挪到缓冲区开头，再由 WS 通路接手
          * （见 client_readable 里 MODE_WS 的分支）。 */
         return (long)header_end;
+    }
+
+    if (strcmp(method, "GET") == 0 && strcmp(path, "/api/clipboard") == 0) {
+        api_clipboard_meta(c);
+        return (long)len;
+    }
+    if (strcmp(method, "GET") == 0 && strcmp(path, "/api/clipboard/data") == 0) {
+        char idstr[16];
+        idstr[0] = '\0';
+        extract_query_value(query, "id", idstr, sizeof idstr);
+        api_clipboard_data(c, idstr[0] ? atoi(idstr) : -1);
+        return (long)len;
+    }
+    if (strcmp(method, "DELETE") == 0 && strcmp(path, "/api/clipboard") == 0) {
+        char idstr[16];
+        idstr[0] = '\0';
+        extract_query_value(query, "id", idstr, sizeof idstr);
+        api_clipboard_delete(c, idstr[0] ? atoi(idstr) : -1);
+        return (long)len;
+    }
+    if (strcmp(method, "POST") == 0 && strcmp(path, "/api/clipboard") == 0) {
+        char kind[8], mime[80], rawname[NAME_MAX * 4], safe[NAME_MAX * 4];
+        char leaf[ID_MAX + 16], temp[PATH_MAX_LOCAL];
+        size_t bodylen = (len > header_end) ? (len - header_end) : 0;
+        int fd;
+
+        kind[0] = mime[0] = rawname[0] = '\0';
+        extract_query_value(query, "kind", kind, sizeof kind);
+        extract_query_value(query, "mime", mime, sizeof mime);
+        extract_query_value(query, "name", rawname, sizeof rawname);
+        if (strcmp(kind, "text") == 0) {
+            snprintf(mime, sizeof mime, "text/plain");
+            if (!rawname[0]) snprintf(rawname, sizeof rawname, "共享文字.txt");
+        } else if (!rawname[0]) {
+            snprintf(rawname, sizeof rawname, "shared-image");
+        }
+        if (!clipboard_mime_allowed(kind, mime) ||
+            (strcmp(kind, "image") == 0 && content_len == 0)) {
+            queue_response(c, 400, "application/json; charset=utf-8",
+                           "{\"error\":\"invalid clipboard content\"}",
+                           sizeof("{\"error\":\"invalid clipboard content\"}") - 1);
+            return (long)len;
+        }
+        if (content_len > CLIPBOARD_MAX) {
+            queue_response(c, 413, "application/json; charset=utf-8",
+                           "{\"error\":\"clipboard item too large\"}",
+                           sizeof("{\"error\":\"clipboard item too large\"}") - 1);
+            return (long)len;
+        }
+        sanitize_name(rawname, safe, sizeof safe);
+        snprintf(leaf, sizeof leaf, "data-%s.tmp", c->id);
+        if (clipboard_file_path(leaf, temp, sizeof temp) != 0) {
+            queue_response(c, 500, "application/json; charset=utf-8",
+                           "{\"error\":\"path too long\"}", sizeof("{\"error\":\"path too long\"}") - 1);
+            return (long)len;
+        }
+        fd = ls_openwrite_at(temp, 0, 0);
+        if (fd < 0) {
+            queue_response(c, 500, "application/json; charset=utf-8",
+                           "{\"error\":\"create failed\"}", sizeof("{\"error\":\"create failed\"}") - 1);
+            return (long)len;
+        }
+        if ((uint64_t)bodylen > content_len) bodylen = (size_t)content_len;
+        if (bodylen && clipboard_write_retry(fd, req + header_end, bodylen) != (long)bodylen) {
+            ls_closefile(fd);
+            ls_remove_file(temp);
+            queue_response(c, 500, "application/json; charset=utf-8",
+                           "{\"error\":\"write failed\"}", sizeof("{\"error\":\"write failed\"}") - 1);
+            return (long)len;
+        }
+        c->upfd = fd;
+        c->upleft = content_len - (uint64_t)bodylen;
+        c->up_reqlen = content_len;
+        snprintf(c->upname, sizeof c->upname, "%s", temp);
+        snprintf(c->clip_kind, sizeof c->clip_kind, "%s", kind);
+        snprintf(c->clip_mime, sizeof c->clip_mime, "%s", mime);
+        snprintf(c->clip_name, sizeof c->clip_name, "%s", safe);
+        if (c->upleft == 0) finish_clipboard(c);
+        else c->mode = MODE_CLIPBOARD;
+        return (long)len;
     }
 
     if (strcmp(method, "GET") == 0 && strcmp(path, "/api/files") == 0) {
@@ -2097,16 +2651,18 @@ static void client_readable(ls_client *c) {
             return;
         }
 
-        if (c->mode == MODE_UPLOAD) {
+        if (c->mode == MODE_UPLOAD || c->mode == MODE_CLIPBOARD) {
+            int clipboard = (c->mode == MODE_CLIPBOARD);
             size_t w = (size_t)n;
             if ((uint64_t)w > c->upleft) w = (size_t)c->upleft;
-            if (ls_write(c->upfd, buf, w) != (long)w) {
-                client_close_why(c, "上传写盘失败");
+            if ((clipboard ? clipboard_write_retry(c->upfd, buf, w) : ls_write(c->upfd, buf, w)) != (long)w) {
+                client_close_why(c, clipboard ? "剪贴板写盘失败" : "上传写盘失败");
                 return;
             }
             c->upleft -= (uint64_t)w;
             if (c->upleft == 0) {
-                finish_upload(c);
+                if (clipboard) finish_clipboard(c);
+                else finish_upload(c);
                 return;
             }
         } else if (c->mode == MODE_WS) {
@@ -2223,6 +2779,7 @@ static void ensure_upload_dir(void) {
 #else
     mkdir(parts, 0755);
 #endif
+    ensure_clipboard_dir();
 }
 
 static void usage(const char *prog) {

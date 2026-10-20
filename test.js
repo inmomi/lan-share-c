@@ -55,6 +55,19 @@ function normalizeSpawn(cmd) {
     return parts.join(' ');
 }
 
+function stopChild(child) {
+    if (!child) return;
+    if (process.platform === 'win32') {
+        spawn('taskkill', ['/F', '/T', '/PID', String(child.pid)], { stdio: 'ignore' });
+        return;
+    }
+    try {
+        process.kill(-child.pid, 'SIGTERM');
+    } catch (_) {
+        child.kill('SIGTERM');
+    }
+}
+
 /* SPAWN 模式下等待服务端口就绪，最多等 20 秒 */
 async function waitReady(host, port, timeoutMs) {
     const deadline = Date.now() + timeoutMs;
@@ -173,6 +186,116 @@ async function testFileLibrary() {
     const after = await json('GET', '/api/files');
     check('删除后列表不含该文件',
         after.json && !after.json.files.some((f) => f.name === 'round.txt'));
+}
+
+async function testClipboard() {
+    console.log('\n--- 服务端共享剪贴板 ---');
+    const text = Buffer.from('共享剪贴板内容：你好\n第二行', 'utf8');
+    const textUp = await json('POST', '/api/clipboard?kind=text', text, {
+        'Content-Type': 'text/plain; charset=utf-8',
+    });
+    check('共享文字写入成功', textUp.status === 200 && textUp.json && textUp.json.kind === 'text',
+        JSON.stringify(textUp.json));
+    const textMeta = await json('GET', '/api/clipboard');
+    check('文字元数据可被其他设备读取',
+        textMeta.json && textMeta.json.kind === 'text' && textMeta.json.mime === 'text/plain');
+    const textGet = await req('GET', '/api/clipboard/data');
+    check('共享文字逐字节一致', textGet.status === 200 && textGet.body.equals(text));
+
+    const image = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x01]);
+    const imageUp = await json('POST', '/api/clipboard?kind=image&mime=image%2Fpng&name=clip.png', image, {
+        'Content-Type': 'image/png',
+    });
+    check('共享图片写入成功', imageUp.status === 200 && imageUp.json && imageUp.json.kind === 'image',
+        JSON.stringify(imageUp.json));
+    const imageMeta = await json('GET', '/api/clipboard');
+    const imageGet = await req('GET', '/api/clipboard/data');
+    check('图片 MIME 与名称保留', imageMeta.json && imageMeta.json.mime === 'image/png'
+        && imageMeta.json.name === 'clip.png');
+    check('快速连续更新仍可被识别', imageMeta.json && textMeta.json
+        && imageMeta.json.updated > textMeta.json.updated);
+    check('共享图片二进制逐字节一致', imageGet.status === 200
+        && imageGet.headers['content-type'] === 'image/png' && imageGet.body.equals(image));
+
+    /* ---------------- 历史记录（最多 32 条 / 128 MiB，超出淘汰最老） ---------------- */
+    const hist = await json('GET', '/api/clipboard');
+    const items = (hist.json && hist.json.items) || [];
+    check('剪贴板返回历史条目', items.length === 2, `items=${items.length}`);
+    check('历史按更新时间倒序',
+        items.length === 2 && items[0].updated > items[1].updated,
+        items.map((i) => i.updated).join(' > '));
+    check('最新一条与顶层字段一致',
+        items.length === 2 && items[0].id === hist.json.id && items[0].name === hist.json.name);
+    check('历史条目带 id/大小/类型',
+        items.length === 2 && items.every((i) => Number.isInteger(i.id) && i.id >= 0
+            && i.size > 0 && (i.kind === 'text' || i.kind === 'image')),
+        JSON.stringify(items));
+
+    /* 历史里"不是最新"的那条也要能按 id 取回来，否则历史只是看得见摸不着 */
+    const oldItem = items.length === 2 ? items[1] : { id: -1 };
+    const oldData = await req('GET', `/api/clipboard/data?id=${oldItem.id}`);
+    check('可按 id 取回旧的历史内容',
+        oldData.status === 200 && oldData.body.equals(text), `status=${oldData.status}`);
+
+    /* 不带 id 仍然是"最新一条"：老页面 / 老脚本不能被这次改动打断 */
+    const latestData = await req('GET', '/api/clipboard/data');
+    check('不带 id 时仍返回最新一条',
+        latestData.status === 200 && latestData.body.equals(image), `status=${latestData.status}`);
+
+    const badId = await req('GET', '/api/clipboard/data?id=999');
+    check('越界 id 返回 404', badId.status === 404, `status=${badId.status}`);
+
+    const delOne = await json('DELETE', `/api/clipboard?id=${oldItem.id}`);
+    check('按 id 删除只删一条',
+        delOne.status === 200 && delOne.json && delOne.json.removed === 1,
+        JSON.stringify(delOne.json));
+    const afterOne = await json('GET', '/api/clipboard');
+    const afterOneItems = (afterOne.json && afterOne.json.items) || [];
+    check('删除后历史只剩最新一条',
+        afterOneItems.length === 1 && afterOneItems[0].id === imageUp.json.id,
+        JSON.stringify(afterOneItems));
+
+    /* 条数上限：第 33 条必须挤掉最老的一条，而不是报错或无限增长 */
+    await json('DELETE', '/api/clipboard');
+    const HIST_TOTAL = 33;
+    let lastPost = null;
+    for (let i = 0; i < HIST_TOTAL; i++) {
+        lastPost = await json('POST', `/api/clipboard?kind=text&name=h${i}.txt`,
+            Buffer.from(`history-${i}`, 'utf8'));
+        if (lastPost.status !== 200) break;
+    }
+    check('连续写入 33 条历史都不报错',
+        !!lastPost && lastPost.status === 200, lastPost ? `status=${lastPost.status}` : 'no response');
+    const capped = await json('GET', '/api/clipboard');
+    const cappedItems = (capped.json && capped.json.items) || [];
+    check('历史条数被压在 32 条以内', cappedItems.length === 32, `items=${cappedItems.length}`);
+    check('最老的一条被淘汰掉',
+        !cappedItems.some((i) => i.name === 'h0.txt'),
+        cappedItems.map((i) => i.name).slice(-1)[0]);
+    check('最新一条仍在且排在最前',
+        !!cappedItems[0] && cappedItems[0].name === 'h32.txt',
+        cappedItems[0] ? cappedItems[0].name : 'empty');
+    /* 淘汰最老之后那一格是被复用的：必须真的装着新内容，不能只剩一份元数据 */
+    const reuseData = cappedItems[0]
+        ? await req('GET', `/api/clipboard/data?id=${cappedItems[0].id}`) : null;
+    check('被复用的槽位内容正确',
+        !!reuseData && reuseData.status === 200
+        && reuseData.body.equals(Buffer.from('history-32', 'utf8')),
+        reuseData ? `status=${reuseData.status}` : 'no item');
+
+    const invalid = await json('POST', '/api/clipboard?kind=image&mime=image%2Fsvg%2Bxml', image, {
+        'Content-Type': 'image/svg+xml',
+    });
+    check('不支持的图片类型被拒绝', invalid.status === 400);
+    const tooLarge = await req('POST', '/api/clipboard?kind=image&mime=image%2Fpng', null, {
+        'Content-Length': String(16 * 1024 * 1024 + 1),
+        'Content-Type': 'image/png',
+    });
+    check('超过 16 MiB 的共享内容被拒绝', tooLarge.status === 413, `status=${tooLarge.status}`);
+    const cleared = await json('DELETE', '/api/clipboard');
+    check('共享剪贴板可清空', cleared.status === 200 && cleared.json && cleared.json.ok === true);
+    const empty = await json('GET', '/api/clipboard');
+    check('清空后状态为空', empty.status === 404);
 }
 
 async function testRename() {
@@ -589,6 +712,17 @@ async function testRange() {
     const r2 = await req('GET', '/api/download?name=' + name, null, { Range: 'bytes=10-19' });
     check('闭区间 Range 长度为 10', r2.body.length === 10, `${r2.body.length}`);
     check('闭区间 Range 内容一致', r2.body.equals(data.subarray(10, 20)));
+
+    const suffix = await req('GET', '/api/download?name=' + name, null, { Range: 'bytes=-3' });
+    check('suffix Range 返回最后 3 字节',
+        suffix.status === 206 && suffix.body.equals(data.subarray(total - 3)),
+        `status=${suffix.status} ${suffix.headers['content-range']}`);
+
+    const malformed = await req('GET', '/api/download?name=' + name, null,
+        { Range: 'bytes=3-junk' });
+    check('畸形 Range 被忽略并返回完整文件',
+        malformed.status === 200 && malformed.body.equals(data),
+        `status=${malformed.status}`);
 
     const r3 = await req('GET', '/api/download?name=' + name, null, { Range: `bytes=${total}-` });
     check('越界 Range 返回 416', r3.status === 416, `status=${r3.status}`);
@@ -1007,6 +1141,7 @@ async function testNameMemory() {
          * 统一走 shell 是为了让 SPAWN 支持 "./lan-share -p 8080 -d ./uploads" 这种带参数的写法。 */
         child = spawn(cmd, [], {
             shell: true,
+            detached: process.platform !== 'win32',
             stdio: ['ignore', 'pipe', 'pipe'],
         });
         child.stdout.on('data', (d) => process.stdout.write(`[srv] ${d}`));
@@ -1014,7 +1149,7 @@ async function testNameMemory() {
         const ready = await waitReady(base.hostname, Number(base.port || 80), 20000);
         if (!ready) {
             console.log(`FAIL  服务未能在 20 秒内就绪: ${cmd}`);
-            child.kill();
+            stopChild(child);
             process.exit(1);
         }
     }
@@ -1024,6 +1159,7 @@ async function testNameMemory() {
         await testStatic();
         await testTraversal();
         await testFileLibrary();
+        await testClipboard();
         await testRename();
         await testUnicode();
         await testBigFile();
@@ -1041,7 +1177,7 @@ async function testNameMemory() {
     }
 
     if (child) {
-        child.kill();
+        stopChild(child);
         await sleep(200);
     }
     console.log(`\n===== 通过 ${passed} / 失败 ${failed} =====`);

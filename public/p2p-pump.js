@@ -180,6 +180,7 @@
         hooks = hooks || {};
         const chunk = hooks.chunk || 64 * 1024;
         const onProgress = hooks.onProgress || function () {};
+        const waitForAck = hooks.waitForAck || null;
         /* 只发到这里为止。给并行 lane 切段用；不传就是发到文件末尾。 */
         const end = Math.min(Math.max(Number(hooks.end) || file.size, 0), file.size);
 
@@ -193,6 +194,7 @@
             : null;
 
         while (offset < end) {
+            if (waitForAck) await waitForAck(offset);
             if (blockPos >= block.byteLength) {
                 block = prefetch ? await prefetch : await readBlockAt(file, offset);
                 blockPos = 0;
