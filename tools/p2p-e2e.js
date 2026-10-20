@@ -479,6 +479,57 @@ async function dumpConnDiag(page, peerId) {
       return 'hooked';
     })()`);
     if (hooked !== 'hooked') fail(`接收端弹窗挂钩失败: ${hooked}`);
+    const streamSaveAvailable = FILE_MB * 1024 * 1024 >= 32 * 1024 * 1024
+      && await pageB.evaluate('window.isSecureContext');
+    if (streamSaveAvailable) {
+      await pageB.evaluate(`(function(){
+        let expectedSize = ${FILE_MB} * 1024 * 1024;
+        Object.defineProperty(window, 'showSaveFilePicker', {
+          configurable: true,
+          value: async ({ suggestedName }) => ({
+          createWritable: async () => {
+            const intervals = [];
+            let bytes = 0;
+            let patternOk = true;
+            return {
+              async write(command) {
+                const position = command.position;
+                const data = command.data instanceof ArrayBuffer
+                  ? new Uint8Array(command.data)
+                  : new Uint8Array(command.data.buffer, command.data.byteOffset, command.data.byteLength);
+                if (position < 0 || position + data.byteLength > expectedSize) patternOk = false;
+                for (let i = 0; i < data.length; i++) {
+                  const at = position + i;
+                  if (data[i] !== ((at * 7 + (at >>> 3)) & 0xFF)) patternOk = false;
+                }
+                intervals.push([position, position + data.byteLength]);
+                bytes += data.byteLength;
+              },
+              async truncate(size) { expectedSize = size; },
+              async close() {
+                intervals.sort((a, b) => a[0] - b[0]);
+                let end = 0;
+                let contiguous = true;
+                for (const range of intervals) {
+                  if (range[0] !== end) contiguous = false;
+                  end = range[1];
+                }
+                window.__streamSaveResult = {
+                  name: suggestedName,
+                  bytes,
+                  contiguous: contiguous && end === expectedSize,
+                  patternOk,
+                };
+              },
+              async abort() {},
+            };
+          },
+          }),
+        });
+        return true;
+      })()`);
+      log('接收端原生文件写入接口已就绪，将验证大文件流式落盘');
+    }
     const fileName = `e2e-${LABEL}-${FILE_MB}mb.bin`;
 
     const sendStart = Date.now();
@@ -598,12 +649,33 @@ async function dumpConnDiag(page, peerId) {
     /* 等接收端把文件存下来 */
     let transferOk = false;
     let e2eRate = 0;
-    const saved = await pageB.waitForDownload(fileName, TIMEOUT_MS);
+    let saved = null;
+    let streamed = null;
+    if (streamSaveAvailable) {
+      const streamDeadline = Date.now() + TIMEOUT_MS;
+      while (Date.now() < streamDeadline) {
+        streamed = await pageB.evaluate('window.__streamSaveResult || null');
+        if (streamed) break;
+        await new Promise((resolve) => setTimeout(resolve, 250));
+      }
+    } else {
+      saved = await pageB.waitForDownload(fileName, TIMEOUT_MS);
+    }
     /* 真正的端到端速率要算到"文件落盘"为止。发送端的 done 现在代表对端
      * 已组装落盘（收到 file-done 回执），与 waitForDownload 命中的时间点
      * 几乎重合，所以下面的"交付速率"和"端到端"会收敛到同一个数。 */
     const e2eSecs = (Date.now() - sendStart) / 1000;
-    if (!saved) {
+    if (streamSaveAvailable && !streamed) {
+      fail('接收端流式文件写入未完成');
+    } else if (streamed) {
+      if (streamed.bytes !== FILE_MB * 1024 * 1024 || !streamed.contiguous || !streamed.patternOk) {
+        fail(`流式落盘校验失败: ${JSON.stringify(streamed)}`);
+      } else {
+        log(`  接收端: ${(streamed.bytes / 1048576).toFixed(1)} MB 流式写入，偏移连续、内容正确 ✓`);
+        transferOk = true;
+        e2eRate = FILE_MB / e2eSecs;
+      }
+    } else if (!saved) {
       fail('接收端没有出现下载文件');
     } else {
       const got = fs.readFileSync(saved);

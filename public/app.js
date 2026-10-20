@@ -5,12 +5,10 @@
  * - File bytes travel over a WebRTC DataChannel straight between browsers.
  * - The vault tab uploads to / downloads from the server disk.
  * - DataChannel 的发送 pacing 在 p2p-pump.js（LSPump），浏览器里以全局变量暴露。
+ *
+ * 背压与分块策略在 p2p-pump.js（LSPump）。注意 DRAIN_LIMIT 必须远小于 Chrome
+ * DataChannel 发送队列约 16MB 的硬上限，超了 send() 会直接抛队列满异常。
  */
-
-/* 背压与分块策略在 p2p-pump.js（LSPump），单独一个文件是为了能在 Node 里
- * 直接 require 做单测。注意那里的 DRAIN_LIMIT 必须远小于 Chrome DataChannel
- * 发送队列约 16MB 的硬上限，超了 send() 会直接抛
- * "RTCDataChannel send queue is full"，把整次传输判死。 */
 const { LOW_WATER, LANES, splitRange, chunkSizeFor, pumpFile,
   speedtestBegin, speedtestCount, speedtestFinish, speedtestAbort } = LSPump;
 
@@ -19,6 +17,8 @@ const UP_CHUNK = 4 * 1024 * 1024;
 /* 进度条刷新间隔。原来每收到一块就写一次 DOM，100MB 文件要动 1600 次，
  * 光重排就把主线程拖住了。改成 120ms 批量刷一次。 */
 const UI_TICK = 120;
+const STREAM_SAVE_THRESHOLD = 32 * 1024 * 1024;
+const STREAM_ACK_WINDOW = 4 * 1024 * 1024;
 
 const NAME_KEY = 'lanshare.deviceName';
 
@@ -37,6 +37,7 @@ const state = {
   targetPeer: null,
   clipboardUpdated: null,
   modalResolve: null,
+  modalAccept: null,
   /* 接收方未完成的半成品，按 fileId 存。通道断了不清空，
    * 对端重发同一个文件时用它里的 received 作为续传起点。 */
   resume: new Map(),
@@ -111,12 +112,13 @@ function toast(message, ms = 3200) {
 
 /* ------------------------------------------------------------------- modal */
 
-function confirmDialog(title, body) {
+function confirmDialog(title, body, onAccept) {
   $('modalTitle').textContent = title;
   $('modalBody').textContent = body;
   $('modal').classList.remove('hidden');
   return new Promise((resolve) => {
     state.modalResolve = resolve;
+    state.modalAccept = onAccept || null;
   });
 }
 
@@ -124,10 +126,27 @@ function closeModal(result) {
   $('modal').classList.add('hidden');
   const resolve = state.modalResolve;
   state.modalResolve = null;
+  state.modalAccept = null;
   if (resolve) resolve(result);
 }
 
-$('modalYes').addEventListener('click', () => closeModal(true));
+$('modalYes').addEventListener('click', async () => {
+  const onAccept = state.modalAccept;
+  if (!onAccept) {
+    closeModal(true);
+    return;
+  }
+  $('modalYes').disabled = true;
+  try {
+    const fileHandle = await onAccept();
+    closeModal({ accepted: true, fileHandle });
+  } catch (err) {
+    if (err.name !== 'AbortError') toast(`无法选择保存位置：${err.message}`);
+    closeModal(false);
+  } finally {
+    $('modalYes').disabled = false;
+  }
+});
 $('modalNo').addEventListener('click', () => closeModal(false));
 
 /* --------------------------------------------------------------- signalling */
@@ -157,12 +176,14 @@ function connect() {
       const frame = LSRelay.parseRelayFrame(event.data);
       if (frame && frame.payload.byteLength) {
         const lane = ensureRelay(frame.from);
-        lane.ackPending += frame.payload.byteLength;
-        /* 收到就回确认：发送端的 inflight 窗口靠它泄流，否则 pumpFile 会
-         * 一直卡在 waitDrain 上（表现是速度掉到 0 然后超时）。 */
-        if (lane.ackPending >= RELAY_ACK_EVERY) {
-          sendSignal(frame.from, { ch: 0, relayAck: lane.ackPending });
-          lane.ackPending = 0;
+        const inc = state.incoming;
+        const deferAck = inc && inc.writer && inc.lanes && inc.lanes.has(lane);
+        if (!deferAck) {
+          lane.ackPending += frame.payload.byteLength;
+          if (lane.ackPending >= RELAY_ACK_EVERY) {
+            sendSignal(frame.from, { ch: 0, relayAck: lane.ackPending });
+            lane.ackPending = 0;
+          }
         }
         lane.dc.deliver(frame.payload);
       }
@@ -710,10 +731,17 @@ async function sendOne(peerId, file) {
     : use.length + ' 路并行';
   const ranges = splitRange(start, file.size, use.length);
   const laneSent = use.map(() => 0);
+  const sentTotal = () => start + laneSent.reduce((a, b) => a + b, 0);
   const report = () => {
-    const total = start + laneSent.reduce((a, b) => a + b, 0);
-    updateTransfer(tid, { sent: total, status: '传输中 · ' + laneLabel });
+    updateTransfer(tid, { sent: sentTotal(), status: '传输中 · ' + laneLabel });
   };
+  const waitForFileWriteAck = accept.stream ? async () => {
+    const deadline = Date.now() + 120000;
+    while (sentTotal() - Math.max(start, rec.acked || start) >= STREAM_ACK_WINDOW) {
+      if (rec.failed || Date.now() > deadline) throw new Error('等待浏览器写入文件超时');
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+  } : null;
 
   const sendStart = Date.now();
   await Promise.all(ranges.map((range, i) => {
@@ -724,6 +752,7 @@ async function sendOne(peerId, file) {
     return pumpFile(lane.dc, file, range.from, {
       chunk: chunkSizeFor(lane),
       end: range.to,
+      waitForAck: waitForFileWriteAck,
       onProgress: (sent) => {
         laneSent[i] = sent - range.from;
         report();
@@ -796,7 +825,11 @@ function onChannelMessage(lane, data) {
       const resolve = state.pendingAccept.get(msg.tid);
       if (resolve) {
         state.pendingAccept.delete(msg.tid);
-        resolve({ ok: msg.t === 'file-accept', offset: Number(msg.offset) || 0 });
+        resolve({
+          ok: msg.t === 'file-accept',
+          offset: Number(msg.offset) || 0,
+          stream: Boolean(msg.stream),
+        });
       }
       if (msg.t === 'file-reject') toast('对方拒绝了接收');
     } else if (msg.t === 'lane-end') {
@@ -835,25 +868,52 @@ function onChannelMessage(lane, data) {
   if (speedtestCount(lane, data.byteLength, Date.now())) return;
 
   const inc = state.incoming;
+  if (inc && inc.writer) {
+    const part = inc.laneOffsets[lane.index];
+    if (!part) return;
+    if (part.received + data.byteLength > part.length) {
+      markInterrupted(lane);
+      return;
+    }
+    const position = part.from + part.received;
+    part.received += data.byteLength;
+    inc.writeQueue = inc.writeQueue.then(async () => {
+      if (inc.writeError) return;
+      await inc.writer.write({ type: 'write', position, data });
+      part.saved += data.byteLength;
+      if (lane.relay) {
+        lane.ackPending += data.byteLength;
+        if (lane.ackPending >= RELAY_ACK_EVERY) {
+          sendSignal(lane.peerId, { ch: 0, relayAck: lane.ackPending });
+          lane.ackPending = 0;
+        }
+      }
+      recordReceivedProgress(lane, inc, data.byteLength);
+    }).catch((err) => {
+      inc.writeError = err;
+      if (state.incoming === inc) markInterrupted(lane);
+    });
+    return;
+  }
   if (inc && inc.laneBufs[lane.index]) {
     /* 这一条 lane 对应文件的一段，分块按到达顺序进本段的缓冲。
      * lane 内部是有序的（ordered:true），段与段之间靠 splitRange 的顺序拼。 */
     inc.laneBufs[lane.index].push(data);
-    inc.received += data.byteLength;
-    updateTransfer(inc.tid, { sent: inc.received });
-    /* 周期性回传实收字节数：发送端的进度和速率用它来显示。
-     * 不这么做的话，发送端只能显示"交给发送队列的字节"——那会被 lane 的
-     * 高水位吸收（32 条 × 2MB = 64MB），进度条先冲到 100% 再卡住，
-     * 速率在 2~40MB/s 之间荡，而真实速度一直很稳。 */
-    const now = Date.now();
-    if (inc.received - (inc.lastAck || 0) >= 1024 * 1024
-      || now - (inc.lastAckTs || 0) >= 500) {
-      inc.lastAck = inc.received;
-      inc.lastAckTs = now;
-      try {
-        lane.dc.send(JSON.stringify({ t: 'progress', tid: inc.tid, received: inc.received }));
-      } catch (_) { /* 通道正在关，下一条数据也到不了了 */ }
-    }
+    recordReceivedProgress(lane, inc, data.byteLength);
+  }
+}
+
+function recordReceivedProgress(lane, inc, bytes) {
+  inc.received += bytes;
+  updateTransfer(inc.tid, { sent: inc.received });
+  const now = Date.now();
+  if (inc.received - (inc.lastAck || 0) >= 1024 * 1024
+    || now - (inc.lastAckTs || 0) >= 500) {
+    inc.lastAck = inc.received;
+    inc.lastAckTs = now;
+    try {
+      lane.dc.send(JSON.stringify({ t: 'progress', tid: inc.tid, received: inc.received }));
+    } catch (_) { /* 通道正在关，下一条数据也到不了了 */ }
   }
 }
 
@@ -861,24 +921,59 @@ async function askReceive(lane, msg) {
   const from = peerName(lane.peerId);
   /* 同一个文件之前收到一半就断了：用已收字节数作为续传起点，
    * 让对端从断点接着发，而不是从 0 重来。 */
-  const prior = msg.fileId ? state.resume.get(msg.fileId) : null;
+  let prior = msg.fileId ? state.resume.get(msg.fileId) : null;
+  if (prior && prior.writerClose) await prior.writerClose;
+  if (prior && prior.writeError) {
+    state.resume.delete(msg.fileId);
+    prior = null;
+  }
   const already = prior ? prior.received : 0;
 
+  const canStreamSave = msg.size >= STREAM_SAVE_THRESHOLD
+    && window.isSecureContext && typeof window.showSaveFilePicker === 'function';
+  const resumeStream = Boolean(prior && prior.streamBacked && prior.fileHandle);
+  const resumeHandle = resumeStream ? prior.fileHandle : null;
+  const picker = canStreamSave && !resumeHandle
+    ? () => window.showSaveFilePicker({ suggestedName: msg.name })
+    : null;
+  const saveHint = canStreamSave || resumeHandle
+    ? '\n大文件将直接写入你选择的位置，减少内存占用。'
+    : (msg.size >= STREAM_SAVE_THRESHOLD
+      ? '\n当前浏览器/HTTP 页面不支持流式写盘，接收期间可能占用较多内存。'
+      : '');
   let accepted;
   if (already > 0 && already < msg.size) {
     accepted = await confirmDialog(
       '继续接收',
       `${from} 继续发送「${msg.name}」(${humanSize(msg.size)})，`
-        + `本机已收到 ${humanSize(already)}，将从断点续传。`
+        + `本机已收到 ${humanSize(already)}，将从断点续传。${saveHint}`,
+      picker
     );
   } else {
     accepted = await confirmDialog(
       '收到传输请求',
-      `${from} 想发送「${msg.name}」(${humanSize(msg.size)})`
+      `${from} 想发送「${msg.name}」(${humanSize(msg.size)})${saveHint}`,
+      picker
     );
   }
-  if (!accepted) {
+  if (!accepted || (typeof accepted === 'object' && !accepted.accepted)) {
     lane.dc.send(JSON.stringify({ t: 'file-reject', tid: msg.tid }));
+    return;
+  }
+  const fileHandle = (typeof accepted === 'object' && accepted.fileHandle) || resumeHandle || null;
+  let writer = null;
+  try {
+    if (prior && prior.writerClose) await prior.writerClose;
+    if (prior && prior.writeQueue) await prior.writeQueue;
+    writer = prior && prior.writer ? prior.writer : null;
+    if (!writer && fileHandle) {
+      writer = await fileHandle.createWritable({ keepExistingData: resumeStream });
+    }
+    if (writer && resumeStream) await writer.truncate(already);
+    if (writer && !resumeStream && prior && already > 0) await writer.truncate(0);
+  } catch (err) {
+    lane.dc.send(JSON.stringify({ t: 'file-reject', tid: msg.tid }));
+    toast(`无法打开保存文件：${err.message}`);
     return;
   }
 
@@ -913,8 +1008,16 @@ async function askReceive(lane, msg) {
     from,
     /* 续传时上一段已经收到的字节。上一段的 lane 缓冲按 lane 顺序摊平就是
      * [0, already)，直接接在新数据前面，不需要重新分组。 */
-    priorChunks: (prior && already < msg.size) ? prior.laneBufs.flat() : [],
+    priorChunks: writer ? [] : ((prior && already < msg.size) ? prior.laneBufs.flat() : []),
     laneBufs: lane.session.lanes.map(() => []),
+    writer,
+    streamBacked: Boolean(writer),
+    fileHandle,
+    writerClose: null,
+    writeQueue: Promise.resolve(),
+    writeError: null,
+    laneOffsets: Object.create(null),
+    resumeFrom: already,
     lanesDone: 0,
     /* 这次传输实际在用的通道。判"中断"时必须拿它过滤——直连建不起来时文件走
      * 兜底通道，而同期那 32 条 WebRTC lane 还在陆续 ICE 失败被判死刑，它们的
@@ -926,6 +1029,30 @@ async function askReceive(lane, msg) {
     lastAck: already,
     lastAckTs: 0,
   };
+  if (writer && !resumeStream && prior && already > 0) {
+    let position = 0;
+    try {
+      for (const chunk of prior.laneBufs.flat()) {
+        await writer.write({ type: 'write', position, data: chunk });
+        position += chunk.byteLength;
+      }
+    } catch (err) {
+      await writer.abort().catch(() => {});
+      lane.dc.send(JSON.stringify({ t: 'file-reject', tid: msg.tid }));
+      toast(`无法写入续传数据：${err.message}`);
+      return;
+    }
+  }
+  const transferRanges = splitRange(already, msg.size, useCount);
+  transferRanges.forEach((range, index) => {
+    const laneIndex = lane.relay ? 0 : (sharedLive[index] ?? myLive[index] ?? 0);
+    inc.laneOffsets[laneIndex] = {
+      from: range.from,
+      length: range.to - range.from,
+      received: 0,
+      saved: 0,
+    };
+  });
   state.incoming = inc;
   if (inc.fileId) state.resume.set(inc.fileId, inc);
 
@@ -936,7 +1063,7 @@ async function askReceive(lane, msg) {
   /* 回传本端活着的 lane：发送端取交集后切段，段数和这边才对得上 */
   lane.dc.send(JSON.stringify({
     t: 'file-accept', tid: msg.tid, fileId: msg.fileId, offset: inc.received,
-    lanes: myLive,
+    lanes: myLive, stream: Boolean(writer),
   }));
 }
 
@@ -961,6 +1088,38 @@ function markInterrupted(lane) {
   if (lane && inc.lanes && !inc.lanes.has(lane)) return;
 
   state.incoming = null;
+  if (inc.writer) {
+    const writer = inc.writer;
+    inc.writerClose = inc.writeQueue
+      .then(async () => {
+        if (inc.writeError) {
+          const safeOffset = contiguousSavedOffset(inc);
+          await writer.truncate(safeOffset);
+          await writer.close();
+          inc.received = safeOffset;
+        } else {
+          await writer.close();
+          inc.received = contiguousSavedOffset(inc);
+        }
+      })
+      .then(() => {
+        inc.writer = null;
+        if (inc.fileId && inc.received > 0 && inc.received < inc.size) {
+          state.resume.set(inc.fileId, inc);
+          updateTransfer(inc.tid, {
+            status: `已中断（${humanSize(inc.received)}），可续传`, failed: true,
+          });
+        } else {
+          updateTransfer(inc.tid, { status: '已中断', failed: true });
+        }
+      })
+      .catch((err) => {
+        inc.writeError = err;
+        inc.writer = null;
+        updateTransfer(inc.tid, { status: `保存失败：${err.message}`, failed: true });
+      });
+    return;
+  }
   if (inc.fileId && inc.received > 0 && inc.received < inc.size) {
     state.resume.set(inc.fileId, inc);
     updateTransfer(inc.tid, { status: `已中断（${humanSize(inc.received)}），可续传`, failed: true });
@@ -969,11 +1128,59 @@ function markInterrupted(lane) {
   }
 }
 
-function finishReceive(lane) {
+function contiguousSavedOffset(inc) {
+  let offset = inc.resumeFrom || 0;
+  const parts = Object.values(inc.laneOffsets || {}).sort((a, b) => a.from - b.from);
+  for (const part of parts) {
+    if (part.from !== offset || part.saved < part.length) break;
+    offset = part.from + part.length;
+  }
+  return offset;
+}
+
+async function finishReceive(lane) {
   const inc = state.incoming;
-  state.incoming = null;
   if (!inc) return;
+  if (inc.writer) {
+    try {
+      await inc.writeQueue;
+      if (inc.writeError) throw inc.writeError;
+      await inc.writer.close();
+      inc.writer = null;
+    } catch (err) {
+      inc.writeError = err;
+      if (inc.writer) {
+        try {
+          const safeOffset = contiguousSavedOffset(inc);
+          await inc.writer.truncate(safeOffset);
+          await inc.writer.close();
+          inc.received = safeOffset;
+        } catch (_) {
+          await inc.writer.abort().catch(() => {});
+        }
+        inc.writer = null;
+      }
+      state.incoming = null;
+      if (inc.fileId && inc.received > 0) state.resume.set(inc.fileId, inc);
+      else if (inc.fileId) state.resume.delete(inc.fileId);
+      updateTransfer(inc.tid, { status: `保存失败：${err.message}`, failed: true });
+      return;
+    }
+  }
+  state.incoming = null;
   state.resume.delete(inc.fileId);
+  if (inc.streamBacked) {
+    inc.priorChunks.length = 0;
+    inc.laneBufs.forEach((b) => { b.length = 0; });
+    updateTransfer(inc.tid, { status: '已保存', sent: inc.size, done: true });
+    if (lane && lane.dc && lane.dc.readyState === 'open') {
+      try {
+        lane.dc.send(JSON.stringify({ t: 'file-done', tid: inc.tid, received: inc.size }));
+      } catch (_) { /* 忽略：收尾回执失败不致命 */ }
+    }
+    toast(`已保存「${inc.name}」`);
+    return;
+  }
   /* 拼接顺序：先续传前已经收到的字节，再按 lane 0..N-1 的顺序把各段接上。
    * splitRange 保证各段首尾相接，所以这个顺序就是文件原始顺序。 */
   const blob = new Blob([...inc.priorChunks, ...inc.laneBufs.flat()],
