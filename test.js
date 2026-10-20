@@ -188,6 +188,50 @@ async function testFileLibrary() {
         after.json && !after.json.files.some((f) => f.name === 'round.txt'));
 }
 
+async function testClipboard() {
+    console.log('\n--- 服务端共享剪贴板 ---');
+    const text = Buffer.from('共享剪贴板内容：你好\n第二行', 'utf8');
+    const textUp = await json('POST', '/api/clipboard?kind=text', text, {
+        'Content-Type': 'text/plain; charset=utf-8',
+    });
+    check('共享文字写入成功', textUp.status === 200 && textUp.json && textUp.json.kind === 'text',
+        JSON.stringify(textUp.json));
+    const textMeta = await json('GET', '/api/clipboard');
+    check('文字元数据可被其他设备读取',
+        textMeta.json && textMeta.json.kind === 'text' && textMeta.json.mime === 'text/plain');
+    const textGet = await req('GET', '/api/clipboard/data');
+    check('共享文字逐字节一致', textGet.status === 200 && textGet.body.equals(text));
+
+    const image = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x01]);
+    const imageUp = await json('POST', '/api/clipboard?kind=image&mime=image%2Fpng&name=clip.png', image, {
+        'Content-Type': 'image/png',
+    });
+    check('共享图片写入成功', imageUp.status === 200 && imageUp.json && imageUp.json.kind === 'image',
+        JSON.stringify(imageUp.json));
+    const imageMeta = await json('GET', '/api/clipboard');
+    const imageGet = await req('GET', '/api/clipboard/data');
+    check('图片 MIME 与名称保留', imageMeta.json && imageMeta.json.mime === 'image/png'
+        && imageMeta.json.name === 'clip.png');
+    check('快速连续更新仍可被识别', imageMeta.json && textMeta.json
+        && imageMeta.json.updated > textMeta.json.updated);
+    check('共享图片二进制逐字节一致', imageGet.status === 200
+        && imageGet.headers['content-type'] === 'image/png' && imageGet.body.equals(image));
+
+    const invalid = await json('POST', '/api/clipboard?kind=image&mime=image%2Fsvg%2Bxml', image, {
+        'Content-Type': 'image/svg+xml',
+    });
+    check('不支持的图片类型被拒绝', invalid.status === 400);
+    const tooLarge = await req('POST', '/api/clipboard?kind=image&mime=image%2Fpng', null, {
+        'Content-Length': String(16 * 1024 * 1024 + 1),
+        'Content-Type': 'image/png',
+    });
+    check('超过 16 MiB 的共享内容被拒绝', tooLarge.status === 413, `status=${tooLarge.status}`);
+    const cleared = await json('DELETE', '/api/clipboard');
+    check('共享剪贴板可清空', cleared.status === 200 && cleared.json && cleared.json.ok === true);
+    const empty = await json('GET', '/api/clipboard');
+    check('清空后状态为空', empty.status === 404);
+}
+
 async function testRename() {
     console.log('\n--- 同名自动重命名 ---');
     const p = Buffer.from('v1');
@@ -1049,6 +1093,7 @@ async function testNameMemory() {
         await testStatic();
         await testTraversal();
         await testFileLibrary();
+        await testClipboard();
         await testRename();
         await testUnicode();
         await testBigFile();

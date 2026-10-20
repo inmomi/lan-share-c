@@ -50,7 +50,7 @@ jobs:
           ./lan-share -h || true
           ls -la lan-share
 
-      # 测试脚本会自己拉起服务、跑完 79 项断言再关掉它
+      # 测试脚本会自己拉起服务、跑完 135 项断言再关掉它
       - name: 运行端到端测试
         env:
           SPAWN: ./lan-share -p 8080 -d ./uploads -w ./public

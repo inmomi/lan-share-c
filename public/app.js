@@ -35,6 +35,7 @@ const state = {
   pendingAccept: new Map(),
   transfers: new Map(),
   targetPeer: null,
+  clipboardUpdated: null,
   modalResolve: null,
   /* 接收方未完成的半成品，按 fileId 存。通道断了不清空，
    * 对端重发同一个文件时用它里的 received 作为续传起点。 */
@@ -662,11 +663,13 @@ async function sendOne(peerId, file) {
   });
   rec.fileId = fileId;
 
-  /* 这条链路用几条 lane：首次传输前探一次（probeLanes），之后按探测结果
-   * 和实测表现动态调整。只广告真正会用的 lane——对端按交集数段数，
+  /* 不在真实文件前跑测速流。新链路先直接用默认并行度，随后按实收速率动态升档。
+   * 只广告真正会用的 lane——对端按交集数段数，
    * 广告 32 条却只用 16 条，对端会永远等不到收尾。 */
-  /* 兜底通道只有一条，也不用探 lane 数（探测本身就是一次 4MB 往返） */
-  const want = live.length === 1 && live[0].relay ? 1 : await chooseLanes(conn, live);
+  const want = live.length === 1 && live[0].relay
+    ? 1
+    : Math.min(conn.lanePref || PROBE_LANES, live.length);
+  if (!live[0].relay && !conn.lanePref) conn.lanePref = want;
   const chosen = live.slice(0, want);
 
   /* 控制消息走第一条活 lane，数据随后按范围铺到所用 lane 上。
@@ -804,8 +807,6 @@ function onChannelMessage(lane, data) {
         inc.lanesDone = (inc.lanesDone || 0) + 1;
         if (inc.lanesDone >= inc.expectedLanes) finishReceive(lane);
       }
-    } else if (msg.t === 'text') {
-      toast(`来自 ${peerName(lane.peerId)}：${msg.text}`);
     } else if (msg.t === 'speedtest') {
       /* 对端在测链路速度：接下来这条连接上的二进制只计数，不弹窗、不进文件库。
        * 计数挂在 lane 上并有硬超时，万一 speedtest-end 永远不来也不会
@@ -1143,24 +1144,11 @@ function renderPeers() {
     card.dataset.peer = peer.id;
     card.innerHTML = `<div class="avatar">${esc(peer.name.slice(0, 1))}</div>`
       + `<div class="pname">${esc(peer.name)}</div>`
-      + `<div class="pmeta"><span class="${dotClass}"></span>${note}</div>`
-      + '<button class="mini" data-act="text">发文字</button>';
+      + `<div class="pmeta"><span class="${dotClass}"></span>${note}</div>`;
 
     card.addEventListener('click', () => {
       state.targetPeer = peer.id;
       $('peerPicker').click();
-    });
-
-    card.querySelector('.mini').addEventListener('click', (event) => {
-      event.stopPropagation();
-      const text = window.prompt(`发送文字给 ${peer.name}`);
-      if (!text) return;
-      ensureChannel(peer.id)
-        .then((conn2) => {
-          conn2.lanes[0].dc.send(JSON.stringify({ t: 'text', text }));
-          toast('已发送');
-        })
-        .catch((err) => toast(`发送失败：${err.message}`));
     });
 
     card.addEventListener('dragover', (event) => {
@@ -1243,6 +1231,142 @@ async function refreshVault() {
     list.appendChild(li);
   }
 }
+
+function clipboardForm(kind, mime, name) {
+  return `/api/clipboard?kind=${encodeURIComponent(kind)}&mime=${encodeURIComponent(mime)}`
+    + `&name=${encodeURIComponent(name || '')}`;
+}
+
+async function publishClipboard(kind, mime, name, blob) {
+  const status = $('clipboardStatus');
+  status.textContent = '正在发布';
+  try {
+    const res = await fetch(clipboardForm(kind, mime, name), {
+      method: 'POST',
+      headers: { 'Content-Type': mime },
+      body: blob,
+    });
+    if (!res.ok) {
+      const error = await res.json().catch(() => ({}));
+      throw new Error(error.error || `HTTP ${res.status}`);
+    }
+    state.clipboardDirty = false;
+    toast(kind === 'text' ? '文字已发布到共享剪贴板' : '图片已发布到共享剪贴板');
+    await refreshClipboard(true);
+  } catch (err) {
+    status.textContent = '发布失败';
+    toast(`共享剪贴板发布失败：${err.message}`);
+  }
+}
+
+async function refreshClipboard(force) {
+  const status = $('clipboardStatus');
+  try {
+    const res = await fetch('/api/clipboard', { cache: 'no-store' });
+    if (res.status === 404) {
+      state.clipboardUpdated = null;
+      $('clipboardPreview').replaceChildren();
+      $('copyClipboardText').classList.add('hidden');
+      $('downloadClipboardImage').classList.add('hidden');
+      status.textContent = '剪贴板为空';
+      return;
+    }
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const meta = await res.json();
+    if (!force && meta.updated === state.clipboardUpdated) return;
+    state.clipboardUpdated = meta.updated;
+    const data = await fetch(`/api/clipboard/data?v=${meta.updated}`, { cache: 'no-store' });
+    if (!data.ok) throw new Error(`HTTP ${data.status}`);
+    $('clipboardPreview').replaceChildren();
+    $('copyClipboardText').classList.add('hidden');
+    $('downloadClipboardImage').classList.add('hidden');
+    if (meta.kind === 'text') {
+      const text = await data.text();
+      const pre = document.createElement('pre');
+      pre.className = 'clipboard-text-preview';
+      pre.textContent = text;
+      $('clipboardPreview').appendChild(pre);
+      $('copyClipboardText').classList.remove('hidden');
+      $('copyClipboardText').onclick = async () => {
+        try {
+          if (navigator.clipboard && navigator.clipboard.writeText) {
+            await navigator.clipboard.writeText(text);
+          } else {
+            const input = document.createElement('textarea');
+            input.value = text;
+            input.style.position = 'fixed';
+            input.style.opacity = '0';
+            document.body.appendChild(input);
+            input.select();
+            const copied = document.execCommand('copy');
+            input.remove();
+            if (!copied) throw new Error('copy unavailable');
+          }
+          toast('已复制到本机剪贴板');
+        } catch (_) {
+          toast('浏览器未授予剪贴板权限');
+        }
+      };
+    } else if (meta.kind === 'image') {
+      const image = document.createElement('img');
+      image.className = 'clipboard-image-preview';
+      image.src = `/api/clipboard/data?v=${meta.updated}`;
+      image.alt = meta.name;
+      $('clipboardPreview').appendChild(image);
+      const link = $('downloadClipboardImage');
+      link.href = image.src;
+      link.download = meta.name || 'shared-image';
+      link.classList.remove('hidden');
+    }
+    status.textContent = `更新于 ${new Date(meta.updated).toLocaleTimeString()}`;
+  } catch (_) {
+    status.textContent = '无法连接服务端';
+  }
+}
+
+$('publishClipboardText').addEventListener('click', () => {
+  publishClipboard('text', 'text/plain', 'shared-text.txt', new Blob([$('clipboardText').value], {
+    type: 'text/plain;charset=utf-8',
+  }));
+});
+$('clearClipboard').addEventListener('click', async () => {
+  const res = await fetch('/api/clipboard', { method: 'DELETE' });
+  if (res.ok || res.status === 404) {
+    $('clipboardText').value = '';
+    await refreshClipboard(true);
+  } else {
+    toast('清空共享剪贴板失败');
+  }
+});
+$('pickClipboardImage').addEventListener('click', () => $('clipboardImagePicker').click());
+$('clipboardImagePicker').addEventListener('change', (event) => {
+  const image = event.target.files && event.target.files[0];
+  event.target.value = '';
+  if (image) publishClipboard('image', image.type, image.name, image);
+});
+const imageDrop = $('clipboardImageDrop');
+imageDrop.addEventListener('dragover', (event) => {
+  event.preventDefault();
+  imageDrop.classList.add('dragover');
+});
+imageDrop.addEventListener('dragleave', () => imageDrop.classList.remove('dragover'));
+imageDrop.addEventListener('drop', (event) => {
+  event.preventDefault();
+  imageDrop.classList.remove('dragover');
+  const image = [...event.dataTransfer.files].find((file) => file.type.startsWith('image/'));
+  if (image) publishClipboard('image', image.type, image.name, image);
+  else toast('拖入的文件不是图片');
+});
+document.addEventListener('paste', (event) => {
+  if (!$('pane-clipboard').classList.contains('active')) return;
+  const item = [...(event.clipboardData && event.clipboardData.items || [])]
+    .find((entry) => entry.type.startsWith('image/'));
+  const image = item && item.getAsFile();
+  if (image) {
+    event.preventDefault();
+    publishClipboard('image', image.type, 'pasted-image', image);
+  }
+});
 
 /** 上传单个分块。服务端按 offset 顺序落进 .part 文件，中断后 .part 保留。 */
 function putChunk(name, size, offset, blob) {
@@ -1543,43 +1667,9 @@ async function laneSpeedtest(lanes, totalBytes, blob) {
   };
 }
 
-/* ---------------- lane 数决策：16 条探一次，慢才加开到 32 ----------------
- *
- * CI 实测（--sweep，速率由对端计时）表明最优 lane 数随链路丢包变化：
- *   无损 loopback：1~4 条就够（26~39MB/s），16/32 条回落到 16~18；
- *   5ms + 0.5% 丢包：16 条 20.0 > 32 条 17.1——轻度丢包 16 条最优；
- *   20ms + 2% 丢包：16 条 3.0 < 32 条 4.2——重丢包才吃得上 32 条。
- * 而且多开 lane 不是免费的：每条关联都有独立的 DTLS/SCTP 开销，Chrome 的
- * DataChannel 通路是 CPU-bound 的（Aalto 大学实测：高端 PC 上双端各吃满一个
- * 核，且接收端比发送端更耗 CPU），32 条在轻度丢包的 Wi-Fi 上等于拿 CPU 和
- * 空口控制帧换一点点带宽。所以先用 16 条探 4MB：对端聚合 ≥10MB/s 就用
- * 16 条（省 CPU、发送队列吸收窗口小、数字稳），低于阈值才加满到 32 条。
- *
- * 阈值 10MB/s 在三档 CI 档案上都分得开：0.5% 丢包的 16 条聚合是 20（不升），
- * 2% 丢包是 3.0（升），无损是 16~29（不升）。 */
+/* 初始并行度。真实传输的对端回执够慢时再升档，不为决策预先发送探测数据。 */
 const PROBE_LANES = 16;
-const PROBE_BYTES = 4 * 1024 * 1024;
 const ESCALATE_BELOW = 10 * 1024 * 1024;
-
-/** 本次传输用几条 lane。探测结果按连接缓存（conn.lanePref）——
- *  同一对端第二次发文件不再重新探，链路变化由 sendOne 末尾的实收速率兜底
- *  （明显慢就加满，只升不降，避免抖动）。 */
-async function chooseLanes(conn, live) {
-  if (conn.lanePref) return Math.min(conn.lanePref, live.length);
-  const lanes = live.slice(0, PROBE_LANES);
-  let agg = 0;
-  try {
-    const blob = new Blob([new Uint8Array(PROBE_BYTES)]);
-    const r = await laneSpeedtest(lanes, PROBE_BYTES, blob);
-    agg = r.slowest > 0 ? (r.received / 1048576) / (r.slowest / 1000) : 0;
-  } catch (_) {
-    /* 探测本身失败（链路很差才会）——按最坏情况办，直接加满 */
-    conn.lanePref = live.length;
-    return live.length;
-  }
-  conn.lanePref = agg < 10 ? live.length : PROBE_LANES;
-  return conn.lanePref;
-}
 
 async function speedP2p(peerId) {
   const { live } = await ensureChannel(peerId);
@@ -1668,12 +1758,17 @@ document.querySelectorAll('.tab').forEach((tab) => {
       pane.classList.toggle('active', pane.id === `pane-${name}`);
     });
     if (name === 'vault') refreshVault();
+    if (name === 'clipboard') refreshClipboard(true);
   });
 });
 
 renderPeers();
 refreshVault();
+refreshClipboard();
 connect();
 setInterval(() => {
   if ($('pane-vault').classList.contains('active')) refreshVault();
 }, 15000);
+setInterval(() => {
+  if ($('pane-clipboard').classList.contains('active')) refreshClipboard();
+}, 2000);

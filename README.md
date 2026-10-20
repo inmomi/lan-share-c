@@ -61,9 +61,9 @@ chmod +x lan-share-linux-amd64
 
 ---
 
-## 三种用法
+## 四种用法
 
-界面分三个标签页，对应三种用途。
+界面分四个标签页，对应四种用途。
 
 ### 设备直传
 
@@ -72,6 +72,10 @@ chmod +x lan-share-linux-amd64
 文件按字节范围切成多段，**最多 32 条并行通道**各自推一段，接收端按通道顺序拼回原文件。面板上会显示实际开了几路并行。
 
 传输过程中某条通道断了会自动退役换一条；已收到的字节会保留，重发同一个文件时**从断点续传**。
+
+### 共享剪贴板
+
+所有打开页面的设备共享服务端保存的最新一项内容。可以发布文字，也可以粘贴、拖放或选择 PNG/JPEG/GIF/WebP 图片；每个页面自动刷新，支持复制文字、预览或下载图片。单项上限 16 MiB。它是一个共享内容槽，不是设备间私信。
 
 ### 服务端文件库
 
@@ -203,19 +207,17 @@ bufferedAmountLowThreshold / addEventListener('message' | 'close')
 
 一个 `RTCPeerConnection` 只有一个 SCTP 关联，拥塞窗口、接收窗口、消息粒度全按关联算。实测同一对设备 TCP（SMB）能跑 30MB/s，而单条 DataChannel 只有 3.2MB/s——**瓶颈在每关联的机制里，不在链路上**，所以加带宽没用，只能加关联。
 
-因此每个对端开 32 条 lane，每条独立的 pc / ICE / DTLS / SCTP / 拥塞窗口，文件按字节范围切段并行推。
+每个对端最多开 32 条 lane，每条独立的 pc / ICE / DTLS / SCTP / 拥塞窗口，文件按字节范围切段并行推。
 
 注意：同一条关联上开多个 DataChannel **没有用**，它们共享同一个拥塞窗口。
 
-lane 数不硬编码。最优值随丢包变化，这是 CI 双 Chrome + `tc netem` 扫出来的（速率由对端计时）：
+初始直接用最多 16 条 lane 发送，不先跑测速探针。传输中的对端实收回执若显示吞吐偏低，下一次向该设备发送时升到当前可用的全部 lane；手动“网速测试”仍可单独运行。不同丢包条件下的 lane 扫描基线如下（速率由对端计时）：
 
 | 链路 | 4 条 | 8 条 | 16 条 | 32 条 |
 |---|---|---|---|---|
 | 无损 loopback（TCP 300+ MB/s） | 39 MB/s | 37 | 32 | 32 |
 | 5ms + 0.5% 丢包（TCP 26~38） | 6.4 | 11.7 | 11.0 | **13.5** |
 | 20ms + 2% 丢包（TCP 3.6~6.7） | 0.9 | 1.6 | 3.1 | **5.1** |
-
-所以每次连接先用 16 条探 4MB：聚合 ≥10MB/s 就用 16 条（省 CPU、吸收窗口小、数字稳），慢了才加满 32 条。结果按连接缓存，之后每趟传输实收速率明显变慢会自动升档（只升不降）。
 
 还有两个细节：
 
@@ -291,6 +293,10 @@ pacing 集中在 `public/p2p-pump.js`：高水位 2MB、低水位 1MB，**窗口
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET | `/api/files` | 文件列表 `{ files: [{name,size,sizeText,mtime}], total }` |
+| GET | `/api/clipboard` | 共享剪贴板元数据；没有内容时返回 404 |
+| GET | `/api/clipboard/data` | 下载当前共享文字或图片原始内容 |
+| POST | `/api/clipboard?kind=text\|image&mime=...&name=...` | 覆盖共享剪贴板；支持文字和 PNG/JPEG/GIF/WebP 图片，单项最大 16 MiB |
+| DELETE | `/api/clipboard` | 清空共享剪贴板 |
 | POST | `/api/upload?name=xxx` | 请求体为原始文件流，落盘；同名自动追加 `(1)` |
 | POST | `/api/upload?name=xxx&size=N&offset=M` | 分块上传。先写 `.lanshare-parts/<sha1(name\|size)>.part`，收满 `size` 字节才改名进文件库；返回 `done:false,received:N`。跳过未上传区域返回 409 |
 | GET | `/api/upload-status?name=xxx&size=N` | 查询半成品已收字节数 `{ received }`，续传前用它定位起点 |
@@ -320,7 +326,7 @@ make test                   # 编译 + 端到端
 node tools/test-relay.js    # 兜底通道单测（不需要服务端和浏览器）
 ```
 
-`test.js` 自己拉起服务、跑完 **122 项断言**再关掉，覆盖：静态托管与目录穿越防护、上传/下载/删除、中文与特殊文件名往返、5MB 与 16MB 文件逐字节完整性、WebSocket 信令全链路、上传断点续传、下载 `Range`、设备名记忆，以及用**假 DataChannel 跑 `p2p-pump.js` 的真代码**验证 64MB 一次性发完不抛"队列满"。
+`test.js` 自己拉起服务、跑完 **135 项断言**再关掉，覆盖：静态托管与目录穿越防护、上传/下载/删除、共享剪贴板文字与图片往返、中文与特殊文件名、5MB 与 16MB 文件逐字节完整性、WebSocket 信令全链路、上传断点续传、下载 `Range`、设备名记忆，以及用**假 DataChannel 跑 `p2p-pump.js` 的真代码**验证 64MB 一次性发完不抛"队列满"。
 
 `tools/test-relay.js` 是兜底通道的 **17 项**帧格式 / 切块上限 / 背压窗口单测。
 
