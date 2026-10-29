@@ -214,21 +214,43 @@ jobs:
 
       # 路由器 ARM/MIPS 没法在 x86 Runner 上直接跑，用 qemu-user 把刚编出来的
       # 二进制真跑一遍：起服务、请求首页和 /api/info，确认它不是"能编译但不能运行"。
+      #
+      # 包名要按发行版挑：ubuntu-24.04 及以前叫 qemu-user-static，从 26.04 起
+      # 该包被拆掉，只剩 qemu-user / qemu-user-binfmt，直接写死 qemu-user-static
+      # 会报 "has no installation candidate" 把整条发布流水线卡死（2026-10-29 踩过，
+      # ubuntu-latest 迁到 26.04 之后 arm64 和 armv7l 两档同时红）。
+      # 这里按顺序试候选，谁装上用谁，一个都不行才失败。
       - name: 实机冒烟 (Linux / 路由器目标，qemu)
         if: matrix.kind == 'zig'
         run: |
           set -e
           BIN="./${{ matrix.out }}"
+          install_qemu() {
+            sudo apt-get update -qq
+            for pkg in "${QEMU_PKGS[@]}"; do
+              if sudo apt-get install -y -qq "$pkg" >/dev/null 2>&1; then
+                echo "已安装 $pkg"; return 0
+              fi
+              echo "跳过 $pkg（无安装候选）"
+            done
+            echo "::error::qemu-user 装不上，候选: ${QEMU_PKGS[*]}"
+            return 1
+          }
           case "${{ matrix.target }}" in
             x86_64-linux-musl)    RUNNER="" ;;
-            aarch64-linux-musl)   sudo apt-get update -qq
-                                  sudo apt-get install -y -qq qemu-user-static
-                                  RUNNER="qemu-aarch64-static" ;;
-            arm-linux-musleabihf) sudo apt-get update -qq
-                                  sudo apt-get install -y -qq qemu-user-static
-                                  RUNNER="qemu-arm-static" ;;
+            aarch64-linux-musl)   RUNNER="qemu-aarch64" ;;
+            arm-linux-musleabihf) RUNNER="qemu-arm" ;;
             *) echo "::error::未覆盖的 target"; exit 1 ;;
           esac
+          if [ -n "$RUNNER" ]; then
+            QEMU_PKGS=(qemu-user-static qemu-user qemu-user-binfmt qemu)
+            install_qemu
+            # -static 后缀只存在于老包；新包不带后缀，按实际存在的挑
+            if ! command -v "$RUNNER" >/dev/null 2>&1 && command -v "$RUNNER-static" >/dev/null 2>&1; then
+              RUNNER="$RUNNER-static"
+            fi
+            command -v "$RUNNER" >/dev/null 2>&1 || { echo "::error::找不到 $RUNNER 可执行文件"; exit 1; }
+          fi
           $RUNNER "$BIN" -p 8098 -d ./uploads-qemu -w ./no-such-dir >/dev/null 2>&1 &
           SRV=$!
           code=000; info=000
