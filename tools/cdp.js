@@ -2,10 +2,10 @@
 
 /* 极简 Chrome DevTools Protocol 客户端。
  *
- * 为什么不用 puppeteer / playwright：这个仓库（尤其是 C 版）的卖点就是零依赖，
+ * 为什么不用 puppeteer / playwright：这个仓库的卖点就是零依赖，
  * 为了跑测试引一个几百 MB 的 npm 包不划算；而我们需要用到的 CDP 方法非常有限——
- * 导航、在页面里求值、自动点确认框、打开下载。Node 18+ 自带 WebSocket，
- * 直接跟 DevTools 的 WebSocket 对话就够了。
+ * 导航、在页面里求值、自动点确认框、打开下载。直接用 Node 自带的全局
+ * WebSocket（21 起提供，本项目用 22 验证）跟 DevTools 对话就够了。
  *
  * 只支持我们用到的那几个域：Page / Runtime / Browser 级别的下载开关。
  */

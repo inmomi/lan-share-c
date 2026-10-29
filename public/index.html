@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>LAN Share · 局域网文件分享</title>
+<link rel="icon" type="image/png" sizes="32x32" href="/favicon.png">
 <link rel="stylesheet" href="/style.css">
 </head>
 <body>
@@ -45,7 +46,6 @@
         <textarea id="clipboardText" rows="7" placeholder="输入要共享的文字"></textarea>
         <div class="clip-actions">
           <button id="publishClipboardText" class="btn primary">发布文字</button>
-          <button id="clearClipboard" class="btn">清空共享内容</button>
         </div>
         <div id="clipboardImageDrop" class="clipboard-image-drop" tabindex="0">
           <span>粘贴、拖入图片，或</span>
@@ -59,8 +59,12 @@
           <span id="clipboardStatus">正在读取</span>
         </div>
         <div id="clipboardPreview" class="clipboard-preview"></div>
-        <button id="copyClipboardText" class="btn hidden">复制文字</button>
-        <a id="downloadClipboardImage" class="btn hidden" download>下载图片</a>
+        <div class="clip-actions">
+          <button id="copyClipboardText" class="btn">复制文字</button>
+          <button id="clearCurrentClipboard" class="btn">清空当前共享框</button>
+          <button id="clearClipboard" class="btn">清空所有共享内容</button>
+          <a id="downloadClipboardImage" class="btn hidden" download>下载图片</a>
+        </div>
         <div class="clipboard-history-head">
           <strong>历史记录</strong>
           <span id="clipboardHistoryCount">0 条</span>
@@ -122,6 +126,17 @@
     <div class="modal-actions">
       <button id="modalNo" class="btn">拒绝</button>
       <button id="modalYes" class="btn primary">接收</button>
+    </div>
+  </div>
+</div>
+
+<div id="tokenModal" class="modal hidden">
+  <div class="modal-card">
+    <h3>需要访问口令</h3>
+    <p>服务端开启了访问保护，请输入管理员提供的口令。</p>
+    <input id="tokenInput" class="token-input" type="password" autocomplete="current-password" placeholder="访问口令">
+    <div class="modal-actions">
+      <button id="tokenSubmit" class="btn primary">进入</button>
     </div>
   </div>
 </div>

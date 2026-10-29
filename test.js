@@ -1,20 +1,19 @@
 'use strict';
 /*
- * lan-share 端到端功能测试。Node 版与 C 版共用（两者 HTTP 接口与 WebSocket 协议一致）。
+ * lan-share 端到端功能测试。
  *
  * 用法：
  *   1) 服务已经在跑：
  *        BASE=http://127.0.0.1:8080 node test.js
- *   2) 让测试自己拉起服务（CI 推荐，跨平台行为一致，不用处理后台进程差异）：
- *        SPAWN="node server.js" node test.js
- *        SPAWN="./lan_share -p 8080 -d ./uploads -w ./public" node test.js
+ *   2) 让测试自己拉起服务（跨平台行为一致，不用处理后台进程差异）：
+ *        SPAWN="./lan-share -p 8080 -d ./uploads -w ./public" node test.js
  *
  * SPAWN 模式下脚本会启动子进程、轮询端口就绪、跑完全部用例后终止它。
  *
  * 覆盖：静态托管、目录穿越防护、上传/下载/删除、中文名、同名自动重命名、
- *       大文件完整性、WebSocket 信令全链路。
+ *       大文件完整性、WebSocket 信令全链路、p2p-pump 背压与分块边界。
  *
- * 零第三方依赖，但需要 Node >= 21 提供全局 WebSocket（CI 用 22）。
+ * 零第三方依赖，但需要 Node >= 21 提供全局 WebSocket（本项目用 22 验证）。
  */
 
 const http = require('http');
@@ -98,6 +97,9 @@ function req(method, path, body, extraHeaders) {
                 method,
                 path,
                 headers: {
+                    /* 服务端要求所有 mutating /api/* 带这个头（防 CSRF），
+                     * 不带的话 POST/DELETE 会直接 403。 */
+                    'X-Lan-Share-Request': '1',
                     ...(extraHeaders || {}),
                     ...(body ? { 'Content-Length': Buffer.byteLength(body) } : {}),
                 },
@@ -147,10 +149,13 @@ async function testStatic() {
 
 async function testTraversal() {
     console.log('\n--- 目录穿越防护 ---');
-    const raw = await req('GET', '/../' + (process.env.TRAVERSAL_PROBE || 'server.js'));
+    /* 探针必须指向"真实存在、且在静态目录之外"的文件：拿一个不存在的名字去试，
+     * 穿越成功也会因为文件不存在而回 404，测试等于永远绿。 */
+    const probe = process.env.TRAVERSAL_PROBE || 'lan_share.c';
+    const raw = await req('GET', '/../' + probe);
     check('明文 ../ 被拒', raw.status === 404 || raw.status === 403,
         `status=${raw.status}`);
-    const enc = await req('GET', '/%2e%2e%2f' + (process.env.TRAVERSAL_PROBE || 'server.js'));
+    const enc = await req('GET', '/%2e%2e%2f' + probe);
     check('编码 %2e%2e%2f 被拒', enc.status === 404 || enc.status === 403,
         `status=${enc.status}`);
     const deep = await req('GET', '/../../../../etc/passwd');
@@ -838,15 +843,7 @@ async function testPump() {
     check('队列满判定为可重试', pump.isRetryableSendError(queueFull) === true);
     check('普通网络错误不重试', pump.isRetryableSendError(new Error('网络中断')) === false);
 
-    /* 4. 分块计划：起点落在块边界、最后一块不足、空文件 */
-    const plan = pump.planBlocks(20 * MB, 0, 8 * MB);
-    check('20MB 按 8MB 切出 3 块', plan.length === 3, `${plan.length}`);
-    check('首块从 0 开始', plan[0].from === 0 && plan[0].want === 8 * MB);
-    check('末块不足一个整块', plan[2].from === 16 * MB && plan[2].want === 4 * MB);
-    check('空文件没有块', pump.planBlocks(0, 0, 8 * MB).length === 0);
-    check('起点超过文件大小返回空', pump.planBlocks(10, 100, 8 * MB).length === 0);
-
-    /* 5. 真正的回归：64MB 文件过一条 16MB 上限、1GB/s 的假通道，
+    /* 4. 真正的回归：64MB 文件过一条 16MB 上限、1GB/s 的假通道，
      *    必须一次发完、不抛队列满、缓冲从未越过上限、字节顺序正确。 */
     const file = fakeFile(64 * MB);
     const dc = new FakeDataChannel(pump.CHROME_DC_QUEUE_CAP, 1024 * 1024);
@@ -869,7 +866,7 @@ async function testPump() {
         progress.length > 0 && progress[progress.length - 1] === file.size
         && progress.every((n, i) => i === 0 || n > progress[i - 1]));
 
-    /* 6. 慢通道（64MB/s）也要能过，验证背压真的在起作用而不是靠运气 */
+    /* 5. 慢通道（64MB/s）也要能过，验证背压真的在起作用而不是靠运气 */
     const dc2 = new FakeDataChannel(pump.CHROME_DC_QUEUE_CAP, 64 * 1024);
     let sent2 = 0;
     try {
@@ -880,7 +877,7 @@ async function testPump() {
     check('慢通道同样发完且不越界', sent2 === 32 * MB && dc2.throws === 0
         && dc2.peak <= pump.CHROME_DC_QUEUE_CAP, `sent=${sent2} peak=${(dc2.peak / MB).toFixed(2)}MB`);
 
-    /* 7. 续传：从半路开始只发剩下的 */
+    /* 6. 续传：从半路开始只发剩下的 */
     const dc3 = new FakeDataChannel(pump.CHROME_DC_QUEUE_CAP, 1024 * 1024);
     let sent3 = 0;
     try {
@@ -891,7 +888,7 @@ async function testPump() {
     check('续传只发剩余部分', sent3 === file.size && dc3.receivedBytes === 32 * MB,
         `sent=${sent3} received=${dc3.receivedBytes}`);
 
-    /* 8. 发送节奏：窗口没打满时必须连续发，不能每块都等一次。
+    /* 7. 发送节奏：窗口没打满时必须连续发，不能每块都等一次。
      *
      *    曾经的写法是"每发一块都先 await waitDrain"，而 bufferedamountlow
      *    的阈值默认是 0、要等整队泄空才触发，实际放行全靠 50ms 轮询。
@@ -938,7 +935,7 @@ async function testPump() {
     check('突发发送同样不越 16MB 上限', dc8.peak <= pump.CHROME_DC_QUEUE_CAP,
         `peak=${(dc8.peak / MB).toFixed(2)}MB`);
 
-    /* 9. 并行 lane：区间切分必须首尾相接、不重不漏。
+    /* 8. 并行 lane：区间切分必须首尾相接、不重不漏。
      *    接收端是直接按 lane 顺序把各段拼回去的，这里漏一段或者重叠一段，
      *    文件就是坏的——而且是静默损坏，不到打开那一刻发现不了。 */
     const splitCases = [
@@ -963,7 +960,7 @@ async function testPump() {
     check('空区间切出零段', pump.splitRange(5, 5, 4).length === 0);
     check('lane 数为 0 时退化成 1 段', pump.splitRange(0, 10, 0).length === 1);
 
-    /* 10. 端到端：按 lane 切开、各自 pumpFile、再按 lane 顺序拼回，
+    /* 9. 端到端：按 lane 切开、各自 pumpFile、再按 lane 顺序拼回，
      *     必须和原文件逐字节一致。这条守的是并行传输的正确性——
      *     end 参数少截一段、某条 lane 多发一段，都会在这里现形。 */
     const parSize = 12 * MB;
@@ -1137,7 +1134,7 @@ async function testNameMemory() {
         const cmd = normalizeSpawn(process.env.SPAWN);
         /* 注意第二个参数是 argv 数组、第三个才是 options。
          * 写成 spawn(cmd, { shell: true }) 会把 options 当成 argv，
-         * Node 就会把整串 "node server.js" 当作可执行文件路径去找，直接 ENOENT。
+         * Node 就会把整串 "./lan-share -p 8080" 当作可执行文件路径去找，直接 ENOENT。
          * 统一走 shell 是为了让 SPAWN 支持 "./lan-share -p 8080 -d ./uploads" 这种带参数的写法。 */
         child = spawn(cmd, [], {
             shell: true,

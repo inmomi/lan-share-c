@@ -26,6 +26,8 @@ const outFile = path.resolve(process.argv[3] || path.join(__dirname, '..', 'web_
  * p2p-pump.js 必须在 app.js 之前加载（app.js 顶层就解构 LSPump）。 */
 const ASSETS = [
     { file: 'index.html', routes: ['/', '/index.html'] },
+    { file: 'login.html', routes: ['/login.html'] },
+    { file: 'favicon.png', routes: ['/favicon.png'] },
     { file: 'relay-channel.js', routes: ['/relay-channel.js'] },
     { file: 'p2p-pump.js', routes: ['/p2p-pump.js'] },
     { file: 'app.js', routes: ['/app.js'] },

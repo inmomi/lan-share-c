@@ -25,7 +25,7 @@
     'use strict';
 
     /* 背压靠 pumpFile 的 waitDrain：bufferedAmount 反映的是 inflight（未确认
-     * 字节），超过 DRAIN_LIMIT(2MB) 就停发。DataChannel 那边是 Chrome 内部
+     * 字节），超过 DRAIN_LIMIT(1MB) 就停发。DataChannel 那边是 Chrome 内部
      * 16MB 队列在兜着，这里没有，所以 inflight 必须如实反映对端进度——
      * 不限的话发送端会把服务端和接收端的内存吃光。 */
     /* 接收端每收到这么多字节回一次确认 */
@@ -110,7 +110,17 @@
             return;
         }
         var buf = data;
-        if (!(buf instanceof ArrayBuffer)) buf = buf && buf.buffer ? buf.buffer : null;
+        /* 上层现在按视图（ArrayBufferView + byteOffset/byteLength）传分块，
+         * 不能再一律取 .buffer——那会把整块 8MB 当成分块发出去，既超帧上限
+         * 又把后面的数据重复发一遍。 */
+        if (!(buf instanceof ArrayBuffer)) {
+            if (!buf || !(buf.buffer instanceof ArrayBuffer)) return;
+            if (buf.byteOffset === 0 && buf.byteLength === buf.buffer.byteLength) {
+                buf = buf.buffer;
+            } else {
+                buf = buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
+            }
+        }
         if (!buf) return;
         if (buf.byteLength > RELAY_CHUNK) {
             /* 超出单帧上限就切块：整帧超限会被服务端直接丢掉，

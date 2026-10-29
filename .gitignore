@@ -1,11 +1,13 @@
+uploads/*
+!uploads/.gitkeep
+/.Trash-0/
 lan-share
 lan-share.exe
 *.o
 *.tgz
 toolchain/
 *-cross/
-uploads/*
-!uploads/.gitkeep
 *.log
 .DS_Store
 Thumbs.db
+/web_assets.h

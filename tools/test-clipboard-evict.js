@@ -47,7 +47,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function req(method, path, body, headers) {
     return new Promise((resolve, reject) => {
-        const h = Object.assign({}, headers || {});
+        const h = Object.assign({ 'X-Lan-Share-Request': '1' }, headers || {});
         if (body) h['Content-Length'] = String(body.length);
         const r = http.request({ host: '127.0.0.1', port: PORT, method, path, headers: h }, (res) => {
             const chunks = [];

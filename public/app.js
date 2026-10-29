@@ -20,15 +20,18 @@ const UI_TICK = 120;
 const STREAM_SAVE_THRESHOLD = 32 * 1024 * 1024;
 const STREAM_ACK_WINDOW = 4 * 1024 * 1024;
 
-const NAME_KEY = 'lanshare.deviceName';
+/* v2：服务端改成"主机1、主机2…"编号，旧的随机动物名（安静鲸鱼之类）在
+ * 同一个出口 IP 下会重复，换 key 让老浏览器重新分配一次。 */
+const NAME_KEY = 'lanshare.deviceName.v2';
 
 const state = {
   myId: null,
   myName: '',
   peers: [],
   conns: new Map(),
-  queue: Promise.resolve(),
+  sendQueues: new Map(),
   incoming: null,
+  reconnectDelay: 2000,
   /* 非空表示本连接正在接收对端的测速流量，此时二进制消息只计数不当文件。
    * 计数状态按连接存（conn.speedtest），不是全局——挂在全局会让一个连接的
    * 测速流量把另一个连接的文件分块吞掉。 */
@@ -37,18 +40,86 @@ const state = {
   targetPeer: null,
   clipboardUpdated: null,
   clipboardSelectedId: null,
+  /* 共享框当前显示的内容，供常驻的复制按钮使用；两者最多一个非 null */
+  clipboardText: null,
+  clipboardImageUrl: null,
+  /* 上次 /api/clipboard 的 ETag，没变化时服务端直接回 304 */
+  clipboardEtag: null,
+  /* 可选访问口令；null 表示服务端没开或还没输入 */
+  token: null,
+  tokenPrompting: false,
   /* 剪贴板预览的渲染序号：并发的两次刷新只有最后一次能落 DOM */
   clipboardRenderSeq: 0,
-  modalResolve: null,
-  modalAccept: null,
+  modalResolve: null,   /* 当前正在显示的弹窗的 resolve */
+  modalAccept: null,    /* 当前正在显示的弹窗的 onAccept */
+  modalQueue: [],       /* 待显示的弹窗（FIFO），见 confirmDialog */
   /* 接收方未完成的半成品，按 fileId 存。通道断了不清空，
    * 对端重发同一个文件时用它里的 received 作为续传起点。 */
   resume: new Map(),
   dirty: new Set(),
 };
 
+const MAX_RESUME_SLOTS = 8;
+function resumeSet(fileId, inc) {
+  if (state.resume.size >= MAX_RESUME_SLOTS && !state.resume.has(fileId)) {
+    const oldest = state.resume.keys().next().value;
+    if (oldest !== undefined) state.resume.delete(oldest);
+  }
+  state.resume.set(fileId, inc);
+}
+
 const $ = (id) => document.getElementById(id);
 const makeId = () => Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
+
+/* ------------------------------------------------------------- 访问口令 */
+
+const TOKEN_KEY = 'lanshare.token';
+
+/* 支持一次性 ?token=xxx 链接：存起来并从地址栏抹掉，避免留在历史记录里。
+ * 平时从 localStorage 读，刷新页面不用重新输入。 */
+function loadToken() {
+  try {
+    const url = new URL(location.href);
+    const fromUrl = url.searchParams.get('token');
+    if (fromUrl) {
+      url.searchParams.delete('token');
+      history.replaceState(null, '', url.pathname + url.search + url.hash);
+      localStorage.setItem(TOKEN_KEY, fromUrl);
+      return fromUrl;
+    }
+    return localStorage.getItem(TOKEN_KEY) || null;
+  } catch (_) {
+    return null;
+  }
+}
+state.token = loadToken();
+
+/* 所有 /api/* 请求统一带上 CSRF 头和可选口令。用包装 fetch 而不是改几十个
+ * 调用点，新增接口也不会漏。 */
+const nativeFetch = window.fetch.bind(window);
+window.fetch = (input, init) => {
+  const url = typeof input === 'string' ? input : (input && input.url) || '';
+  if (!url.startsWith('/api/')) return nativeFetch(input, init);
+  const opts = Object.assign({}, init);
+  const headers = new Headers(opts.headers || undefined);
+  headers.set('X-Lan-Share-Request', '1');
+  if (state.token) headers.set('X-Lan-Share-Token', state.token);
+  opts.headers = headers;
+  return nativeFetch(input, opts).then((res) => {
+    if (res.status === 401 && state.token) {
+      state.token = null;
+      try { localStorage.removeItem(TOKEN_KEY); } catch (_) { /* ignore */ }
+      showTokenModal();
+    }
+    return res;
+  });
+};
+
+/* <img> / <a download> / XMLHttpRequest 不能带自定义头，只能把口令放查询串。 */
+function apiUrl(url) {
+  if (!state.token) return url;
+  return `${url}${url.includes('?') ? '&' : '?'}token=${encodeURIComponent(state.token)}`;
+}
 
 function esc(text) {
   return String(text).replace(/[&<>"']/g, (c) => ({
@@ -56,9 +127,11 @@ function esc(text) {
   }[c]));
 }
 
+/* 单位跟随数量级：最小单位 KB，往上是 MB / GB / TB（1024 进制）。
+ * 个位数保留两位小数，否则 84 字节会显示成 "0.0 KB"，看不出量级。 */
 function humanSize(bytes) {
-  const n = Number(bytes) || 0;
-  if (n < 1024) return `${n} B`;
+  const n = Math.max(0, Number(bytes) || 0);
+  if (n === 0) return '0 KB';
   const units = ['KB', 'MB', 'GB', 'TB'];
   let value = n / 1024;
   let idx = 0;
@@ -66,12 +139,27 @@ function humanSize(bytes) {
     value /= 1024;
     idx += 1;
   }
-  return `${value.toFixed(value >= 100 || idx === 0 ? 0 : 1)} ${units[idx]}`;
+  const digits = value < 1 ? 2 : (value < 100 ? 1 : 0);
+  return `${value.toFixed(digits)} ${units[idx]}`;
+}
+
+/* id → 名字的缓存。对端一掉线 peers 里就没有它了，但提示需要说出是谁，
+ * 不然只能显示"已断开的设备"。只保留最近 64 条，别无限长。 */
+const peerNameById = new Map();
+
+function rememberPeerName(id, name) {
+  if (!id) return;
+  peerNameById.delete(id);
+  peerNameById.set(id, name);
+  while (peerNameById.size > 64) {
+    peerNameById.delete(peerNameById.keys().next().value);
+  }
 }
 
 function peerName(id) {
   const peer = state.peers.find((p) => p.id === id);
-  return peer ? peer.name : '已断开的设备';
+  if (peer) return peer.name;
+  return peerNameById.get(id) || '已断开的设备';
 }
 
 /* 设备名持久化。
@@ -105,7 +193,14 @@ function humanSpeed(bytesPerSecond) {
 
 /* ------------------------------------------------------------------ toasts */
 
+/* 同一句话 4 秒内只弹一次。对端掉线时，各条 lane 会各自重发一次信令，
+ * 服务端每条都回 signal-lost——不合并的话一次断线能连弹十几个相同的提示。 */
+const toastRecent = new Map();
+
 function toast(message, ms = 3200) {
+  const now = Date.now();
+  if ((toastRecent.get(message) || 0) + 4000 > now) return;
+  toastRecent.set(message, now);
   const el = document.createElement('div');
   el.className = 'toast';
   el.textContent = message;
@@ -115,21 +210,40 @@ function toast(message, ms = 3200) {
 
 /* ------------------------------------------------------------------- modal */
 
-function confirmDialog(title, body, onAccept) {
-  $('modalTitle').textContent = title;
-  $('modalBody').textContent = body;
+/* 弹窗 DOM 只有一个，但请求可能同时来好几个（多台设备同时发文件）。
+ * 用真正的 FIFO 队列：来一个排一个，关掉当前再显示下一个。
+ * 曾用"把上一个 resolve 串起来"的写法，那只能串两个：第三个进来时
+ * show() 会把 modalResolve 覆盖成自己的，中间的请求就永远等不到结果。 */
+function showNextModal() {
+  const item = state.modalQueue[0];
+  if (!item) {
+    state.modalResolve = null;
+    state.modalAccept = null;
+    return;
+  }
+  $('modalTitle').textContent = item.title;
+  $('modalBody').textContent = item.body;
   $('modal').classList.remove('hidden');
+  state.modalResolve = item.resolve;
+  state.modalAccept = item.onAccept;
+}
+
+function confirmDialog(title, body, onAccept) {
   return new Promise((resolve) => {
-    state.modalResolve = resolve;
-    state.modalAccept = onAccept || null;
+    state.modalQueue.push({ title, body, onAccept: onAccept || null, resolve });
+    if (state.modalQueue.length === 1) showNextModal();
   });
 }
 
 function closeModal(result) {
-  $('modal').classList.add('hidden');
-  const resolve = state.modalResolve;
+  const item = state.modalQueue.shift();
+  const resolve = item ? item.resolve : state.modalResolve;
   state.modalResolve = null;
   state.modalAccept = null;
+  $('modal').classList.add('hidden');
+  /* 先显示下一个再 resolve：这样 Promise 的后续逻辑（发 file-accept 等）
+   * 不会和弹窗切换抢同一个时序，用户看到的是"关掉一个立刻弹出下一个"。 */
+  if (state.modalQueue.length) showNextModal();
   if (resolve) resolve(result);
 }
 
@@ -152,17 +266,69 @@ $('modalYes').addEventListener('click', async () => {
 });
 $('modalNo').addEventListener('click', () => closeModal(false));
 
+/* ------------------------------------------------------------- 口令弹窗 */
+
+function showTokenModal() {
+  if (state.tokenPrompting) return;
+  state.tokenPrompting = true;
+  $('tokenModal').classList.remove('hidden');
+  $('tokenInput').value = '';
+  setTimeout(() => $('tokenInput').focus(), 30);
+}
+
+function hideTokenModal() {
+  state.tokenPrompting = false;
+  $('tokenModal').classList.add('hidden');
+}
+
+async function submitToken() {
+  const value = $('tokenInput').value.trim();
+  if (!value) return;
+  state.token = value;
+  const res = await fetch('/api/info', { cache: 'no-store' });
+  if (!res.ok) {
+    state.token = null;
+    try { localStorage.removeItem(TOKEN_KEY); } catch (_) { /* ignore */ }
+    toast('口令错误，请重试');
+    $('tokenInput').select();
+    return;
+  }
+  try { localStorage.setItem(TOKEN_KEY, value); } catch (_) { /* ignore */ }
+  hideTokenModal();
+  if (ws) {
+    try { ws.close(); } catch (_) { /* ignore */ }
+    ws = null;
+  }
+  connect();
+  refreshVault();
+  refreshClipboard(true);
+}
+
+$('tokenSubmit').addEventListener('click', submitToken);
+$('tokenInput').addEventListener('keydown', (event) => {
+  if (event.key === 'Enter') submitToken();
+});
+
 /* --------------------------------------------------------------- signalling */
 
 let ws = null;
 
 function connect() {
+  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  ws = new WebSocket(`${proto}//${location.host}/ws`);
+  const params = new URLSearchParams();
+  if (state.token) params.set('token', state.token);
+  /* 名字随握手一起带上：服务端据此保持同一个"主机N"，刷新不换号。
+   * 第一次来没有存过名字，服务端会分配一个新编号。 */
+  const savedName = loadSavedName();
+  if (savedName) params.set('name', savedName);
+  const qs = params.toString();
+  ws = new WebSocket(`${proto}//${location.host}/ws${qs ? '?' + qs : ''}`);
   /* 兜底数据通道直接收 ArrayBuffer，省掉一次 Blob→ArrayBuffer 的异步转换 */
   ws.binaryType = 'arraybuffer';
 
   ws.addEventListener('open', () => {
+    state.reconnectDelay = 2000;
     const saved = loadSavedName();
     if (saved) {
       state.myName = saved;
@@ -215,11 +381,22 @@ function connect() {
       renderPeers();
     } else if (msg.type === 'peers') {
       state.peers = msg.peers.filter((p) => p.id !== state.myId);
+      for (const p of state.peers) rememberPeerName(p.id, p.name);
+      /* 对端刷新/重连后 id 会变。旧 id 的连接不扔掉的话，它上面的 lane 还会
+       * 继续往一个不存在的 id 发信令，服务端每条都回 signal-lost——这就是
+       * "一台设备一直弹目标设备已离线"的来源。 */
+      const online = new Set(state.peers.map((p) => p.id));
+      for (const id of [...state.conns.keys()]) {
+        if (!online.has(id)) dropConn(id);
+      }
       renderPeers();
     } else if (msg.type === 'signal') {
       handleSignal(msg.from, msg.data);
     } else if (msg.type === 'signal-lost') {
-      toast('目标设备已离线');
+      const who = msg.to ? peerName(msg.to) : '';
+      dropConn(msg.to);
+      renderPeers();
+      toast(who ? `${who} 已离线` : '目标设备已离线');
     }
   });
 
@@ -234,8 +411,8 @@ function connect() {
       at: Date.now(),
       sent: ws ? ws.bufferedAmount : -1,
     };
-    /* 也往控制台打一份：CI 会把页面 console 汇到日志里，这样"谁在哪一刻断的"
-     * 和服务端日志能对上时间轴，不用两边猜。 */
+    /* 也往控制台打一份：出问题时把页面 console 和服务端日志按时间轴对一遍，
+     * 就知道"谁在哪一刻断的"，不用两边猜。 */
     console.log('[lan-share] 信令已断:', JSON.stringify(window.__wsClose),
                 '我=', state.myId, '已有连接=', state.conns.size);
     state.peers = [];
@@ -249,7 +426,15 @@ function connect() {
       }
     }
     renderPeers();
-    setTimeout(connect, 2000);
+    const delay = state.reconnectDelay || 2000;
+    state.reconnectDelay = Math.min((state.reconnectDelay || 2000) * 2, 30000);
+    setTimeout(() => {
+      /* 口令弹窗期间不要空转重连：错误口令会把服务端日志刷满 */
+      if (!state.tokenPrompting) connect();
+    }, delay);
+  });
+  ws.addEventListener('error', () => {
+    console.log('[lan-share] 信令 WebSocket 错误');
   });
 }
 
@@ -284,10 +469,12 @@ const RELAY_ACK_EVERY = LSRelay.RELAY_ACK_EVERY;
 /* 直连宽限期：这段时间内一条 lane 都没开，就认定直连不可用、降级到兜底。
  * 不能等到 LANE_OPEN_TIMEOUT(20s)——用户只会看到界面没反应。 */
 const DIRECT_GRACE_MS = 9000;
-/* 已经有 lane 打开之后，连续这么久没有新 lane 打开就开工（见 ensureChannel）。
- * LANE_SETTLE_MAX_MS 是硬上限，防止一直有 lane 慢慢开而拖太久。 */
-const LANE_SETTLE_MS = 1500;
-const LANE_SETTLE_MAX_MS = 12000;
+/* 首包只等"够用的一批"lane：32 条全部错开发完 offer 要 3s 上下，等齐了再传，
+ * 用户看到的就是"点了发送没反应"（实测 16MB 只要 0.17s 传完，整单却要 6.7s，
+ * 全耗在等 lane）。够 START_BATCH_LANES 条、或首条开好后再等 START_GRACE_MS
+ * 就开工；剩下的 lane 在后台继续建，下一次传输直接用。 */
+const START_BATCH_LANES = 16;
+const START_GRACE_MS = 1500;
 
 /* 兜底通道的出站口：控制消息走信令 JSON，数据帧直接投给 WebSocket。
  * 单独抽出来是为了让 RelayChannel 本身不依赖页面全局（ws / send），
@@ -381,6 +568,26 @@ function getConn(peerId) {
   for (let i = 0; i < LANES; i++) conn.lanes.push(makeLane(conn, i));
   state.conns.set(peerId, conn);
   return conn;
+}
+
+/** 丢掉某个对端的连接状态（对端离线，或刷新后换了 id）。
+ * 不清理的话，旧 pc 上的 ICE/DTLS 还会继续往旧 id 发信令，服务端每收到
+ * 一条就回一条 signal-lost，界面表现就是"一直弹对方已离线"。
+ * *不* 负责渲染，调用方自己决定什么时候重画。 */
+function dropConn(peerId) {
+  if (!peerId) return;
+  const conn = state.conns.get(peerId);
+  if (conn) {
+    for (const lane of conn.lanes.slice()) {
+      try { if (lane.pc) lane.pc.close(); } catch (_) { /* 已经关了 */ }
+    }
+    if (conn.relay) {
+      try { conn.relay.dc.close(); } catch (_) { /* 已经关了 */ }
+      conn.relay = null;
+    }
+    state.conns.delete(peerId);
+  }
+  if (state.targetPeer === peerId) state.targetPeer = null;
 }
 
 /* 构造 ICE 服务器列表：基础 STUN 永远在；若页面被服务端注入了 TURN 配置
@@ -488,16 +695,19 @@ function attachChannel(lane, dc) {
 async function initiate(peerId) {
   const conn = getConn(peerId);
   const pending = conn.lanes.filter((l) => !l.dc);
-  /* 逐条建立、每条之间留 150ms。真实局域网里 Chrome 默认把 host 候选伪装成
-   * mDNS .local 名字，32 条同时建会瞬间灌出 60+ 个 mDNS 组播查询，操作系统
-   * 大量丢弃 → 多数候选永远解析不出、对应 lane 的 ICE 连不上（典型症状：
-   * 回环能开 32 条、真机只开 1~4 条、速度卡在单关联 ~5MB/s）。一条一条来，
-   * mDNS 查询错开，几乎每条都能解析出真实 IP，32 条基本全开；而且每条走的是
-   * 干净的直接 host 连接，单关联速度也会从"mDNS 降级路径"回到正常的几十
-   * MB/s——这样少量 lane 就能跑满千兆。 */
-  const GAP = 150;
-  for (const l of pending) {
-    await initiateLane(conn, l);
+  /* 分两段建，兼顾"首包快"和"别把 mDNS 打爆"：
+   *   - 第一段 8 条并发（8 个 offer ≈ 十几个 mDNS 查询，系统扛得住），
+   *     首条 lane 通常在 100~300ms 内 open，传输立刻就能开工；
+   *   - 其余继续按 120ms 错开发 offer（32 条同时建会一口气灌出 60+ 个组播
+   *     查询，被内核丢弃后多数候选解析不出来，真机只剩 1~4 条 lane）。
+   * 注意这里只等 offer 发完，不等 ICE 连通——连通由 ensureChannel 轮询。 */
+  const FIRST_WAVE = 8;
+  const GAP = 120;
+  await Promise.all(pending.slice(0, FIRST_WAVE).map(
+    (l) => initiateLane(conn, l).catch(() => {})
+  ));
+  for (const l of pending.slice(FIRST_WAVE)) {
+    initiateLane(conn, l).catch(() => {});
     await new Promise((r) => setTimeout(r, GAP));
   }
   return conn;
@@ -593,18 +803,24 @@ const LANE_OPEN_TIMEOUT = 20000;
 async function ensureChannel(peerId) {
   let conn = state.conns.get(peerId);
   if (!conn) conn = getConn(peerId);
-  /* initiate 里 32 条 lane 是错开 150ms 逐条 offer 的（避免 mDNS 查询风暴），
-   * 全部发完要约 4.8s。不能等它全部 settle 再判断能不能直连——那样光"发现
+  /* initiate 里首段 8 条并发 offer，其余按 120ms 错开（避免 mDNS 查询风暴），
+   * 全部发完要约 3s。不能等它全部 settle 再判断能不能直连——那样光"发现
    * 直连不可用"就要二十几秒。这里让它跑着，同时轮询已经 open 的 lane。 */
   let initiating = Promise.resolve(conn);
   if (conn.lanes.some((l) => !l.dc)) initiating = initiate(peerId);
 
+  /* 后台把剩下的 lane 开完，失败不影响本次传输 */
+  initiating.catch(() => {});
+
   const graceEnd = Date.now() + DIRECT_GRACE_MS;
+  const batchEnd = Date.now() + START_GRACE_MS;
   let live = [];
   for (;;) {
     live = conn.lanes.filter((l) => l.dc && l.dc.readyState === 'open');
-    if (live.length || Date.now() >= graceEnd) break;
-    await new Promise((r) => setTimeout(r, 200));
+    if (live.length >= START_BATCH_LANES) break;      /* 够一批，开工 */
+    if (live.length > 0 && Date.now() >= batchEnd) break;  /* 首条已开，等到期就开工 */
+    if (Date.now() >= graceEnd) break;                /* 一条都没有，走兜底 */
+    await new Promise((r) => setTimeout(r, 60));
   }
 
   if (!live.length) {
@@ -623,31 +839,13 @@ async function ensureChannel(peerId) {
     return { conn, live: [relay], mode: 'relay' };
   }
 
-  /* 已经开了一部分，再等一会儿让其余 lane 赶上（多开几条换吞吐的收益）。
-   *
-   * 这里原来是 Promise.all 等每条 lane 的 ready、每条各带 20s 超时：只要
-   * 32 条里少开一条（真机上的常态），就要**白等整整 20 秒**才开始传，用户
-   * 看到的就是"点了发送没反应"。改成自适应收敛——连续 LANE_SETTLE_MS 没有
-   * 新的 lane 打开就走，既不会为开不了的 lane 干等，也能把谈好的都收进来。 */
-  let seen = -1;
-  let stableSince = Date.now();
-  const settleEnd = Date.now() + LANE_SETTLE_MAX_MS;
-  for (;;) {
-    live = conn.lanes.filter((l) => l.dc && l.dc.readyState === 'open');
-    if (live.length !== seen) {
-      seen = live.length;
-      stableSince = Date.now();
-    }
-    if (Date.now() - stableSince >= LANE_SETTLE_MS) break;
-    if (Date.now() >= settleEnd) break;
-    await new Promise((r) => setTimeout(r, 200));
-  }
-  await initiating.catch(() => {});
+  /* 已经够一批了，不再等其余 lane——它们还在后台握手，下次传输直接受益。
+   * 只退役明确失败/已关闭的 lane：还在 connecting 的留着，否则刚谈好就被
+   * 我们自己掐掉，永远凑不满一批。 */
   live = conn.lanes.filter((l) => l.dc && l.dc.readyState === 'open');
-  /* 没打开的 lane 退役掉：半开的 pc 留着只会漏资源，且下一次会在这里重建。
-   * 先拷贝再遍历——retireLane 会往 conn.lanes 里写新对象。 */
   for (const l of conn.lanes.slice()) {
-    if (!live.includes(l) && l.dc) retireLane(l);
+    const st = l.pc ? l.pc.connectionState : 'closed';
+    if (st === 'failed' || st === 'closed') retireLane(l);
   }
   if (!live.length) throw new Error('点对点通道未就绪');
   return { conn, live, mode: 'p2p' };
@@ -687,13 +885,14 @@ async function sendOne(peerId, file) {
   });
   rec.fileId = fileId;
 
-  /* 不在真实文件前跑测速流。新链路先直接用默认并行度，随后按实收速率动态升档。
-   * 只广告真正会用的 lane——对端按交集数段数，
+  /* 不在真实文件前跑测速流。只广告真正会用的 lane——对端按交集数段数，
    * 广告 32 条却只用 16 条，对端会永远等不到收尾。 */
-  const want = live.length === 1 && live[0].relay
-    ? 1
-    : Math.min(conn.lanePref || PROBE_LANES, live.length);
-  if (!live[0].relay && !conn.lanePref) conn.lanePref = want;
+  /* 并行度 = 此刻所有已建立的 lane。曾经按 PROBE_LANES(16) 截断，还把这
+   * 个数字写进 conn.lanePref 冻结下来：第一次传输赶上 lane 刚开 8 条，就
+   * 只发 8 条；下一次 max(8,16)=16，32 条里永远只跑一半——真机上表现为
+   * "比上一版慢一倍"。lane 的建立本来就不受这个数影响（initiate 始终建满
+   * 32 条），这里没有理由不用。 */
+  const want = live.length === 1 && live[0].relay ? 1 : live.length;
   const chosen = live.slice(0, want);
 
   /* 控制消息走第一条活 lane，数据随后按范围铺到所用 lane 上。
@@ -725,14 +924,23 @@ async function sendOne(peerId, file) {
   /* 把 [start, size) 均分给活 lane。段与段首尾相接，接收端按 lane 顺序
    * 拼回去就是原文件——所以这里切的顺序不能乱，也不能漏段。
    * 每条 lane 是独立的 SCTP 关联，拥塞窗口互不影响：丢包链路上单关联
-   * 的窗口会坍缩，多关联并联是对抗手段（CI 实测 2% 丢包下 4 条 0.9MB/s、
-   * 32 条 5.1MB/s）。 */
+   * 的窗口会坍缩，多关联并联是对抗手段（tools/p2p-e2e.js --sweep：2% 丢包下
+   * 4 条 0.9MB/s、32 条 5.1MB/s）。 */
   /* 走的是哪一层必须让用户看见：直连 = "N 路并行"，兜底 = "服务器中转"。
    * 之前只有"点对点通道未就绪"一句报错，用户既不知道为什么、也没有退路。 */
   const laneLabel = (use.length === 1 && use[0].relay)
     ? '1 路 · 服务器中转（直连未建立）'
     : use.length + ' 路并行';
   const ranges = splitRange(start, file.size, use.length);
+  /* 空文件（size=0）或"上次已经全收完"（start=size）时 splitRange 返回空数组：
+   * 没有任何 lane 会发数据，也就没有任何 lane 会发 lane-end，接收端永远等不到
+   * 收尾，发送端一直停在"已发出，等待对端保存"。这里补一条 lane-end 让对端
+   * 走完收尾流程——接收端的 expectedLanes 也是 0，收到即齐。 */
+  if (!ranges.length && use[0].dc && use[0].dc.readyState === 'open') {
+    try {
+      use[0].dc.send(JSON.stringify({ t: 'lane-end', tid, ch: 0 }));
+    } catch (_) { /* 通道刚关：下面照样进入等待送达，失败由回执超时兜底 */ }
+  }
   const laneSent = use.map(() => 0);
   const sentTotal = () => start + laneSent.reduce((a, b) => a + b, 0);
   const report = () => {
@@ -767,30 +975,32 @@ async function sendOne(peerId, file) {
     });
   }));
 
-  /* 这一趟的对端实收速率（progress 回执算出来的）如果明显慢，下次给同一
-   * 对端直接加满 lane——链路变差不用等下次探测。只升不降，避免抖动。 */
-  const moved = Math.max(0, rec.acked - start);
-  const secs = (Date.now() - sendStart) / 1000;
-  if (moved > 4 * 1024 * 1024 && secs > 0.5
-    && moved / secs < ESCALATE_BELOW && conn.lanePref < live.length) {
-    conn.lanePref = live.length;
-  }
-
   /* 全部 lane-end 都已发出，本端不再发数据。但"已送达"要等对端 file-done
    * 回执才算数——此刻对端可能还有几十 MB 在队列里没落盘，这里把进度拉满、
    * acked 也拉满，会让发送端显示冲到接收端前面一大截、速率飙上天（就是
    * 用户看到的"做过山车"）。所以只标 sent，进度仍由对端回执驱动。 */
   updateTransfer(tid, { status: '已发出，等待对端保存', sent: file.size });
+
+  /* 对端同一时刻只接收一个文件（state.incoming 是单槽位）。这里等"已送达"
+   * 回执再返回，sendQueues 才能把同一对端的多次发送真正串起来——否则第二个
+   * 文件会在第一个还没落盘时开传，接收端只能中断前一个，发送端则永远停在
+   * "已发出，等待对端保存"。回执迟到不应卡死队列，超时就放行。 */
+  const ackDeadline = Date.now() + 60000;
+  while (!rec.done && !rec.failed && Date.now() < ackDeadline) {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
 }
 
 function enqueueSend(peerId, file) {
-  state.queue = state.queue.then(() => sendOne(peerId, file)).catch((err) => {
+  /* 按对端分组队列：给 A 发大文件不再阻塞给 B 发文件 */
+  const q = state.sendQueues.get(peerId) || Promise.resolve();
+  state.sendQueues.set(peerId, q.then(() => sendOne(peerId, file)).catch((err) => {
     const rec = [...state.transfers.values()].reverse().find(
       (r) => r.file === file && !r.done
     );
     if (rec) updateTransfer(rec.tid, { status: `发送失败：${err.message}`, failed: true });
     toast(`发送「${file.name}」失败：${err.message}`);
-  });
+  }));
 }
 
 function onChannelMessage(lane, data) {
@@ -824,6 +1034,15 @@ function onChannelMessage(lane, data) {
       /* 对端已组装落盘，发送端这才算真正送达——而不是本端把字节交给
        * 发送队列就当完事（那种假完成会让发送端进度冲到接收端前面一大截）。 */
       updateTransfer(msg.tid, { acked: Number(msg.received) || 0, status: '已送达', done: true });
+    } else if (msg.t === 'file-abort') {
+      /* 对端明确放弃了这次接收（被新任务顶掉等）。不标失败的话发送端会一直
+       * 停在"已发出，等待对端保存"，用户以为还在传。 */
+      const ab = state.transfers.get(msg.tid);
+      if (ab && !ab.done && !ab.failed) {
+        updateTransfer(msg.tid, {
+          status: `对端中断接收：${msg.reason || '被新任务打断'}`, failed: true,
+        });
+      }
     } else if (msg.t === 'file-accept' || msg.t === 'file-reject') {
       const resolve = state.pendingAccept.get(msg.tid);
       if (resolve) {
@@ -1056,8 +1275,22 @@ async function askReceive(lane, msg) {
       saved: 0,
     };
   });
+  /* 并发保护：已有未完成的接收时先妥善中断它（存为可续传），
+   * 避免被新文件无条件覆盖导致静默数据损坏。真并发需按 tid 重构，此处先止损。 */
+  if (state.incoming && state.incoming !== inc && !state.incoming.done) {
+    const preempted = state.incoming;
+    markInterrupted(null);
+    /* 必须告诉发送端这个 tid 已被顶掉，否则它永远停在"等待对端保存"。 */
+    if (lane.dc && lane.dc.readyState === 'open') {
+      try {
+        lane.dc.send(JSON.stringify({
+          t: 'file-abort', tid: preempted.tid, reason: '对端开始接收新文件',
+        }));
+      } catch (_) { /* 通道正在关，发送端靠回执超时兜底 */ }
+    }
+  }
   state.incoming = inc;
-  if (inc.fileId) state.resume.set(inc.fileId, inc);
+  if (inc.fileId) resumeSet(inc.fileId, inc);
 
   addTransfer({
     tid: msg.tid, name: msg.name, size: msg.size, dir: 'down', peerId: lane.peerId, peerLabel: from,
@@ -1086,8 +1319,8 @@ function markInterrupted(lane) {
    * 接，界面就停在传了几 MB 然后中断，对端却还在发（最终"发送未完成"）。
    *
    * 断点落在哪完全由两条时间轴的相对快慢决定（兜底吞吐 × 首条 lane 判死刑的
-   * 时刻），所以真机上看起来是"19.7MB 与 32.6MB 之间随机断"，CI 里则表现为
-   * 同一份代码时绿时红。 */
+   * 时刻），所以真机上看起来是"19.7MB 与 32.6MB 之间随机断"，自动化测试里则
+   * 表现为同一份代码时绿时红。 */
   if (lane && inc.lanes && !inc.lanes.has(lane)) return;
 
   state.incoming = null;
@@ -1108,7 +1341,7 @@ function markInterrupted(lane) {
       .then(() => {
         inc.writer = null;
         if (inc.fileId && inc.received > 0 && inc.received < inc.size) {
-          state.resume.set(inc.fileId, inc);
+          resumeSet(inc.fileId, inc);
           updateTransfer(inc.tid, {
             status: `已中断（${humanSize(inc.received)}），可续传`, failed: true,
           });
@@ -1124,7 +1357,7 @@ function markInterrupted(lane) {
     return;
   }
   if (inc.fileId && inc.received > 0 && inc.received < inc.size) {
-    state.resume.set(inc.fileId, inc);
+    resumeSet(inc.fileId, inc);
     updateTransfer(inc.tid, { status: `已中断（${humanSize(inc.received)}），可续传`, failed: true });
   } else {
     updateTransfer(inc.tid, { status: '已中断', failed: true });
@@ -1282,6 +1515,10 @@ function updateTransfer(tid, patch) {
       }
     }
   }
+  if ((rec.done || rec.failed) && !rec._cleanupScheduled) {
+    rec._cleanupScheduled = true;
+    setTimeout(() => { state.transfers.delete(tid); if (rec.el) rec.el.remove(); }, 5 * 60 * 1000);
+  }
   state.dirty.add(tid);
 }
 
@@ -1423,7 +1660,7 @@ async function refreshVault() {
 
     li.querySelector('[data-act="dl"]').addEventListener('click', () => {
       const a = document.createElement('a');
-      a.href = `/api/download?name=${encodeURIComponent(file.name)}`;
+      a.href = apiUrl(`/api/download?name=${encodeURIComponent(file.name)}`);
       a.download = file.name;
       document.body.appendChild(a);
       a.click();
@@ -1432,10 +1669,14 @@ async function refreshVault() {
 
     li.querySelector('[data-act="rm"]').addEventListener('click', async () => {
       if (!window.confirm(`确定删除「${file.name}」？`)) return;
-      const res = await fetch(`/api/files?name=${encodeURIComponent(file.name)}`, { method: 'DELETE' });
-      const body = await res.json();
-      toast(body.ok ? '已删除' : `删除失败：${body.error || '未知错误'}`);
-      refreshVault();
+      try {
+        const res = await fetch(`/api/files?name=${encodeURIComponent(file.name)}`, { method: 'DELETE' });
+        const body = await res.json();
+        toast(body.ok ? '已删除' : `删除失败：${body.error || '未知错误'}`);
+        refreshVault();
+      } catch (err) {
+        toast('删除失败：网络错误');
+      }
     });
 
     list.appendChild(li);
@@ -1449,6 +1690,12 @@ function clipboardForm(kind, mime, name) {
 
 async function publishClipboard(kind, mime, name, blob) {
   const status = $('clipboardStatus');
+  /* 空内容没有意义，发上去只会给所有人留一条空记录；服务端也会拒。 */
+  if (!blob || blob.size === 0) {
+    status.textContent = '';
+    toast('内容为空，未发布');
+    return false;
+  }
   status.textContent = '正在发布';
   try {
     const res = await fetch(clipboardForm(kind, mime, name), {
@@ -1463,9 +1710,11 @@ async function publishClipboard(kind, mime, name, blob) {
     state.clipboardDirty = false;
     toast(kind === 'text' ? '文字已发布到共享剪贴板' : '图片已发布到共享剪贴板');
     await refreshClipboard(true);
+    return true;
   } catch (err) {
     status.textContent = '发布失败';
     toast(`共享剪贴板发布失败：${err.message}`);
+    return false;
   }
 }
 
@@ -1495,13 +1744,17 @@ function renderClipboardHistory(items, selectedId) {
     remove.className = 'clipboard-history-delete';
     remove.textContent = '删除';
     remove.addEventListener('click', async () => {
-      const res = await fetch(`/api/clipboard?id=${item.id}`, { method: 'DELETE' });
-      if (!res.ok) {
-        toast('删除历史记录失败');
-        return;
+      try {
+        const res = await fetch(`/api/clipboard?id=${item.id}`, { method: 'DELETE' });
+        if (!res.ok) {
+          toast('删除历史记录失败');
+          return;
+        }
+        state.clipboardUpdated = null;
+        await refreshClipboard(true);
+      } catch (err) {
+        toast('删除历史记录失败：网络错误');
       }
-      state.clipboardUpdated = null;
-      await refreshClipboard(true);
     });
     row.append(select, remove);
     list.appendChild(row);
@@ -1523,40 +1776,22 @@ async function showClipboardItem(meta, items) {
     const text = meta.kind === 'text' ? await data.text() : null;
     if (seq !== state.clipboardRenderSeq) return;
     state.clipboardSelectedId = Number(meta.id);
+    state.clipboardText = meta.kind === 'text' ? text : null;
+    state.clipboardImageUrl = meta.kind === 'image'
+      ? apiUrl(`/api/clipboard/data?id=${meta.id}&v=${meta.updated}`) : null;
+    $('copyClipboardText').textContent = meta.kind === 'image' ? '复制图片' : '复制文字';
     renderClipboardHistory(items || [], state.clipboardSelectedId);
     $('clipboardPreview').replaceChildren();
-    $('copyClipboardText').classList.add('hidden');
     $('downloadClipboardImage').classList.add('hidden');
     if (meta.kind === 'text') {
       const pre = document.createElement('pre');
       pre.className = 'clipboard-text-preview';
       pre.textContent = text;
       $('clipboardPreview').appendChild(pre);
-      $('copyClipboardText').classList.remove('hidden');
-      $('copyClipboardText').onclick = async () => {
-        try {
-          if (navigator.clipboard && navigator.clipboard.writeText) {
-            await navigator.clipboard.writeText(text);
-          } else {
-            const input = document.createElement('textarea');
-            input.value = text;
-            input.style.position = 'fixed';
-            input.style.opacity = '0';
-            document.body.appendChild(input);
-            input.select();
-            const copied = document.execCommand('copy');
-            input.remove();
-            if (!copied) throw new Error('copy unavailable');
-          }
-          toast('已复制到本机剪贴板');
-        } catch (_) {
-          toast('浏览器未授予剪贴板权限');
-        }
-      };
     } else if (meta.kind === 'image') {
       const image = document.createElement('img');
       image.className = 'clipboard-image-preview';
-      image.src = `/api/clipboard/data?id=${meta.id}&v=${meta.updated}`;
+      image.src = apiUrl(`/api/clipboard/data?id=${meta.id}&v=${meta.updated}`);
       image.alt = meta.name;
       $('clipboardPreview').appendChild(image);
       const link = $('downloadClipboardImage');
@@ -1573,43 +1808,162 @@ async function showClipboardItem(meta, items) {
 async function refreshClipboard(force) {
   const status = $('clipboardStatus');
   try {
-    const res = await fetch('/api/clipboard', { cache: 'no-store' });
+    const headers = {};
+    if (!force && state.clipboardEtag) headers['If-None-Match'] = state.clipboardEtag;
+    const res = await fetch('/api/clipboard', { cache: 'no-store', headers });
+    if (res.status === 304) return;      /* 没有新内容，连 JSON 都不用解析 */
+    if (res.status === 401) return;      /* 口令弹窗由 fetch 包装层负责 */
     if (res.status === 404) {
+      state.clipboardEtag = null;
       state.clipboardUpdated = null;
       state.clipboardSelectedId = null;
+      state.clipboardText = null;
+      state.clipboardImageUrl = null;
+      $('copyClipboardText').textContent = '复制文字';
       renderClipboardHistory([], null);
       $('clipboardPreview').replaceChildren();
-      $('copyClipboardText').classList.add('hidden');
       $('downloadClipboardImage').classList.add('hidden');
       status.textContent = '剪贴板为空';
       return;
     }
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    state.clipboardEtag = res.headers.get('ETag') || null;
     const meta = await res.json();
-    const items = Array.isArray(meta.items) ? meta.items : [meta];
-    renderClipboardHistory(items, state.clipboardSelectedId || meta.id);
-    if (!force && meta.updated === state.clipboardUpdated) return;
+    /* 历史按 updated 倒序，最新一条永远在栈顶；服务端已排好序，这里再排一次，
+     * 避免任何响应顺序问题导致旧记录跑到前面。 */
+    const items = (Array.isArray(meta.items) ? meta.items : [meta])
+      .slice()
+      .sort((a, b) => Number(b.updated) - Number(a.updated));
+    /* 没有新内容时只重画历史列表，保留用户手动点开的旧记录；一旦有新内容
+     * 或强制刷新，共享框始终切回最新一条。 */
+    if (!force && meta.updated === state.clipboardUpdated) {
+      renderClipboardHistory(items, state.clipboardSelectedId);
+      return;
+    }
     state.clipboardUpdated = meta.updated;
-    const selected = items.find((item) => Number(item.id) === Number(state.clipboardSelectedId))
-      || items[0];
-    await showClipboardItem(selected, items);
+    state.clipboardSelectedId = items[0].id;
+    renderClipboardHistory(items, state.clipboardSelectedId);
+    await showClipboardItem(items[0], items);
   } catch (_) {
     status.textContent = '无法连接服务端';
   }
 }
 
-$('publishClipboardText').addEventListener('click', () => {
-  publishClipboard('text', 'text/plain', 'shared-text.txt', new Blob([$('clipboardText').value], {
+$('publishClipboardText').addEventListener('click', async () => {
+  const input = $('clipboardText');
+  if (!input.value.trim()) {
+    toast('文字为空，未发布');
+    return;
+  }
+  const published = await publishClipboard('text', 'text/plain', 'shared-text.txt', new Blob([input.value], {
     type: 'text/plain;charset=utf-8',
   }));
+  if (published) input.value = '';
+});
+/* 浏览器剪贴板的图片普遍只接受 image/png，JPEG/GIF/WebP 先经 canvas 转 PNG。 */
+function imageBlobToPng(blob) {
+  if (blob.type === 'image/png') return Promise.resolve(blob);
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(blob);
+    const image = new Image();
+    image.onload = () => {
+      URL.revokeObjectURL(url);
+      const canvas = document.createElement('canvas');
+      canvas.width = image.naturalWidth;
+      canvas.height = image.naturalHeight;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) {
+        reject(new Error('no canvas'));
+        return;
+      }
+      ctx.drawImage(image, 0, 0);
+      canvas.toBlob((png) => (png ? resolve(png) : reject(new Error('encode failed'))), 'image/png');
+    };
+    image.onerror = () => {
+      URL.revokeObjectURL(url);
+      reject(new Error('decode failed'));
+    };
+    image.src = url;
+  });
+}
+
+/* 复制按钮常驻在共享框下方，复制的是共享框当前显示的那一条：文字写文本，
+ * 图片转成 PNG 后写剪贴板。 */
+$('copyClipboardText').addEventListener('click', async () => {
+  if (state.clipboardImageUrl) {
+    if (!navigator.clipboard || !navigator.clipboard.write || typeof ClipboardItem === 'undefined') {
+      toast('当前环境不支持复制图片（需 HTTPS 或 localhost）');
+      return;
+    }
+    try {
+      /* 直接把 Promise 交给 ClipboardItem：写剪贴板要求用户手势，先 await
+       * fetch 再写的话手势可能已失效，浏览器会拒绝。 */
+      const png = fetch(state.clipboardImageUrl, { cache: 'no-store' })
+        .then((res) => {
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          return res.blob();
+        })
+        .then(imageBlobToPng);
+      await navigator.clipboard.write([new ClipboardItem({ 'image/png': png })]);
+      toast('图片已复制到本机剪贴板');
+    } catch (_) {
+      toast('复制图片失败，请检查剪贴板权限');
+    }
+    return;
+  }
+  const text = state.clipboardText;
+  if (text == null) {
+    toast('当前没有可复制的内容');
+    return;
+  }
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(text);
+    } else {
+      const input = document.createElement('textarea');
+      input.value = text;
+      input.style.position = 'fixed';
+      input.style.opacity = '0';
+      document.body.appendChild(input);
+      input.select();
+      const copied = document.execCommand('copy');
+      input.remove();
+      if (!copied) throw new Error('copy unavailable');
+    }
+    toast('已复制到本机剪贴板');
+  } catch (_) {
+    toast('浏览器未授予剪贴板权限');
+  }
 });
 $('clearClipboard').addEventListener('click', async () => {
-  const res = await fetch('/api/clipboard', { method: 'DELETE' });
-  if (res.ok || res.status === 404) {
-    $('clipboardText').value = '';
-    await refreshClipboard(true);
-  } else {
-    toast('清空共享剪贴板失败');
+  try {
+    const res = await fetch('/api/clipboard', { method: 'DELETE' });
+    if (res.ok || res.status === 404) {
+      $('clipboardText').value = '';
+      await refreshClipboard(true);
+    } else {
+      toast('清空共享剪贴板失败');
+    }
+  } catch (err) {
+    toast('清空共享剪贴板失败：网络错误');
+  }
+});
+$('clearCurrentClipboard').addEventListener('click', async () => {
+  const id = state.clipboardSelectedId;
+  if (id == null) {
+    toast('当前没有共享内容');
+    return;
+  }
+  try {
+    const res = await fetch(`/api/clipboard?id=${encodeURIComponent(id)}`, { method: 'DELETE' });
+    if (res.ok || res.status === 404) {
+      state.clipboardSelectedId = null;
+      await refreshClipboard(true);
+    } else {
+      toast('清空当前共享内容失败');
+    }
+  } catch (err) {
+    toast('清空当前共享内容失败：网络错误');
   }
 });
 $('pickClipboardImage').addEventListener('click', () => $('clipboardImagePicker').click());
@@ -1647,6 +2001,10 @@ function putChunk(name, size, offset, blob) {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     xhr.open('POST', `/api/upload?name=${encodeURIComponent(name)}&size=${size}&offset=${offset}`);
+    /* XHR 不走包装 fetch，CSRF 头（和服务端口令）必须手动带。
+     * 漏了就是 403，文件库上传整个不可用，前端只显示"missing csrf header"。 */
+    xhr.setRequestHeader('X-Lan-Share-Request', '1');
+    if (state.token) xhr.setRequestHeader('X-Lan-Share-Token', state.token);
     xhr.setRequestHeader('Content-Type', 'application/octet-stream');
     xhr.addEventListener('load', () => {
       if (xhr.status === 200) {
@@ -1780,11 +2138,16 @@ function speedDownload() {
   return new Promise((resolve, reject) => {
     const t0 = performance.now();
     const xhr = new XMLHttpRequest();
-    xhr.open('GET', `/api/download?name=${encodeURIComponent(SPEED_NAME)}`);
+    xhr.open('GET', apiUrl(`/api/download?name=${encodeURIComponent(SPEED_NAME)}`));
     xhr.responseType = 'arraybuffer';
     let bytes = 0;
     xhr.addEventListener('progress', (e) => { bytes = e.loaded; });
     xhr.addEventListener('load', () => {
+      /* 404 的响应体也会触发 load，不判状态码就会把错误页当成测速结果 */
+      if (xhr.status < 200 || xhr.status >= 300) {
+        reject(new Error(`下载测速失败（HTTP ${xhr.status}）`));
+        return;
+      }
       const secs = (performance.now() - t0) / 1000;
       const got = bytes || (xhr.response ? xhr.response.byteLength : 0);
       resolve({ mbps: got / 1048576 / secs, bytes: got });
@@ -1804,7 +2167,15 @@ function speedUpload() {
     const xhr = new XMLHttpRequest();
     xhr.open('POST', `/api/upload?name=${encodeURIComponent(SPEED_NAME)}`
       + `&size=${SPEED_BYTES}&offset=0`);
+    /* XHR 走不到包装 fetch，CSRF 头得手动补。漏了就是 403，而 load 事件照样
+     * 触发，会把"秒失败"算成一个上千 MB/s 的假速度。 */
+    xhr.setRequestHeader('X-Lan-Share-Request', '1');
+    if (state.token) xhr.setRequestHeader('X-Lan-Share-Token', state.token);
     xhr.addEventListener('load', () => {
+      if (xhr.status < 200 || xhr.status >= 300) {
+        reject(new Error(`上传测速失败（HTTP ${xhr.status}）`));
+        return;
+      }
       const secs = (performance.now() - t0) / 1000;
       resolve({ mbps: SPEED_BYTES / 1048576 / secs });
     });
@@ -1852,8 +2223,8 @@ async function linkDiag(pc) {
  * 30MB/s——瓶颈在单个 SCTP 关联里（拥塞窗口/接收窗口/消息粒度），不在链路上。
  * 只测一条的话，测出来的只是关联的上限，会误判成"网络不行"。 */
 /* 在指定的一组 lane 上跑一次逐 lane 测速：握手 → 泵数据 → 等对端回执。
- * speedP2p（页面上的测速按钮）和 chooseLanes（传输前的 lane 数决策）用的是
- * 同一套机制，只有 lane 子集和字节数不同，所以抽成公共函数。
+ * 只由网速测试按钮（speedP2p）调用；真实传输不预跑测速，直接按
+ * 一次跑全部已建立的 lane；真实传输不预跑测速，也不按速率降档。
  * 速率由对端计时（speedtest-result 回执），不受发送队列吸收影响。 */
 async function laneSpeedtest(lanes, totalBytes, blob) {
   const t0 = performance.now();
@@ -1942,8 +2313,6 @@ async function laneSpeedtest(lanes, totalBytes, blob) {
 }
 
 /* 初始并行度。真实传输的对端回执够慢时再升档，不为决策预先发送探测数据。 */
-const PROBE_LANES = 16;
-const ESCALATE_BELOW = 10 * 1024 * 1024;
 
 async function speedP2p(peerId) {
   const { live } = await ensureChannel(peerId);
@@ -1961,7 +2330,7 @@ async function speedP2p(peerId) {
   /* 两个数字的含义不同：
    *   mbps       —— 本机把字节交给 DataChannel 的速率，含背压等待，
    *                 也就是"我这边发得多快"。它会被发送队列吸收（每条 lane
-   *                 最多囤 2MB，32 条就是 64MB），链路一抖动就虚高，
+   *                 最多囤 1MB，32 条就是 32MB），链路一抖动就虚高，
    *                 只能看趋势。
    *   peerMbps   —— 对端真正收完的速率，由对端计时，这才是端到端速度。 */
   return {
@@ -1996,8 +2365,8 @@ async function runSpeedTest() {
     if (peer) {
       const p2p = await speedP2p(peer.id);
       /* 头条用对端确认的速率：那才是端到端真实速度。本机"交付出手"的速率
-       * 会被发送队列吸收（每条 lane 最多囤 2MB，32 条就是 64MB 的吸收
-       * 窗口），链路一抖动就虚高——用户实测发送端在 2~40MB/s 之间荡、
+       * 会被发送队列吸收（每条 lane 最多囤 1MB，32 条就是 32MB 的吸收
+       * 窗口），链路一抖动就虚高——实测发送端在 2~40MB/s 之间荡、
        * 对端却一直稳定 13MB/s，荡的就是这个数。两个都显示，但主次分明。 */
       const extra = p2p.echoed
         ? ` · 本端交付 ${p2p.mbps.toFixed(1)}`
@@ -2014,6 +2383,11 @@ async function runSpeedTest() {
     }
     speedLog('完成');
   } catch (err) {
+    /* 失败时不要留着"测试中…"，否则页面看起来像卡死了 */
+    for (const id of ['spDown', 'spUp', 'spP2p']) {
+      const el = $(id);
+      if (el && el.textContent === '测试中…') speedSet(id, '失败');
+    }
     speedLog(`测速中断：${err.message}`);
   } finally {
     if (btn) btn.disabled = false;
@@ -2036,13 +2410,37 @@ document.querySelectorAll('.tab').forEach((tab) => {
   });
 });
 
+/* 首屏先探一下服务端是否需要口令：/api/info 在未鉴权时回 401，
+ * 此时不要连 WS、也不要刷数据，直接弹口令框。 */
+async function boot() {
+  try {
+    const res = await fetch('/api/info', { cache: 'no-store' });
+    if (res.status === 401) {
+      showTokenModal();
+      return;
+    }
+  } catch (_) {
+    /* 服务端暂时不可达也继续：WS 会自己重连，页面至少能打开 */
+  }
+  connect();
+  refreshVault();
+  refreshClipboard();
+}
+
 renderPeers();
-refreshVault();
-refreshClipboard();
-connect();
+boot();
+
 setInterval(() => {
+  /* 页面在后台时停止轮询，回来时由 visibilitychange 立刻补一次 */
+  if (document.visibilityState !== 'visible') return;
   if ($('pane-vault').classList.contains('active')) refreshVault();
 }, 15000);
 setInterval(() => {
+  if (document.visibilityState !== 'visible') return;
   if ($('pane-clipboard').classList.contains('active')) refreshClipboard();
 }, 2000);
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState !== 'visible') return;
+  refreshVault();
+  if ($('pane-clipboard').classList.contains('active')) refreshClipboard();
+});

@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>LAN Share · 需要访问口令</title>
+<!-- 认证页：只依赖自身，不加载 app.js / style.css，因为未通过认证前
+     服务端会把其它静态资源一律重定向回这里。口令校验成功后服务端下发
+     一个 HttpOnly Cookie，然后跳转到正常页面。 -->
+<style>
+  :root {
+    --bg: #f5f6f8;
+    --card: #ffffff;
+    --line: #d3d8e0;
+    --text: #1f2937;
+    --muted: #6b7280;
+    --blue: #2563eb;
+    --red: #b91c1c;
+    --radius: 12px;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0;
+    min-height: 100%;
+    background: var(--bg);
+    color: var(--text);
+    font-family: system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+    font-size: 14px;
+    line-height: 1.6;
+  }
+  body {
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+  }
+  .card {
+    width: 100%;
+    max-width: 360px;
+    padding: 26px 24px 22px;
+    background: var(--card);
+    border-radius: var(--radius);
+    box-shadow: 0 1px 2px rgba(15, 23, 42, .04), 0 8px 24px rgba(15, 23, 42, .06);
+  }
+  h1 { margin: 0 0 6px; font-size: 16px; font-weight: 500; }
+  .sub { margin: 0 0 20px; font-size: 13px; color: var(--muted); }
+  input {
+    width: 100%;
+    padding: 10px 12px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: var(--bg);
+    color: var(--text);
+    font: inherit;
+  }
+  input:focus { outline: none; border-color: var(--blue); background: #fff; }
+  button {
+    width: 100%;
+    margin-top: 12px;
+    padding: 10px 12px;
+    border: 0;
+    border-radius: 8px;
+    background: var(--blue);
+    color: #fff;
+    font: inherit;
+    cursor: pointer;
+  }
+  button:disabled { opacity: .6; cursor: default; }
+  .err { min-height: 20px; margin-top: 12px; font-size: 13px; color: var(--red); }
+  .foot { margin-top: 6px; font-size: 12px; color: var(--muted); text-align: center; }
+</style>
+</head>
+<body>
+<form class="card" id="form" autocomplete="off">
+  <h1>需要访问口令</h1>
+  <p class="sub">这台设备开启了访问保护，请输入管理员提供的口令后继续。</p>
+  <input id="pw" type="password" placeholder="访问口令" autocomplete="current-password" autofocus>
+  <button id="go" type="submit">进入</button>
+  <div class="err" id="err"></div>
+  <div class="foot">LAN Share · 局域网直传</div>
+</form>
+<script>
+(function () {
+  'use strict';
+  var form = document.getElementById('form');
+  var pw = document.getElementById('pw');
+  var go = document.getElementById('go');
+  var err = document.getElementById('err');
+
+  function fail(message) {
+    err.textContent = message;
+    go.disabled = false;
+    pw.select();
+  }
+
+  form.addEventListener('submit', function (event) {
+    event.preventDefault();
+    var token = pw.value.trim();
+    if (!token) { err.textContent = '请输入口令'; pw.focus(); return; }
+    go.disabled = true;
+    err.textContent = '';
+    fetch('/api/login?token=' + encodeURIComponent(token), {
+      method: 'POST',
+      headers: { 'X-Lan-Share-Request': '1' }
+    }).then(function (res) {
+      if (res.ok) { location.replace('/'); return; }
+      fail(res.status === 401 ? '口令不正确' : '登录失败（HTTP ' + res.status + '）');
+    }, function () {
+      fail('无法连接服务端');
+    });
+  });
+})();
+</script>
+</body>
+</html>

@@ -14,7 +14,6 @@
 
 CC      ?= cc
 CFLAGS  ?= -Os -std=c99 -Wall
-STATIC  ?=
 TARGET   = lan-share
 SRC      = lan_share.c
 WEBHDR   = web_assets.h
@@ -49,7 +48,8 @@ all: $(TARGET)
 # 前端被编进二进制，所以只把可执行文件拷到路由器上也能打开页面。
 # 前端改了要重新生成；web_assets.h 依赖 public/ 里全部文件的修改时间。
 # 注意 p2p-pump.js 必须在 app.js 之前加载（app.js 顶层就解构 LSPump）。
-WEBFILES = $(WEBDIR)/index.html $(WEBDIR)/p2p-pump.js $(WEBDIR)/app.js $(WEBDIR)/style.css
+WEBFILES = $(WEBDIR)/index.html $(WEBDIR)/login.html $(WEBDIR)/favicon.png \
+           $(WEBDIR)/p2p-pump.js $(WEBDIR)/app.js $(WEBDIR)/style.css $(WEBDIR)/relay-channel.js
 
 $(WEBHDR): $(WEBGEN) $(WEBFILES)
 	$(NODE) $(WEBGEN)

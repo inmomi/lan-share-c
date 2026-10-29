@@ -23,6 +23,14 @@
 #  define _FILE_OFFSET_BITS 64
 #endif
 
+/* 访问日志要毫秒级计时，而 -std=c99 会把 POSIX 的 clock_gettime 藏起来。
+ * 显式声明 POSIX.1-2008，Windows 分支不需要。 */
+#ifndef _WIN32
+#  ifndef _POSIX_C_SOURCE
+#    define _POSIX_C_SOURCE 200809L
+#  endif
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -41,11 +49,11 @@
 #include "web_assets.h"
 
 /* Windows 的 SOCKET 句柄值远大于 Linux 的 fd，默认 FD_SETSIZE=64 会让
- * FD_SET() 写越界。这里在任何 winsock 头文件之前放大它。Linux 下无害。 */
-#ifdef _WIN32
-#  ifndef FD_SETSIZE
-#    define FD_SETSIZE 1024
-#  endif
+ * FD_SET() 写越界。这里在任何 winsock 头文件之前放大它。
+ * Linux 同样放大：ulimit -n 调高的服务器上客户端 fd 可能 >= 1024，
+ * FD_SET 会写越 fd_set 位图数组导致栈破坏。 */
+#ifndef FD_SETSIZE
+#  define FD_SETSIZE 4096
 #endif
 
 /* ==========================================================================
@@ -204,16 +212,32 @@ static void sanitize_name(const char *in, char *out, size_t outsz) {
     if (o == 0) memcpy(out, "unnamed", 8);
 }
 
+/* 单位跟随数量级：最小单位是 KB，往上是 MB / GB / TB（1024 进制）。
+ * 个位数保留两位小数，否则 84 字节会显示成 "0.0 KB"，看不出量级。 */
 static void human_size(unsigned long long bytes, char *out, size_t outsz) {
-    static const char *units[] = { "B", "KB", "MB", "GB", "TB" };
-    double v = (double)bytes;
-    int idx = 0;
-    while (v >= 1024.0 && idx < 4) {
-        v /= 1024.0;
-        idx++;
+    double v;
+    const char *unit;
+    int digits;
+
+    if (bytes == 0) {
+        snprintf(out, outsz, "0 KB");
+        return;
     }
-    if (idx == 0) snprintf(out, outsz, "%llu B", bytes);
-    else snprintf(out, outsz, "%.1f %s", v, units[idx]);
+    if (bytes >= (1ULL << 40)) {
+        v = (double)bytes / (double)(1ULL << 40);
+        unit = "TB";
+    } else if (bytes >= (1ULL << 30)) {
+        v = (double)bytes / (double)(1ULL << 30);
+        unit = "GB";
+    } else if (bytes >= (1ULL << 20)) {
+        v = (double)bytes / (double)(1ULL << 20);
+        unit = "MB";
+    } else {
+        v = (double)bytes / 1024.0;
+        unit = "KB";
+    }
+    digits = (v < 1.0) ? 2 : (v < 100.0 ? 1 : 0);
+    snprintf(out, outsz, "%.*f %s", digits, v, unit);
 }
 
 static size_t json_escape(const char *in, char *out, size_t outsz) {
@@ -369,9 +393,12 @@ static int ls_remove_file(const char *p) {
  * id + 载荷），16KB 装不下，放宽到 128KB。24 个客户端各 256KB（wbuf + frag），
  * 静态区里按需占用，路由器上也吃得下。 */
 #define WS_BUF          131072
+/* 本文件用的是"文件名最大长度"，和 POSIX 的 NAME_MAX（255）不是一个东西。
+ * 开了 _POSIX_C_SOURCE 之后 limits.h 会带进来一个，先清掉避免重定义告警。 */
+#undef  NAME_MAX
 #define NAME_MAX        64
 #define ID_MAX          40
-#define PATH_MAX_LOCAL  512
+#define PATH_MAX_LOCAL  1024
 
 enum { MODE_HTTP = 0, MODE_WS = 1, MODE_UPLOAD = 2, MODE_CLIPBOARD = 3 };
 
@@ -396,6 +423,13 @@ typedef struct {
     char id[ID_MAX];
     char name[NAME_MAX];
     char ip[48];
+    /* 访问日志用：本条连接最近一个请求的方法、目标（已抹掉口令）和起始时刻。
+     * keep-alive 上每个新请求覆盖一次，响应入队时打一行。 */
+    char req_method[16];  /* 与 process_request 的 method 缓冲同宽，避免超长方法名被截断 */
+    char req_target[PATH_MAX_LOCAL];   /* 与 target 同宽，避免长 URL 日志截断 */
+    uint64_t req_t0;
+    time_t last_active;   /* 最近一次收/发成功的时间，用于超时回收 */
+    time_t ws_ping_at;    /* 上次给 WS 客户端发 ping 的时间 */
 
     char hbuf[HEAD_BUF + 1];
     size_t hlen;
@@ -411,6 +445,8 @@ typedef struct {
      * 合用一个预算的话，兜底通道的大二进制帧一条都轮不到打印。 */
     int trace_text;       /* 还能打印多少条文本帧 */
     int trace_bin;        /* 还能打印多少条二进制/续帧 */
+    int trace_cand;       /* 还能打印多少条 ICE 候选（-1 = 已打满） */
+    int trace_lost;       /* 已打印多少条"信令丢失"，只打前几条 */
 
     int upfd;
     uint64_t upleft;
@@ -422,8 +458,11 @@ typedef struct {
     uint64_t up_size;            /* 该文件应有的完整大小 */
     uint64_t up_base;            /* 本次请求之前的已收字节（offset） */
     uint64_t up_reqlen;          /* 本次请求体的字节数 */
+    /* 上一个请求被提前拒绝时，它的请求体还剩多少字节没读。必须排水，
+     * 否则这些字节会被当成下一个请求的行，整条连接错位。 */
+    uint64_t discard;
+    int close_after;             /* 残体太多不值得排水：响应发完就关连接 */
     char up_final[NAME_MAX * 4]; /* 收满后要落成的文件名 */
-    int clip_id;
     char clip_kind[8];
     char clip_mime[80];
     char clip_name[NAME_MAX * 4];
@@ -444,6 +483,11 @@ static unsigned long g_seq = 0;
 static char g_upload_dir[PATH_MAX_LOCAL] = "./uploads";
 static char g_web_dir[PATH_MAX_LOCAL] = "./public";
 static int g_port = 8080;
+/* 可选访问口令。空字符串 = 不启用（默认），启用后 /api 下的接口与 /ws 都必须带。
+ * 只从命令行 --token 读，不写日志，避免口令跟着终端记录/进程列表泄露。 */
+static char g_token[128] = "";
+/* 文件库总配额，默认 4 GiB；--quota 0 表示不限制。剪贴板有独立配额，不计入。 */
+static uint64_t g_quota_bytes = 4096ULL * 1024ULL * 1024ULL;
 
 /* 可选 TURN 中继配置：一段合法 JSON 数组文本（如
  * [{"urls":"turn:1.2.3.4:3478","username":"u","credential":"p"}]），由
@@ -452,16 +496,9 @@ static int g_port = 8080;
  * AP / 客户端隔离下设备间直连被丢弃时即可走中继。 */
 static char *g_turn_config = NULL;
 
-static const char *ADJ[] = { "蓝色", "银色", "安静", "敏捷", "温暖", "明亮", "沉稳", "轻盈", "清澈", "柔和" };
-static const char *ANI[] = { "海豚", "猎鹰", "水獭", "狐狸", "鲸鱼", "山猫", "燕子", "小鹿", "海豹", "苍鹭" };
-
-/* 设备名记忆表：按 IP 记住上次用过的名字。
- *
- * 每次新建连接都会随机取名，没有这层记忆的话浏览器刷新一次就换一个名字，
- * 对端根本认不出这台机器。客户端另有 localStorage 记一层，这里是服务端兜底
- * （换浏览器、清缓存、隐私模式下仍然有效）。
- *
- * 只存 32 条，满了覆盖第一条——设备名不是关键数据，丢了重新随机即可。 */
+/* 设备名记忆表：按 IP 记住上次用过的名字，供"重连后名字不变"兜底。
+ * 只在客户端没带 /ws?name=（换浏览器、清缓存）时才用；同一个 IP 后面对应
+ * 多台设备（端口转发/隧道）时，记忆名如果已被在线设备占用就不再复用。 */
 #define NAME_MEM_MAX 32
 typedef struct {
     char ip[48];
@@ -495,6 +532,59 @@ static void name_mem_set(const char *ip, const char *name) {
     if (free_slot < 0) free_slot = 0;
     snprintf(g_name_mem[free_slot].ip, sizeof g_name_mem[free_slot].ip, "%s", ip);
     snprintf(g_name_mem[free_slot].name, sizeof g_name_mem[free_slot].name, "%s", name);
+}
+
+/* 这个设备名当前是否已被在线连接占用。 */
+static int name_in_use(const char *name) {
+    int i;
+    for (i = 0; i < MAX_CLIENTS; i++) {
+        if (g_clients[i].used && g_clients[i].name[0]
+            && strcmp(g_clients[i].name, name) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* 设备名：主机1、主机2……最多到 100，跳过在线设备已占用的号码。
+ *
+ * 原来按 IP 记名字，出发点是不让刷新换名。但两台设备经同一个端口转发/隧道
+ * 过来时源 IP 完全相同，于是共用同一个名字——界面上就成了两台一模一样的
+ * "安静鲸鱼"，谁也分不清谁。编号与 IP 无关；客户端拿到后存 localStorage，
+ * 刷新时通过 /ws?name= 带回来，所以只有第一次连接会消耗一个号码。 */
+static unsigned long g_host_no = 0;
+
+static void assign_host_name(char *out, size_t cap) {
+    int i, n;
+    for (i = 0; i < 100; i++) {
+        char want[NAME_MAX];
+        int taken = 0;
+        g_host_no = g_host_no % 100 + 1;
+        snprintf(want, sizeof want, "主机%lu", g_host_no);
+        for (n = 0; n < MAX_CLIENTS; n++) {
+            if (g_clients[n].used && strcmp(g_clients[n].name, want) == 0) {
+                taken = 1;
+                break;
+            }
+        }
+        if (!taken) {
+            snprintf(out, cap, "%s", want);
+            return;
+        }
+    }
+    snprintf(out, cap, "主机%lu", g_host_no);
+}
+
+/* 设备名来自浏览器，会原样进 JSON 和日志：控制字符、引号、反斜杠必须去掉，
+ * 否则一条改名消息就能把 peers 的 JSON 打断。 */
+static void clean_display_name(const char *in, char *out, size_t cap) {
+    size_t o = 0;
+    for (; *in && o + 1 < cap; in++) {
+        unsigned char ch = (unsigned char)*in;
+        if (ch < 0x20 || ch == '"' || ch == '\\') continue;
+        out[o++] = (char)ch;
+    }
+    out[o] = '\0';
 }
 
 /* ==========================================================================
@@ -625,10 +715,6 @@ static int would_block(void) {
     return (e == (int)LS_EAGAIN || e == (int)LS_EWOULDBLOCK);
 }
 
-static void random_name(char *out, size_t outsz) {
-    snprintf(out, outsz, "%s%s", ADJ[rand() % 10], ANI[rand() % 10]);
-}
-
 static void make_id(char *out, size_t outsz) {
     snprintf(out, outsz, "dev-%lu-%04x", g_seq, (unsigned)(rand() & 0xFFFF));
 }
@@ -636,6 +722,14 @@ static void make_id(char *out, size_t outsz) {
 /* ==========================================================================
  * 输出缓冲
  * ========================================================================== */
+
+/* 日志分级：默认只打错误。具体含义见下方"日志"小节的 log_emit。
+ * 这里提前声明是因为 queue_mem 等函数比日志实现更早。 */
+enum { LOG_ERROR = 0, LOG_INFO = 1, LOG_DEBUG = 2 };
+static int g_log_level = LOG_ERROR;
+static void log_err(const char *fmt, ...);
+static void log_info(const char *fmt, ...);
+static void log_dbg(const char *fmt, ...);
 
 static void out_reset(ls_client *c) {
     if (c->out.is_mem && c->out.buf) free(c->out.buf);
@@ -678,7 +772,11 @@ static void queue_mem(ls_client *c, const char *data, size_t len) {
                 char *nb;
                 if (ncap < need) ncap = need;
                 nb = (char *)realloc(c->out.buf, ncap);
-                if (!nb) return; /* 内存不足时保留原有内容，本次丢弃 */
+                if (!nb) { /* 内存不足时保留原有内容，本次丢弃，但留日志便于定位 */
+                    log_err("queue_mem OOM：丢弃 %zu 字节（连接 %s）",
+                            len, c->name[0] ? c->name : c->id);
+                    return;
+                }
                 c->out.buf = nb;
                 c->out.cap = ncap;
             }
@@ -700,29 +798,136 @@ static void queue_mem(ls_client *c, const char *data, size_t len) {
     c->out.has = 1;
 }
 
-static void queue_response(ls_client *c, int code, const char *ctype,
-                           const char *body, size_t blen) {
+/* ------------------------------------------------------------------ 日志 */
+
+/* 日志时间戳。没有时间戳的日志没法跟浏览器上的操作对齐——原来的"关闭连接"
+ * 只有先后顺序没有时刻，看不出哪一次点击对应哪一行。 */
+static void log_stamp(char *out, size_t cap) {
+    time_t now = time(NULL);
+    struct tm tmv;
+#ifdef _WIN32
+    localtime_s(&tmv, &now);
+#else
+    localtime_r(&now, &tmv);
+#endif
+    strftime(out, cap, "%H:%M:%S", &tmv);
+}
+
+/* 单调毫秒，只用来算耗时（不受系统时间调整影响）。 */
+static uint64_t log_now_ms(void) {
+#ifdef _WIN32
+    return (uint64_t)GetTickCount64();
+#else
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)(ts.tv_nsec / 1000000);
+#endif
+}
+
+/* 日志分级：默认只打错误，避免正常使用时刷屏。
+ *   （默认）  只输出失败/异常：内存不足、落盘失败、断流、select 错误……
+ *   -v        再加常规操作：连接建立/关闭、上传下载、访问日志、信令
+ *   -vv       再加逐帧/逐块/ICE 候选这类调试细节
+ * 启动横幅（监听地址、访问口令提示等）不经过这里，永远显示。 */
+static void log_emit(int level, const char *fmt, va_list ap) {
+    char stamp[16];
+    if (level > g_log_level) return;
+    log_stamp(stamp, sizeof stamp);
+    fprintf(stderr, "[%s] ", stamp);
+    vfprintf(stderr, fmt, ap);
+    fputc('\n', stderr);
+    fflush(stderr);
+}
+
+static void log_err(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    log_emit(LOG_ERROR, fmt, ap);
+    va_end(ap);
+}
+
+static void log_info(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    log_emit(LOG_INFO, fmt, ap);
+    va_end(ap);
+}
+
+static void log_dbg(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    log_emit(LOG_DEBUG, fmt, ap);
+    va_end(ap);
+}
+
+/* 口令可能出现在查询串里（<img>/<a download>/WS 只能这么传），日志必须抹掉。 */
+static void redact_token(char *s) {
+    char *p = s;
+    while ((p = strstr(p, "token=")) != NULL) {
+        char *v = p + 6;
+        char *e = v;
+        while (*e && *e != '&') e++;
+        if (v == e) { p = e; continue; }
+        if (e - v >= 3) {
+            v[0] = '*'; v[1] = '*'; v[2] = '*';
+            memmove(v + 3, e, strlen(e) + 1);
+            p = v + 3;
+        } else {
+            size_t tlen = (size_t)(e - v), i;
+            for (i = 0; i < tlen; i++) v[i] = '*';
+            p = e;
+        }
+    }
+}
+
+/* 一行一个请求：方法、目标、状态码、字节数、耗时、来源。
+ * 304 是剪贴板轮询的"没变化"，每 2 秒一条会把日志刷满，直接跳过。
+ * 访问日志只在 -v 及以上才输出：正常使用时它是最吵的一类。 */
+static void log_access(ls_client *c, int code, size_t bytes) {
+    uint64_t now, ms = 0;
+    char szbuf[24];
+    if (g_log_level < LOG_INFO) return;
+    if (!c->req_method[0] || code == 304) return;
+    now = log_now_ms();
+    if (c->req_t0 && now >= c->req_t0) ms = now - c->req_t0;
+    human_size((unsigned long long)bytes, szbuf, sizeof szbuf);
+    log_info("%s %s -> %d %s %llums ip=%s", c->req_method, c->req_target,
+             code, szbuf, (unsigned long long)ms, c->ip[0] ? c->ip : "-");
+}
+
+static void queue_response_extra(ls_client *c, int code, const char *ctype,
+                                 const char *body, size_t blen, const char *extra) {
     const char *reason;
-    char head[320];
+    char head[384];
     char *buf;
     int hl;
     size_t total;
 
+    log_access(c, code, blen);
+
     if (code == 200) reason = "OK";
+    else if (code == 302) reason = "Found";
+    else if (code == 304) reason = "Not Modified";
     else if (code == 400) reason = "Bad Request";
+    else if (code == 401) reason = "Unauthorized";
+    else if (code == 403) reason = "Forbidden";
     else if (code == 409) reason = "Conflict";
     else if (code == 404) reason = "Not Found";
     else if (code == 405) reason = "Method Not Allowed";
+    else if (code == 411) reason = "Length Required";
     else if (code == 413) reason = "Payload Too Large";
+    else if (code == 507) reason = "Insufficient Storage";
     else reason = "Error";
 
     hl = snprintf(head, sizeof head,
         "HTTP/1.1 %d %s\r\n"
         "Content-Type: %s\r\n"
         "Content-Length: %llu\r\n"
+        "%s"
         "Cache-Control: no-store\r\n"
-        "Connection: keep-alive\r\n\r\n",
-        code, reason, ctype, (unsigned long long)blen);
+        "Connection: %s\r\n\r\n",
+        code, reason, ctype, (unsigned long long)blen, extra ? extra : "",
+        c->close_after ? "close" : "keep-alive");
     if (hl <= 0) return;
 
     total = (size_t)hl + blen;
@@ -741,11 +946,17 @@ static void queue_response(ls_client *c, int code, const char *ctype,
     c->out.has = 1;
 }
 
+static void queue_response(ls_client *c, int code, const char *ctype,
+                           const char *body, size_t blen) {
+    queue_response_extra(c, code, ctype, body, blen, NULL);
+}
+
 /* 返回 1 完成，0 未完成，-1 出错。 */
 static int flush_out(ls_client *c) {
     if (c->pendlen > 0) {
         int n = (int)send(c->fd, c->pend, (int)c->pendlen, 0);
         if (n > 0) {
+            c->last_active = time(NULL);
             memmove(c->pend, c->pend + n, c->pendlen - (size_t)n);
             c->pendlen -= (size_t)n;
             if (c->pendlen > 0) return 0;
@@ -763,6 +974,7 @@ static int flush_out(ls_client *c) {
             if (chunk > IO_BUF) chunk = IO_BUF;
             n = (int)send(c->fd, c->out.buf + c->out.sent, (int)chunk, 0);
             if (n > 0) {
+                c->last_active = time(NULL);
                 c->out.sent += (size_t)n;
                 continue;
             }
@@ -786,11 +998,12 @@ static int flush_out(ls_client *c) {
             return 1;
         }
         while (off < got) {
-            int n = (int)send(c->fd, buf + off, (int)(got - off), 0);
-            if (n > 0) {
-                off += (size_t)n;
-                continue;
-            }
+        int n = (int)send(c->fd, buf + off, (int)(got - off), 0);
+        if (n > 0) {
+            c->last_active = time(NULL);
+            off += (size_t)n;
+            continue;
+        }
             if (n < 0 && would_block()) {
                 if (off < got) {
                     memcpy(c->pend, buf + off, got - off);
@@ -904,6 +1117,12 @@ static void forward_binary(ls_client *c, const unsigned char *payload, size_t le
     if (idlen >= sizeof to) return;
     memcpy(to, payload + 1, idlen);
     to[idlen] = '\0';
+    if (c->relay_in == 0) {
+        /* 二进制开始走服务器 = 直连没建起来。这条必须在日志里明说，
+         * 否则用户只会看到"测速很慢"，不知道慢在绕路。 */
+        log_info("中转 开始 设备=%s→%s（直连未建立，字节走服务器）",
+                c->name[0] ? c->name : c->id, to);
+    }
     c->relay_in += len;
     for (i = 0; i < MAX_CLIENTS; i++) {
         if (!g_clients[i].used || g_clients[i].mode != MODE_WS) continue;
@@ -979,18 +1198,57 @@ static void broadcast_peers(void) {
  * 原来有十来个调用点直接 client_close(c)，什么也不打。于是出现这种局面：
  * 客户端报 1006（对端没说再见就消失），服务端进程还在、日志一片空白，
  * 谁关的、在哪一步关的完全无从判断——只能靠猜。现在每条关闭都带一个原因
- * 字符串，加上 errno、收发位置和中转计数，一次就能定位。 */
+ * 字符串，加上收发位置和中转计数，一次就能定位。 */
+static const char *mode_name(int m) {
+    switch (m) {
+    case MODE_HTTP: return "HTTP";
+    case MODE_WS: return "WS";
+    case MODE_UPLOAD: return "上传中";
+    case MODE_CLIPBOARD: return "剪贴板";
+    default: return "?";
+    }
+}
+
 static void client_close_why(ls_client *c, const char *why) {
     int was_ws = (c->mode == MODE_WS);
     int err = (int)ls_last_err();
-    fprintf(stderr,
-            "[lan-share] 关闭连接 id=%s ip=%s mode=%d 原因=%s errno=%d "
-            "wlen=%lu 待发=%lu/%lu 中转 收=%llu 发=%llu\n",
-            c->id[0] ? c->id : "-", c->ip[0] ? c->ip : "-", c->mode, why, err,
-            (unsigned long)c->wlen,
-            (unsigned long)c->out.sent, (unsigned long)c->out.len,
-            (unsigned long long)c->relay_in, (unsigned long long)c->relay_out);
-    fflush(stderr);
+    char errbuf[24];
+
+    /* 上传途中被对端关掉时，最要紧的是"哪个文件、收到多少"。原来这条汇总行
+     * 既没有文件名也没有进度，等于什么都没说。 */
+    if (c->mode == MODE_UPLOAD) {
+        const char *slash = strrchr(c->upname, '/');
+        const char *bs = strrchr(c->upname, '\\');
+        const char *base = (slash && (!bs || slash > bs)) ? slash + 1
+                         : (bs ? bs + 1 : c->upname);
+        uint64_t total = c->up_chunked ? c->up_size : c->up_reqlen;
+        uint64_t got = c->up_base
+                     + (c->up_reqlen > c->upleft ? c->up_reqlen - c->upleft : 0);
+        char gotbuf[24], totbuf[24];
+        human_size(got, gotbuf, sizeof gotbuf);
+        human_size(total, totbuf, sizeof totbuf);
+        log_err("上传 中断 设备=%s name=%s 已收=%s/%s 原因=%s",
+                c->name[0] ? c->name : c->ip, base[0] ? base : "-",
+                gotbuf, totbuf, why);
+    }
+
+    /* ENOENT/EAGAIN 是正常收尾后读到的残留值，打出来只会误导 */
+    if (err == 0 || err == 2 || err == 11) errbuf[0] = '\0';
+    else snprintf(errbuf, sizeof errbuf, " errno=%d", err);
+
+    /* 普通 HTTP 连接每个请求一条，正常 FIN 时打出来只是噪声——请求本身
+     * 已经有一行访问日志了。只有"非正常关闭"或还有数据没发完才值得记。 */
+    if (!(c->mode == MODE_HTTP && c->wlen == 0 && c->out.sent == 0
+          && c->relay_in == 0 && c->relay_out == 0
+          && strstr(why, "对端 FIN") != NULL)) {
+        log_info("连接关闭 设备=%s mode=%s ip=%s 原因=%s%s 未发=%lu 待发=%lu/%lu "
+                "中转 收=%llu 发=%llu",
+                c->name[0] ? c->name : "-", mode_name(c->mode),
+                c->ip[0] ? c->ip : "-", why, errbuf,
+                (unsigned long)c->wlen,
+                (unsigned long)c->out.sent, (unsigned long)c->out.len,
+                (unsigned long long)c->relay_in, (unsigned long long)c->relay_out);
+    }
     if (c->upfd >= 0) {
         ls_closefile(c->upfd);
         c->upfd = -1;
@@ -1002,10 +1260,6 @@ static void client_close_why(ls_client *c, const char *why) {
     c->fd = -1;
     c->upfd = -1;
     if (was_ws) broadcast_peers();
-}
-
-static void client_close(ls_client *c) {
-    client_close_why(c, "未标注");
 }
 
 static void forward_signal(ls_client *target, const char *from_id, const char *msg) {
@@ -1057,7 +1311,7 @@ static void unique_path(const char *name, char *out, size_t outsz) {
         ext[0] = '\0';
     }
     for (i = 1; i < 999; i++) {
-        char candidate[NAME_MAX * 4];
+        char candidate[NAME_MAX * 4 + 64];   /* stem(255)+" (999)"(6)+ext(31)+NUL 最坏 294 */
         snprintf(candidate, sizeof candidate, "%s (%d)%s", stem, i, ext);
         if (path_join(g_upload_dir, candidate, out, outsz) != 0) return;
         if (!file_exists(out)) return;
@@ -1082,8 +1336,10 @@ static uint64_t file_size(const char *path) {
 
 /* 分块上传的半成品目录。用子目录而不是和正式文件混在一起，
  * 这样文件列表里不会冒出没传完的东西。 */
-static void parts_dir_path(char *out, size_t outsz) {
-    snprintf(out, outsz, "%s/.lanshare-parts", g_upload_dir);
+static int parts_dir_path(char *out, size_t outsz) {
+    int n = snprintf(out, outsz, "%s/.lanshare-parts", g_upload_dir);
+    /* -d 太长时 half 截断出来的路径会指到别处，必须让调用方知道 */
+    return (n > 0 && (size_t)n < outsz) ? 0 : -1;
 }
 
 #define CLIPBOARD_MAX (16u * 1024u * 1024u)
@@ -1308,12 +1564,13 @@ static void ensure_clipboard_dir(void) {
 /* 半成品文件名取 name|size 的 SHA-1 十六进制。
  * 中文或带特殊字符的文件名在文件系统上容易出岔子，哈希后只剩 [0-9a-f]，
  * 同时保证"同名不同大小"互不干扰。 */
-static void part_path_for(const char *name, uint64_t size, char *out, size_t outsz) {
+static int part_path_for(const char *name, uint64_t size, char *out, size_t outsz) {
     char key[NAME_MAX * 4 + 32];
     unsigned char dig[20];
     char hex[41];
+    char dir[PATH_MAX_LOCAL];
     ls_sha1 ctx;
-    int i;
+    int i, n;
 
     snprintf(key, sizeof key, "%s|%llu", name, (unsigned long long)size);
     sha1_init(&ctx);
@@ -1322,22 +1579,53 @@ static void part_path_for(const char *name, uint64_t size, char *out, size_t out
     for (i = 0; i < 20; i++) snprintf(hex + (size_t)i * 2, 3, "%02x", dig[i]);
     hex[40] = '\0';
 
-    {
-        char dir[PATH_MAX_LOCAL];
-        parts_dir_path(dir, sizeof dir);
-        snprintf(out, outsz, "%s/%s.part", dir, hex);
-    }
+    if (parts_dir_path(dir, sizeof dir) != 0) return -1;
+    n = snprintf(out, outsz, "%s/%s.part", dir, hex);
+    return (n > 0 && (size_t)n < outsz) ? 0 : -1;
 }
 
 /* 某个文件目前收了多少字节。没开始过就是 0。 */
 static uint64_t part_received(const char *name, uint64_t size) {
     char p[PATH_MAX_LOCAL];
     uint64_t sz;
-    part_path_for(name, size, p, sizeof p);
+    if (part_path_for(name, size, p, sizeof p) != 0) return 0;
     if (!file_exists(p)) return 0;
     sz = file_size(p);
     if (size > 0 && sz > size) sz = size;
     return sz;
+}
+
+/* 文件库已用空间。只统计上传目录下的普通文件；剪贴板与 .part 在子目录里，
+ * 有各自的配额/清理策略，不重复计算。 */
+static uint64_t upload_dir_used(void) {
+    uint64_t total = 0;
+#ifdef _WIN32
+    char pat[PATH_MAX_LOCAL];
+    WIN32_FIND_DATAA fd;
+    HANDLE h;
+    snprintf(pat, sizeof pat, "%s\\*", g_upload_dir);
+    h = FindFirstFileA(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    do {
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+            total += ((uint64_t)fd.nFileSizeHigh << 32) | (uint64_t)fd.nFileSizeLow;
+        }
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+#else
+    DIR *d = opendir(g_upload_dir);
+    struct dirent *e;
+    if (!d) return 0;
+    while ((e = readdir(d)) != NULL) {
+        char p[PATH_MAX_LOCAL];
+        struct stat st;
+        if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
+        if (path_join(g_upload_dir, e->d_name, p, sizeof p) != 0) continue;
+        if (stat(p, &st) == 0 && S_ISREG(st.st_mode)) total += (uint64_t)st.st_size;
+    }
+    closedir(d);
+#endif
+    return total;
 }
 
 static void api_list_files(ls_client *c) {
@@ -1348,7 +1636,7 @@ static void api_list_files(ls_client *c) {
 
     body = (char *)malloc(cap);
     if (!body) return;
-    len += (size_t)snprintf(body + len, cap - len, "{\"files\":[");
+    len = body_append(body, len, cap, "{\"files\":[");
 
 #ifdef _WIN32
     {
@@ -1389,7 +1677,7 @@ static void api_list_files(ls_client *c) {
                     uint64_t sec = ft / 10000000ULL;
                     if (sec > 11644473600ULL) mtime = (unsigned long long)(sec - 11644473600ULL);
                 }
-                len += (size_t)snprintf(body + len, cap - len,
+                len = body_append(body, len, cap,
                     "%s{\"name\":\"%s\",\"size\":%llu,\"sizeText\":\"%s\",\"mtime\":%llu}",
                     count ? "," : "", esc, (unsigned long long)sz, szt, mtime);
                 total += sz;
@@ -1420,7 +1708,7 @@ static void api_list_files(ls_client *c) {
                 }
                 json_escape(ent->d_name, esc, sizeof esc);
                 human_size((unsigned long long)st.st_size, szt, sizeof szt);
-                len += (size_t)snprintf(body + len, cap - len,
+                len = body_append(body, len, cap,
                     "%s{\"name\":\"%s\",\"size\":%llu,\"sizeText\":\"%s\",\"mtime\":%llu}",
                     count ? "," : "", esc, (unsigned long long)st.st_size, szt,
                     (unsigned long long)((uint64_t)st.st_mtime * 1000ULL));
@@ -1439,7 +1727,7 @@ static void api_list_files(ls_client *c) {
             cap += 128;
         }
     }
-    len += (size_t)snprintf(body + len, cap - len, "],\"total\":%llu}", (unsigned long long)total);
+    len = body_append(body, len, cap, "],\"total\":%llu}", (unsigned long long)total);
     queue_response(c, 200, "application/json; charset=utf-8", body, len);
     free(body);
 }
@@ -1485,7 +1773,7 @@ static char *apply_turn_injection(const char *in, size_t in_len, size_t *out_len
     return out;
 }
 
-static void serve_static(ls_client *c, const char *rel) {
+static void serve_static(ls_client *c, const char *rel, int authed) {
     char path[PATH_MAX_LOCAL];
     char *body;
     uint64_t sz;
@@ -1502,7 +1790,26 @@ static void serve_static(ls_client *c, const char *rel) {
         queue_response(c, 404, "text/plain; charset=utf-8", "Not Found", 9);
         return;
     }
-    snprintf(path, sizeof path, "%s%s", g_web_dir, rel);
+    /* 开了口令但还没认证：首页给登录页，其它静态资源一律重定向回首页。
+     * 这样未认证的人连 app.js 都拿不到，页面结构也看不到。 */
+    if (g_token[0] && !authed && strcmp(rel, "/login.html") != 0) {
+        if (strcmp(rel, "/index.html") == 0) {
+            rel = "/login.html";
+        } else {
+            queue_response_extra(c, 302, "text/plain; charset=utf-8", "", 0,
+                                 "Location: /\r\n");
+            return;
+        }
+    }
+    {
+        /* -w 目录加上请求路径可能超出缓冲：截断出来的路径会指到别处，
+         * 与其静默 404 或读到意外文件，不如明确判定"路径过长"。 */
+        int pn = snprintf(path, sizeof path, "%s%s", g_web_dir, rel);
+        if (pn < 0 || (size_t)pn >= sizeof path) {
+            queue_response(c, 404, "text/plain; charset=utf-8", "Not Found", 9);
+            return;
+        }
+    }
     if (!file_exists(path)) {
         /* 磁盘上没有就回退到编进二进制的前端。
          * 没有这层回退的话，只把可执行文件拷到路由器上（最常见的用法）
@@ -1521,6 +1828,8 @@ static void serve_static(ls_client *c, const char *rel) {
         }
         if (strstr(rel, ".css")) ctype = "text/css; charset=utf-8";
         else if (strstr(rel, ".js")) ctype = "text/javascript; charset=utf-8";
+        else if (strstr(rel, ".png")) ctype = "image/png";
+        else if (strstr(rel, ".svg")) ctype = "image/svg+xml";
         else ctype = "text/html; charset=utf-8";
         int is_html = (strncmp(ctype, "text/html", 9) == 0);
         if (is_html) {
@@ -1555,6 +1864,7 @@ static void serve_static(ls_client *c, const char *rel) {
     body[got] = '\0';
     if (strstr(rel, ".css")) ctype = "text/css; charset=utf-8";
     else if (strstr(rel, ".js")) ctype = "text/javascript; charset=utf-8";
+    else if (strstr(rel, ".png")) ctype = "image/png";
     else if (strstr(rel, ".svg")) ctype = "image/svg+xml";
     else ctype = "text/html; charset=utf-8";
     int is_html = (strncmp(ctype, "text/html", 9) == 0);
@@ -1688,33 +1998,55 @@ static void api_download(ls_client *c, const char *name, const char *range) {
     c->out.total = length;
     c->out.sent = 0;
     c->out.has = 1;
+    /* 流式下载不走 queue_response，单独记一条，否则日志里看不到任何下载 */
+    {
+        char szbuf[24];
+        human_size((unsigned long long)length, szbuf, sizeof szbuf);
+        log_info("下载 name=%s %s%s", safe, szbuf,
+                has_range ? "（Range 分段）" : "");
+    }
 }
 
 static void api_delete(ls_client *c, const char *name) {
     char safe[NAME_MAX * 4];
+    char esc[NAME_MAX * 8];
     char path[PATH_MAX_LOCAL];
-    char body[256];
+    char body[NAME_MAX * 8 + 64];
     sanitize_name(name, safe, sizeof safe);
     if (path_join(g_upload_dir, safe, path, sizeof path) != 0) return;
     if (!file_exists(path)) {
-        queue_response(c, 404, "application/json; charset=utf-8", "{\"error\":\"not found\"}", 20);
+        queue_response(c, 404, "application/json; charset=utf-8", "{\"error\":\"not found\"}", sizeof("{\"error\":\"not found\"}") - 1);
         return;
     }
     if (ls_remove_file(path) != 0) {
-        queue_response(c, 500, "application/json; charset=utf-8", "{\"error\":\"remove failed\"}", 24);
+        queue_response(c, 500, "application/json; charset=utf-8", "{\"error\":\"remove failed\"}", sizeof("{\"error\":\"remove failed\"}") - 1);
         return;
     }
-    snprintf(body, sizeof body, "{\"ok\":true,\"name\":\"%s\"}", safe);
+    json_escape(safe, esc, sizeof esc);
+    snprintf(body, sizeof body, "{\"ok\":true,\"name\":\"%s\"}", esc);
     queue_response(c, 200, "application/json; charset=utf-8", body, strlen(body));
 }
 
-static void api_clipboard_meta(ls_client *c) {
+/* 定义在 HTTP 解析段，这里先用（剪贴板 ETag 要读 If-None-Match）。 */
+static const char *find_header(const char *req, size_t len, const char *key);
+static void header_value(const char *p, const char *end, char *out, size_t outsz);
+
+static int cmp_clip_meta_desc(const void *pa, const void *pb) {
+    const ls_clipboard_meta *a = (const ls_clipboard_meta *)pa;
+    const ls_clipboard_meta *b = (const ls_clipboard_meta *)pb;
+    if (a->updated != b->updated) return a->updated < b->updated ? 1 : -1;
+    if (a->id != b->id) return a->id < b->id ? 1 : -1;
+    return 0;
+}
+
+static void api_clipboard_meta(ls_client *c, const char *req, size_t len) {
     ls_clipboard_meta items[CLIPBOARD_HISTORY_ITEMS];
     ls_clipboard_meta latest;
     char *body;
     char esc[NAME_MAX * 8];
-    size_t cap = 32768, len = 0;
-    int count = 0, i, j;
+    char etag[64], inm[64], extra[96];
+    size_t cap = 32768, len2 = 0;
+    int count = 0, i;
 
     for (i = 0; i < CLIPBOARD_HISTORY_ITEMS; i++) {
         if (read_clipboard_slot(i, &items[count])) count++;
@@ -1724,16 +2056,19 @@ static void api_clipboard_meta(ls_client *c) {
                        "{\"error\":\"empty\"}", sizeof("{\"error\":\"empty\"}") - 1);
         return;
     }
-    for (i = 0; i < count; i++) {
-        for (j = i + 1; j < count; j++) {
-            if (items[j].updated > items[i].updated) {
-                ls_clipboard_meta tmp = items[i];
-                items[i] = items[j];
-                items[j] = tmp;
-            }
-        }
-    }
+    qsort(items, (size_t)count, sizeof items[0], cmp_clip_meta_desc);
     latest = items[0];
+
+    /* ETag 用最新一条的 updated：没有新内容时前端 2 秒轮询只拿一个 304，
+     * 不再反复传输整份历史和图片元数据。 */
+    snprintf(etag, sizeof etag, "\"%llu\"", (unsigned long long)latest.updated);
+    inm[0] = '\0';
+    header_value(find_header(req, len, "If-None-Match"), req + len, inm, sizeof inm);
+    if (strcmp(inm, etag) == 0) {
+        snprintf(extra, sizeof extra, "ETag: %s\r\n", etag);
+        queue_response_extra(c, 304, "text/plain; charset=utf-8", "", 0, extra);
+        return;
+    }
     body = (char *)malloc(cap);
     if (!body) {
         queue_response(c, 500, "application/json; charset=utf-8", "{\"error\":\"out of memory\"}",
@@ -1741,19 +2076,20 @@ static void api_clipboard_meta(ls_client *c) {
         return;
     }
     json_escape(latest.name, esc, sizeof esc);
-    len = body_append(body, len, cap,
+    len2 = body_append(body, len2, cap,
         "{\"kind\":\"%s\",\"mime\":\"%s\",\"name\":\"%s\",\"size\":%llu,\"updated\":%llu,\"id\":%d,\"items\":[",
         latest.kind, latest.mime, esc, (unsigned long long)latest.size,
         latest.updated, latest.id);
     for (i = 0; i < count; i++) {
         json_escape(items[i].name, esc, sizeof esc);
-        len = body_append(body, len, cap,
+        len2 = body_append(body, len2, cap,
             "%s{\"id\":%d,\"kind\":\"%s\",\"mime\":\"%s\",\"name\":\"%s\",\"size\":%llu,\"updated\":%llu}",
             i ? "," : "", items[i].id, items[i].kind, items[i].mime, esc,
             (unsigned long long)items[i].size, items[i].updated);
     }
-    len = body_append(body, len, cap, "]}");
-    queue_response(c, 200, "application/json; charset=utf-8", body, len);
+    len2 = body_append(body, len2, cap, "]}");
+    snprintf(extra, sizeof extra, "ETag: %s\r\n", etag);
+    queue_response_extra(c, 200, "application/json; charset=utf-8", body, len2, extra);
     free(body);
 }
 
@@ -1913,7 +2249,7 @@ static void finish_clipboard(ls_client *c) {
     n = snprintf(response, sizeof response,
         "{\"ok\":true,\"id\":%d,\"kind\":\"%s\",\"size\":%llu}",
         meta.id, meta.kind, (unsigned long long)meta.size);
-    if (n > 0) queue_response(c, 200, "application/json; charset=utf-8", response, (size_t)n);
+    if (n > 0) queue_response(c, 200, "application/json; charset=utf-8", response, strlen(response));
 }
 
 /* ==========================================================================
@@ -2018,7 +2354,9 @@ static void header_value(const char *p, const char *end, char *out, size_t outsz
 }
 
 static void finish_upload(ls_client *c) {
-    char body[512];
+    /* 名字经 json_escape 后最长可达 NAME_MAX*8-1，500 多字节的 body 会被截断；
+     * 而下面用 strlen 取长度，缓冲必须真的装得下。 */
+    char body[NAME_MAX * 8 + 128];
     char szt[32];
     char base[PATH_MAX_LOCAL];
     char esc[NAME_MAX * 8];
@@ -2046,7 +2384,15 @@ static void finish_upload(ls_client *c) {
                 "\"done\":false,\"received\":%llu}",
                 escn, (unsigned long long)total, szt, (unsigned long long)total);
             if (n > 0) {
-                queue_response(c, 200, "application/json; charset=utf-8", body, (size_t)n);
+                queue_response(c, 200, "application/json; charset=utf-8", body, strlen(body));
+            }
+            {
+                char cur[24], acc[24], all[24];
+                human_size((unsigned long long)c->up_reqlen, cur, sizeof cur);
+                human_size((unsigned long long)total, acc, sizeof acc);
+                human_size((unsigned long long)c->up_size, all, sizeof all);
+                log_dbg("上传 分块 name=%s 本次=%s 累计=%s/%s",
+                        c->up_final, cur, acc, all);
             }
             return;
         }
@@ -2056,7 +2402,7 @@ static void finish_upload(ls_client *c) {
             unique_path(c->up_final, finalpath, sizeof finalpath);
             if (ls_rename_file(c->upname, finalpath) != 0) {
                 queue_response(c, 500, "application/json; charset=utf-8",
-                               "{\"error\":\"落盘失败\"}", 21);
+                               "{\"error\":\"落盘失败\"}", sizeof("{\"error\":\"落盘失败\"}") - 1);
                 return;
             }
             snprintf(c->upname, sizeof c->upname, "%s", finalpath);
@@ -2077,10 +2423,86 @@ static void finish_upload(ls_client *c) {
     n = snprintf(body, sizeof body,
         "{\"ok\":true,\"name\":\"%s\",\"size\":%llu,\"sizeText\":\"%s\",\"done\":%s}",
         esc, (unsigned long long)sz, szt, done ? "true" : "false");
-    if (n > 0) queue_response(c, 200, "application/json; charset=utf-8", body, (size_t)n);
+    {
+        char szbuf[24];
+        human_size(sz, szbuf, sizeof szbuf);
+        log_info("上传 完成 name=%s %s", base, szbuf);
+    }
+    if (n > 0) queue_response(c, 200, "application/json; charset=utf-8", body, strlen(body));
 }
 
 /* 返回已消耗的字节数；0 表示请求还不完整；-1 表示应关闭连接。 */
+/* 大小写不敏感比较。只用于 Host/Origin 这类 ASCII 头，不做 locale 处理。 */
+static int ci_equal(const char *a, const char *b) {
+    while (*a && *b) {
+        unsigned char ca = (unsigned char)*a++;
+        unsigned char cb = (unsigned char)*b++;
+        if (ca >= 'A' && ca <= 'Z') ca = (unsigned char)(ca - 'A' + 'a');
+        if (cb >= 'A' && cb <= 'Z') cb = (unsigned char)(cb - 'A' + 'a');
+        if (ca != cb) return 0;
+    }
+    return *a == '\0' && *b == '\0';
+}
+
+/* 定长比较，避免按第一个不同字节提前返回泄露口令长度/前缀。 */
+static int token_matches(const char *a, const char *b) {
+    size_t la = strlen(a), lb = strlen(b);
+    size_t n = la > lb ? la : lb;
+    unsigned char diff = (unsigned char)(la != lb);
+    size_t i;
+    for (i = 0; i < n; i++) {
+        unsigned char ca = i < la ? (unsigned char)a[i] : 0;
+        unsigned char cb = i < lb ? (unsigned char)b[i] : 0;
+        diff |= (unsigned char)(ca ^ cb);
+    }
+    return diff == 0;
+}
+
+/* 登录成功后写进 Cookie 的值是 sha1(口令) 的十六进制，而不是口令原文：
+ * 一是不让口令里的 ';'、空格、非 ASCII 破坏 Cookie 语法；二是即使有人看到
+ * Cookie 也拿不到可用口令（服务端只比摘要）。 */
+static void token_digest(char *out, size_t outsz) {
+    unsigned char dig[20];
+    char hex[41];
+    ls_sha1 ctx;
+    int i;
+
+    sha1_init(&ctx);
+    sha1_update(&ctx, g_token, strlen(g_token));
+    sha1_final(&ctx, dig);
+    for (i = 0; i < 20; i++) snprintf(hex + (size_t)i * 2, 3, "%02x", dig[i]);
+    hex[40] = '\0';
+    snprintf(out, outsz, "%s", hex);
+}
+
+/* 从 Cookie 头里取 ls_auth 的值（不存在时 out 为空串）。 */
+static void cookie_token(const char *req, size_t header_end, char *out, size_t outsz) {
+    char cookies[512];
+    const char *p;
+    size_t i = 0;
+
+    out[0] = '\0';
+    cookies[0] = '\0';
+    header_value(find_header(req, header_end, "Cookie"),
+                 req + header_end, cookies, sizeof cookies);
+    p = strstr(cookies, "ls_auth=");
+    if (!p) return;
+    p += 8;
+    while (*p && *p != ';' && *p != ' ' && i + 1 < outsz) out[i++] = *p++;
+    out[i] = '\0';
+}
+
+/* WebSocket 的跨站防护：浏览器一定带 Origin，必须和 Host 完全一致。
+ * 非浏览器客户端（curl / 测试脚本）没有 Origin，放行，靠可选口令保护。 */
+static int origin_allowed(const char *origin, const char *host) {
+    const char *p;
+    if (!origin[0]) return 1;
+    if (strcmp(origin, "null") == 0) return 0;
+    p = strstr(origin, "://");
+    if (!p) return 0;
+    return ci_equal(p + 3, host);
+}
+
 static long process_request(ls_client *c, const char *req, size_t len) {
     char method[16];
     char target[PATH_MAX_LOCAL];
@@ -2092,6 +2514,7 @@ static long process_request(ls_client *c, const char *req, size_t len) {
     uint64_t content_len = 0;
     size_t header_end = 0;
     size_t i, mlen, tlen;
+    int authed = 1;   /* 没开口令 / 凭据有效 / 走登录接口时为 1 */
 
     method[0] = '\0'; target[0] = '\0'; query[0] = '\0'; path[0] = '\0';
     clen_str[0] = '\0'; wskey[0] = '\0';
@@ -2133,9 +2556,114 @@ static long process_request(ls_client *c, const char *req, size_t len) {
         query[0] = '\0';
     }
 
-    header_value(find_header(req, len, "Content-Length"), req + len, clen_str, sizeof clen_str);
-    header_value(find_header(req, len, "Sec-WebSocket-Key"), req + len, wskey, sizeof wskey);
-    if (clen_str[0] != '\0') content_len = strtoull(clen_str, NULL, 10);
+    /* 访问日志的请求上下文。口令会出现在查询串里（<img>/<a download>/WS
+     * 带不了自定义头，只能这么传），落盘前必须抹掉。 */
+    snprintf(c->req_method, sizeof c->req_method, "%s", method);
+    snprintf(c->req_target, sizeof c->req_target, "%s", target);
+    redact_token(c->req_target);
+    c->req_t0 = log_now_ms();
+
+    /* 只扫请求头，不能扫到 body：否则客户端可以在正文里伪造
+     * Content-Length / X-Lan-Share-Request 骗过校验。 */
+    header_value(find_header(req, header_end, "Content-Length"), req + header_end, clen_str, sizeof clen_str);
+    header_value(find_header(req, header_end, "Sec-WebSocket-Key"), req + header_end, wskey, sizeof wskey);
+    if (clen_str[0] != '\0') {
+        char *endp = NULL;
+        errno = 0;
+        content_len = strtoull(clen_str, &endp, 10);
+        if (clen_str[0] == '-' || endp == clen_str || *endp != '\0'
+            || errno == ERANGE || content_len > (1ULL << 40)) {
+            static const char body[] = "{\"error\":\"invalid content-length\"}";
+            queue_response(c, 400, "application/json; charset=utf-8", body, sizeof body - 1);
+            return (long)len;
+        }
+    }
+
+    /* 本服务端不解析 chunked 请求体。以前对这类请求按 content_len=0 处理：
+     * 客户端发 2 MB 分块正文，服务端建出 0 字节文件还回 200——数据全丢却报成功，
+     * 排查时只能看到"上传完成但文件是空的"。明确回 411 让调用方改用
+     * Content-Length（浏览器的 XHR/fetch + Blob 本来就会带）。 */
+    if (clen_str[0] == '\0') {
+        char te[64];
+        te[0] = '\0';
+        header_value(find_header(req, header_end, "Transfer-Encoding"),
+                     req + header_end, te, sizeof te);
+        if (te[0] != '\0') {
+            static const char body[] =
+                "{\"error\":\"chunked request body not supported, send Content-Length\"}";
+            queue_response(c, 411, "application/json; charset=utf-8", body, sizeof body - 1);
+            return (long)len;
+        }
+    }
+
+    /* 提前拒绝（401 / 411 / 400 / 409 / 507）时请求体往往还没到齐，剩下的
+     * 字节不会有人消费。默认把它们排水掉；体量太大就直接关连接，不为一个
+     * 已经被拒的请求白读几 MB。真正要消费 body 的分支（流式上传、剪贴板）
+     * 会把这个计数清掉。 */
+    {
+        uint64_t in_buf = (uint64_t)(len - header_end);
+        uint64_t left = (content_len > in_buf) ? (content_len - in_buf) : 0;
+        if (left > (8ULL << 20)) { c->discard = 0; c->close_after = 1; }
+        else { c->discard = left; c->close_after = 0; }
+    }
+
+    /* 访问口令 + CSRF + WS 跨站校验。全部在分发之前。
+     * 口令开着时静态资源也要过这一关（只有登录页本身放行），否则未认证
+     * 的人会直接看到主界面；认证结果 authed 后面传给 serve_static 用。 */
+    {
+        int is_ws = (wskey[0] != '\0');
+        int is_api = (strncmp(path, "/api/", 5) == 0);
+        /* 登录接口本身不能要求口令，否则永远进不去 */
+        int is_login = (strcmp(path, "/api/login") == 0);
+        if (g_token[0]) {
+            char th[192], tq[192], ck[128], want[64];
+            th[0] = '\0'; tq[0] = '\0'; ck[0] = '\0';
+            header_value(find_header(req, header_end, "X-Lan-Share-Token"),
+                         req + header_end, th, sizeof th);
+            extract_query_value(query, "token", tq, sizeof tq);
+            cookie_token(req, header_end, ck, sizeof ck);
+            authed = 0;
+            if (th[0] && token_matches(th, g_token)) authed = 1;
+            if (!authed && tq[0] && token_matches(tq, g_token)) authed = 1;
+            if (!authed && ck[0]) {
+                token_digest(want, sizeof want);
+                if (token_matches(ck, want)) authed = 1;
+            }
+        }
+        if (is_ws || is_api) {
+            if (g_token[0] && !authed && !is_login) {
+                static const char body[] = "{\"error\":\"unauthorized\"}";
+                queue_response(c, 401, "application/json; charset=utf-8", body, sizeof body - 1);
+                return (long)len;
+            }
+            if (is_api && (strcmp(method, "POST") == 0 || strcmp(method, "PUT") == 0
+                           || strcmp(method, "PATCH") == 0 || strcmp(method, "DELETE") == 0)) {
+                char csrf[16];
+                csrf[0] = '\0';
+                header_value(find_header(req, header_end, "X-Lan-Share-Request"),
+                             req + header_end, csrf, sizeof csrf);
+                if (strcmp(csrf, "1") != 0) {
+                    static const char body[] = "{\"error\":\"missing csrf header\"}";
+                    queue_response(c, 403, "application/json; charset=utf-8", body, sizeof body - 1);
+                    return (long)len;
+                }
+            }
+            if (is_ws) {
+                char origin[256], host[256];
+                origin[0] = '\0';
+                host[0] = '\0';
+                header_value(find_header(req, header_end, "Origin"), req + header_end,
+                             origin, sizeof origin);
+                header_value(find_header(req, header_end, "Host"), req + header_end,
+                             host, sizeof host);
+                if (!origin_allowed(origin, host)) {
+                    static const char body[] = "{\"error\":\"bad origin\"}";
+                    queue_response(c, 403, "application/json; charset=utf-8", body, sizeof body - 1);
+                    return (long)len;
+                }
+            }
+        }
+    }
 
     if (wskey[0] != '\0') {
         static const char GUID[] = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -2164,6 +2692,25 @@ static long process_request(ls_client *c, const char *req, size_t len) {
             "Sec-WebSocket-Accept: %s\r\n\r\n", b64);
         if (n <= 0) return -1;
 
+        /* 名字：优先用 /ws?name=（客户端 localStorage 里存的上次名字），
+         * 没有就分配一个"主机N"。必须在拼 self 消息前定下来。 */
+        if (c->name[0] == '\0') {
+            char given[NAME_MAX * 4];
+            given[0] = '\0';
+            if (extract_query_value(query, "name", given, sizeof given) && given[0]) {
+                clean_display_name(given, c->name, sizeof c->name);
+            }
+            if (c->name[0] == '\0') {
+                const char *remembered = name_mem_get(c->ip);
+                /* 记忆名还挂在别的在线设备上 = 这个 IP 后面不止一台机器，
+                 * 复用就会两台同名，宁可重新编号。 */
+                if (remembered && !name_in_use(remembered)) {
+                    clean_display_name(remembered, c->name, sizeof c->name);
+                }
+            }
+            if (c->name[0] == '\0') assign_host_name(c->name, sizeof c->name);
+        }
+
         json_escape(c->name, escn, sizeof escn);
         snprintf(selfmsg, sizeof selfmsg, "{\"type\":\"self\",\"id\":\"%s\",\"name\":\"%s\"}",
                  c->id, escn);
@@ -2183,14 +2730,14 @@ static long process_request(ls_client *c, const char *req, size_t len) {
         c->fraglen = 0;
         c->trace_text = 6;
         c->trace_bin = 16;
+        c->trace_cand = 40;
         /* 注意：这里绝不能清 c->hlen。调用方靠 `hlen -= used` 推进读指针，
          * 清零会导致下溢成巨大 size_t，随后越界写直接段错误。
          * 101 响应占用了输出缓冲，peers 广播必须等它发完再补发，
          * 否则会把握手响应覆盖掉，浏览器会认为握手失败。 */
         c->pending_hello = 1;
-        fprintf(stderr, "[lan-share] WS 就绪 id=%s ip=%s（当前 WS 连接 %d 个）\n",
-                c->id, c->ip, count_ws_clients());
-        fflush(stderr);
+        log_info("WS 就绪 设备=%s ip=%s（当前在线 %d 台）",
+                c->name, c->ip, count_ws_clients());
         /* 只吃掉请求头。原来返回 len（"整段都算我吃了"），如果客户端把第一帧
          * 和握手塞在同一个 TCP 段里带过来，那部分字节会被调用方的 memmove
          * 直接丢掉——第一帧没了，此后整个帧流错位，后面全是莫名其妙的报错。
@@ -2200,7 +2747,7 @@ static long process_request(ls_client *c, const char *req, size_t len) {
     }
 
     if (strcmp(method, "GET") == 0 && strcmp(path, "/api/clipboard") == 0) {
-        api_clipboard_meta(c);
+        api_clipboard_meta(c, req, header_end);
         return (long)len;
     }
     if (strcmp(method, "GET") == 0 && strcmp(path, "/api/clipboard/data") == 0) {
@@ -2233,8 +2780,15 @@ static long process_request(ls_client *c, const char *req, size_t len) {
         } else if (!rawname[0]) {
             snprintf(rawname, sizeof rawname, "shared-image");
         }
-        if (!clipboard_mime_allowed(kind, mime) ||
-            (strcmp(kind, "image") == 0 && content_len == 0)) {
+        /* 空内容一律拒：以前只拦了空图片，空文字会被当成一条正常记录存下来，
+         * 页面上就是一条点不开也删不掉的空白条目。 */
+        if (content_len == 0) {
+            queue_response(c, 400, "application/json; charset=utf-8",
+                           "{\"error\":\"empty clipboard content\"}",
+                           sizeof("{\"error\":\"empty clipboard content\"}") - 1);
+            return (long)len;
+        }
+        if (!clipboard_mime_allowed(kind, mime)) {
             queue_response(c, 400, "application/json; charset=utf-8",
                            "{\"error\":\"invalid clipboard content\"}",
                            sizeof("{\"error\":\"invalid clipboard content\"}") - 1);
@@ -2267,6 +2821,8 @@ static long process_request(ls_client *c, const char *req, size_t len) {
                            "{\"error\":\"write failed\"}", sizeof("{\"error\":\"write failed\"}") - 1);
             return (long)len;
         }
+        c->discard = 0;              /* 剪贴板本体同样由本函数接管 */
+        c->close_after = 0;
         c->upfd = fd;
         c->upleft = content_len - (uint64_t)bodylen;
         c->up_reqlen = content_len;
@@ -2276,6 +2832,41 @@ static long process_request(ls_client *c, const char *req, size_t len) {
         snprintf(c->clip_name, sizeof c->clip_name, "%s", safe);
         if (c->upleft == 0) finish_clipboard(c);
         else c->mode = MODE_CLIPBOARD;
+        return (long)len;
+    }
+
+    /* 登录：口令放在查询串里（POST + 空 body），校验通过后下发 HttpOnly Cookie。
+     * 口令不放 body 是为了不依赖请求体是否已经完整收到——几 KB 的正文在
+     * 慢链路/分片时可能还没到，而查询串和请求头一定在第一批数据里。 */
+    if (strcmp(path, "/api/login") == 0) {
+        char given[192];
+        char dig[64];
+        char cookie_hdr[192];
+        static const char ok_body[] = "{\"ok\":true}";
+        static const char bad_body[] = "{\"error\":\"unauthorized\"}";
+
+        if (strcmp(method, "POST") != 0) {
+            queue_response(c, 405, "application/json; charset=utf-8",
+                           "{\"error\":\"method not allowed\"}",
+                           sizeof("{\"error\":\"method not allowed\"}") - 1);
+            return (long)len;
+        }
+        if (!g_token[0]) {           /* 没开口令：直接放行，前端跳转即可 */
+            queue_response(c, 200, "application/json; charset=utf-8", ok_body, sizeof ok_body - 1);
+            return (long)len;
+        }
+        given[0] = '\0';
+        extract_query_value(query, "token", given, sizeof given);
+        if (!given[0] || !token_matches(given, g_token)) {
+            queue_response(c, 401, "application/json; charset=utf-8", bad_body, sizeof bad_body - 1);
+            return (long)len;
+        }
+        token_digest(dig, sizeof dig);
+        snprintf(cookie_hdr, sizeof cookie_hdr,
+                 "Set-Cookie: ls_auth=%s; Path=/; HttpOnly; SameSite=Strict; Max-Age=2592000\r\n",
+                 dig);
+        queue_response_extra(c, 200, "application/json; charset=utf-8",
+                             ok_body, sizeof ok_body - 1, cookie_hdr);
         return (long)len;
     }
 
@@ -2301,11 +2892,24 @@ static long process_request(ls_client *c, const char *req, size_t len) {
         return (long)len;
     }
     if (strcmp(method, "GET") == 0 && strcmp(path, "/api/info") == 0) {
-        char body[512];
-        int n = snprintf(body, sizeof body,
-            "{\"peers\":%d,\"uploadDir\":\"%s\",\"engine\":\"c\"}",
-            count_ws_clients(), g_upload_dir);
-        if (n > 0) queue_response(c, 200, "application/json; charset=utf-8", body, (size_t)n);
+        /* uploadDir 须 json_escape 且 body 动态分配：原实现 body[512] 装不下长目录
+         * 会截断出残缺 JSON，前端 JSON.parse 失败。 */
+        char escdir[PATH_MAX_LOCAL * 2 + 8];
+        size_t cap;
+        char *body;
+        int n;
+        json_escape(g_upload_dir, escdir, sizeof escdir);
+        cap = strlen(escdir) + 64;
+        body = (char *)malloc(cap);
+        if (!body) {
+            queue_response(c, 503, "application/json; charset=utf-8", "{\"error\":\"oom\"}", sizeof("{\"error\":\"oom\"}") - 1);
+            return (long)len;
+        }
+        n = snprintf(body, cap,
+            "{\"peers\":%d,\"uploadDir\":\"%s\"}",
+            count_ws_clients(), escdir);
+        if (n > 0) queue_response(c, 200, "application/json; charset=utf-8", body, strlen(body));
+        free(body);
         return (long)len;
     }
     /* 续传前先问：这个文件已经收了多少字节 */
@@ -2314,7 +2918,7 @@ static long process_request(ls_client *c, const char *req, size_t len) {
         char safe[NAME_MAX * 4];
         char sizestr[32];
         char esc[NAME_MAX * 8];
-        char body[512];
+        char body[NAME_MAX * 8 + 128];
         uint64_t fsize;
         int n;
 
@@ -2330,7 +2934,7 @@ static long process_request(ls_client *c, const char *req, size_t len) {
             "{\"ok\":true,\"name\":\"%s\",\"size\":%llu,\"received\":%llu}",
             esc, (unsigned long long)fsize,
             (unsigned long long)part_received(safe, fsize));
-        if (n > 0) queue_response(c, 200, "application/json; charset=utf-8", body, (size_t)n);
+        if (n > 0) queue_response(c, 200, "application/json; charset=utf-8", body, strlen(body));
         return (long)len;
     }
 
@@ -2362,7 +2966,24 @@ static long process_request(ls_client *c, const char *req, size_t len) {
             foffset = strtoull(offstr, NULL, 10);
         }
 
+        if (g_quota_bytes) {
+            uint64_t need = chunked ? fsize : content_len;
+            if (need < content_len) need = content_len;
+            if (upload_dir_used() + need > g_quota_bytes) {
+                static const char body[] = "{\"error\":\"quota exceeded\"}";
+                queue_response(c, 507, "application/json; charset=utf-8", body, sizeof body - 1);
+                return (long)len;
+            }
+        }
+
         if (chunked) {
+            /* 校验本次写入不超出声明大小：否则客户端可声明 size=100 却发 200 字节，
+             * 写出越界数据后 finish_upload 直接 rename，最终文件大于声明 size。 */
+            if (fsize == 0 || fsize > (1ULL << 40) || foffset > fsize || foffset + content_len > fsize) {
+                queue_response(c, 400, "application/json; charset=utf-8",
+                               "{\"error\":\"bad range\"}", sizeof("{\"error\":\"bad range\"}") - 1);
+                return (long)len;
+            }
             uint64_t existing = part_received(safe, fsize);
             if (foffset > existing) {
                 /* 客户端要跳到还没收到的位置。顺序写做不到，
@@ -2372,11 +2993,15 @@ static long process_request(ls_client *c, const char *req, size_t len) {
                     "{\"error\":\"offset 超出已接收范围\",\"received\":%llu}",
                     (unsigned long long)existing);
                 if (n > 0) {
-                    queue_response(c, 409, "application/json; charset=utf-8", body, (size_t)n);
+                    queue_response(c, 409, "application/json; charset=utf-8", body, strlen(body));
                 }
                 return (long)len;
             }
-            part_path_for(safe, fsize, fullpath, sizeof fullpath);
+            if (part_path_for(safe, fsize, fullpath, sizeof fullpath) != 0) {
+                queue_response(c, 400, "application/json; charset=utf-8",
+                               "{\"error\":\"path too long\"}", sizeof("{\"error\":\"path too long\"}") - 1);
+                return (long)len;
+            }
             c->up_chunked = 1;
             c->up_size = fsize;
             c->up_base = foffset;
@@ -2392,17 +3017,19 @@ static long process_request(ls_client *c, const char *req, size_t len) {
 
         fd = ls_openwrite_at(fullpath, foffset, chunked);
         if (fd < 0) {
-            queue_response(c, 500, "application/json; charset=utf-8", "{\"error\":\"create failed\"}", 24);
+            queue_response(c, 500, "application/json; charset=utf-8", "{\"error\":\"create failed\"}", sizeof("{\"error\":\"create failed\"}") - 1);
             return (long)len;
         }
         if (bodylen > 0) {
             if (ls_write(fd, req + header_end, bodylen) != (long)bodylen) {
                 ls_closefile(fd);
-                queue_response(c, 500, "application/json; charset=utf-8", "{\"error\":\"write failed\"}", 23);
+                queue_response(c, 500, "application/json; charset=utf-8", "{\"error\":\"write failed\"}", sizeof("{\"error\":\"write failed\"}") - 1);
                 return (long)len;
             }
         }
         snprintf(c->upname, sizeof c->upname, "%s", fullpath);
+        c->discard = 0;              /* 本体由本函数接管，别再当残体排水 */
+        c->close_after = 0;
         c->upfd = fd;
         c->upleft = (content_len > (uint64_t)bodylen) ? (content_len - (uint64_t)bodylen) : 0;
         if (c->upleft == 0) {
@@ -2413,17 +3040,62 @@ static long process_request(ls_client *c, const char *req, size_t len) {
         return (long)len;
     }
     if (strcmp(method, "GET") == 0) {
-        serve_static(c, path);
+        serve_static(c, path, authed);
         return (long)len;
     }
 
-    queue_response(c, 405, "application/json; charset=utf-8", "{\"error\":\"method not allowed\"}", 31);
+    queue_response(c, 405, "application/json; charset=utf-8", "{\"error\":\"method not allowed\"}", sizeof("{\"error\":\"method not allowed\"}") - 1);
     return (long)len;
 }
 
 /* ==========================================================================
  * WebSocket 消息处理
  * ========================================================================== */
+
+/* ICE 候选是"走不走内网"的唯一答案：
+ *   host  = 局域网地址直连（这才算走内网）
+ *   srflx = NAT 映射后的地址（同一局域网也要绕到路由器外再回来）
+ *   relay = TURN 中转（完全没直连）
+ * 只打前若干条：32 条 lane 的 trickle 会把日志刷满。 */
+/* id → 设备名，只给日志用。找不到就原样返回 id，不返回 NULL。 */
+static const char *name_of_id(const char *id) {
+    int i;
+    for (i = 0; i < MAX_CLIENTS; i++) {
+        if (g_clients[i].used && g_clients[i].id[0]
+            && strcmp(g_clients[i].id, id) == 0 && g_clients[i].name[0]) {
+            return g_clients[i].name;
+        }
+    }
+    return id;
+}
+
+static void log_ice_candidate(ls_client *c, const char *to, const char *cand) {
+    char buf[256];
+    char *tok;
+    char transport[8] = "-", addr[64] = "-", port[8] = "-", typ[12] = "?";
+    int idx = 0;
+
+    if (c->trace_cand < 0) return;
+    if (c->trace_cand == 0) {
+        log_info("候选日志已达上限，后续不再打印");
+        c->trace_cand = -1;
+        return;
+    }
+    c->trace_cand--;
+
+    snprintf(buf, sizeof buf, "%s", cand);
+    if (strncmp(buf, "candidate:", 10) == 0) memmove(buf, buf + 10, strlen(buf + 10) + 1);
+    for (tok = strtok(buf, " "); tok; tok = strtok(NULL, " ")) {
+        if (idx == 2) snprintf(transport, sizeof transport, "%s", tok);
+        else if (idx == 4) snprintf(addr, sizeof addr, "%s", tok);
+        else if (idx == 5) snprintf(port, sizeof port, "%s", tok);
+        else if (idx == 7) snprintf(typ, sizeof typ, "%s", tok);
+        idx++;
+    }
+    log_dbg("候选 %s→%s %s %s:%s 类型=%s",
+            c->name[0] ? c->name : c->id, name_of_id(to),
+            transport, addr, port, typ);
+}
 
 static void handle_ws_message(ls_client *c, const char *msg, size_t len) {
     char type[32];
@@ -2440,9 +3112,12 @@ static void handle_ws_message(ls_client *c, const char *msg, size_t len) {
         if (json_get_str(msg, "name", nm, sizeof nm) && nm[0] != '\0') {
             char selfmsg[384];
             char escn[NAME_MAX * 4];
-            snprintf(c->name, sizeof c->name, "%s", nm);
-            /* 记住这个名字，让对端下次连上来还是它 */
-            name_mem_set(c->ip, nm);
+            clean_display_name(nm, c->name, sizeof c->name);
+            if (c->name[0] == '\0') snprintf(c->name, sizeof c->name, "%s", nm);
+            /* 记住这个名字，换浏览器/清缓存重连时还能认出来 */
+            name_mem_set(c->ip, c->name);
+            /* 日志里认设备靠名字，id 是随机的没人看得懂 */
+            log_info("设备重命名 设备=%s ip=%s", c->name, c->ip);
             json_escape(c->name, escn, sizeof escn);
             snprintf(selfmsg, sizeof selfmsg, "{\"type\":\"self\",\"id\":\"%s\",\"name\":\"%s\"}",
                      c->id, escn);
@@ -2455,6 +3130,21 @@ static void handle_ws_message(ls_client *c, const char *msg, size_t len) {
     if (strcmp(type, "signal") == 0) {
         to[0] = '\0';
         if (!json_get_str(msg, "to", to, sizeof to)) return;
+        /* 信令里的 ICE 候选直接决定走内网还是绕公网，值得单独一行 */
+        {
+            const char *cand = strstr(msg, "\"candidate\":\"");
+            if (cand) {
+                char cbuf[256];
+                size_t k = 0;
+                cand += 13;
+                while (cand[k] && cand[k] != '"' && k + 1 < sizeof cbuf) {
+                    cbuf[k] = cand[k];
+                    k++;
+                }
+                cbuf[k] = '\0';
+                log_ice_candidate(c, to, cbuf);
+            }
+        }
         for (i = 0; i < MAX_CLIENTS; i++) {
             if (!g_clients[i].used || g_clients[i].mode != MODE_WS) continue;
             if (strcmp(g_clients[i].id, to) == 0) {
@@ -2462,7 +3152,29 @@ static void handle_ws_message(ls_client *c, const char *msg, size_t len) {
                 return;
             }
         }
-        ws_send_text(c, "{\"type\":\"signal-lost\"}");
+        {
+            /* 必须把目标 id 回给客户端，它才知道该丢掉哪条连接。不回的话
+             * 客户端只能干弹提示，旧连接上的 lane 还会继续重发。 */
+            char safe_to[ID_MAX * 2];
+            char lost[160];
+            size_t o = 0;
+            const char *p;
+            for (p = to; *p && o + 1 < sizeof safe_to; p++) {
+                unsigned char ch = (unsigned char)*p;
+                if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z')
+                    || (ch >= '0' && ch <= '9') || ch == '-' || ch == '_') {
+                    safe_to[o++] = (char)ch;
+                }
+            }
+            safe_to[o] = '\0';
+            if (c->trace_lost < 3) {
+                c->trace_lost++;
+                log_info("信令丢失 %s→%s（对方不在线）",
+                        c->name[0] ? c->name : c->id, safe_to[0] ? safe_to : "?");
+            }
+            snprintf(lost, sizeof lost, "{\"type\":\"signal-lost\",\"to\":\"%s\"}", safe_to);
+            ws_send_text(c, lost);
+        }
     }
 }
 
@@ -2519,11 +3231,21 @@ static void ws_consume(ls_client *c) {
             client_close_why(c, "单帧超限");
             return;
         }
+        /* RFC 6455 §5.5：控制帧不得分片且载荷≤125 */
+        if ((opcode == 0x8 || opcode == 0x9 || opcode == 0xA) && (fin == 0 || plen > 125)) {
+            client_close_why(c, "控制帧违规");
+            return;
+        }
         mask[0] = mask[1] = mask[2] = mask[3] = 0;
         if (masked) {
             if (avail < off + 4) return;
             memcpy(mask, b + off, 4);
             off += 4;
+        } else {
+            /* RFC 6455 §5.1：服务端必须关闭未掩码的客户端帧。
+             * 浏览器始终掩码；仅恶意/违规客户端发未掩码帧。 */
+            client_close_why(c, "未掩码帧");
+            return;
         }
         if (avail < off + (size_t)plen) return;
 
@@ -2539,10 +3261,10 @@ static void ws_consume(ls_client *c) {
             int *budget = (opcode == 0x2 || opcode == 0x0) ? &c->trace_bin : &c->trace_text;
             if (*budget > 0) {
                 (*budget)--;
-                fprintf(stderr, "[lan-share] 帧 %s op=0x%x fin=%d len=%llu%s\n",
-                        c->id, opcode, fin, (unsigned long long)plen,
+                log_dbg("帧 %s op=0x%x fin=%d len=%llu%s",
+                        c->name[0] ? c->name : c->id, opcode, fin,
+                        (unsigned long long)plen,
                         *budget == 0 ? "（该类帧后续不再逐帧打印）" : "");
-                fflush(stderr);
             }
         }
 
@@ -2650,6 +3372,7 @@ static void client_readable(ls_client *c) {
             client_close_why(c, "recv 出错");
             return;
         }
+        c->last_active = time(NULL);
 
         if (c->mode == MODE_UPLOAD || c->mode == MODE_CLIPBOARD) {
             int clipboard = (c->mode == MODE_CLIPBOARD);
@@ -2676,12 +3399,19 @@ static void client_readable(ls_client *c) {
         } else {
             /* HTTP：先攒进头缓冲再解析。process_request 会一次性吃掉整个缓冲区
              * （连同跟着头一起来的 body），所以正常情况下 hbuf 会被清空。 */
-            if (c->hlen + (size_t)n > HEAD_BUF) {
+            size_t skip = 0;
+            if (c->discard > 0) {
+                /* 上一条被拒请求的残余 body：丢掉，不进解析缓冲 */
+                skip = ((uint64_t)n < c->discard) ? (size_t)n : (size_t)c->discard;
+                c->discard -= skip;
+                if (skip == (size_t)n) continue;
+            }
+            if (c->hlen + ((size_t)n - skip) > HEAD_BUF) {
                 client_close_why(c, "HTTP 头缓冲超限");
                 return;
             }
-            memcpy(c->hbuf + c->hlen, buf, (size_t)n);
-            c->hlen += (size_t)n;
+            memcpy(c->hbuf + c->hlen, buf + skip, (size_t)n - skip);
+            c->hlen += (size_t)n - skip;
             c->hbuf[c->hlen] = '\0';
             for (;;) {
                 long used = process_request(c, c->hbuf, c->hlen);
@@ -2730,6 +3460,10 @@ static void accept_all(int listen_fd) {
         int fd = (int)accept(listen_fd, (struct sockaddr *)&addr, &alen);
         int i;
         if (fd < 0) return;
+        if (fd >= FD_SETSIZE) {   /* fd 超限则 FD_SET 越界，直接拒收 */
+            ls_closesock(fd);
+            continue;
+        }
         for (i = 0; i < MAX_CLIENTS; i++) {
             if (!g_clients[i].used) break;
         }
@@ -2744,21 +3478,46 @@ static void accept_all(int listen_fd) {
         g_clients[i].fd = fd;
         g_clients[i].mode = MODE_HTTP;
         g_clients[i].upfd = -1;
+        g_clients[i].last_active = time(NULL);
+        g_clients[i].ws_ping_at = g_clients[i].last_active;
         g_seq++;
         make_id(g_clients[i].id, sizeof g_clients[i].id);
         {
             const char *r = inet_ntop(AF_INET, &addr.sin_addr, g_clients[i].ip, sizeof g_clients[i].ip);
             if (!r) g_clients[i].ip[0] = '\0';
         }
-        /* 同一个 IP 之前用过名字就复用，别每次连接都换一个。
-         * IP 必须先填好才能查记忆表，所以这段在 inet_ntop 之后。 */
-        {
-            const char *remembered = name_mem_get(g_clients[i].ip);
-            if (remembered) {
-                snprintf(g_clients[i].name, sizeof g_clients[i].name, "%s", remembered);
-            } else {
-                random_name(g_clients[i].name, sizeof g_clients[i].name);
+        /* 名字要等到 WS 握手时才定：HTTP 连接是每个请求一条，不能占用编号，
+         * 而且 /ws?name= 里的名字只有握手阶段才拿得到。 */
+    }
+}
+
+/* 回收卡住的连接。没有这一步，半个请求头就能长期占住 24 个槽位之一，
+ * 24 个这样的连接就能把服务打死（Slowloris）。WS 用 ping 保活，收不到
+ * pong 也没有数据就认为对端已经失联。 */
+static void enforce_timeouts(time_t now) {
+    int i;
+    for (i = 0; i < MAX_CLIENTS; i++) {
+        ls_client *c = &g_clients[i];
+        int idle;
+        if (!c->used) continue;
+        idle = (int)(now - c->last_active);
+        if (c->mode == MODE_WS) {
+            if (idle > 120) {
+                client_close_why(c, "WS 空闲超时");
+                continue;
             }
+            if (now - c->ws_ping_at >= 30) {
+                unsigned char ping[16];
+                size_t pl = ws_frame_build(0x9, NULL, 0, ping, sizeof ping);
+                if (pl) queue_mem(c, (const char *)ping, pl);
+                c->ws_ping_at = now;
+            }
+        } else if (c->mode == MODE_UPLOAD || c->mode == MODE_CLIPBOARD) {
+            if (idle > 60) client_close_why(c, "传输超时");
+        } else if (c->hlen > 0) {
+            if (idle > 20) client_close_why(c, "请求头超时");
+        } else if (idle > 120) {
+            client_close_why(c, "空闲连接超时");
         }
     }
 }
@@ -2773,22 +3532,76 @@ static void ensure_upload_dir(void) {
 #endif
     /* 断点续传的半成品目录。分块上传第一次用到它，
      * 不建的话续传会卡在"打不开文件"上。 */
-    parts_dir_path(parts, sizeof parts);
+    if (parts_dir_path(parts, sizeof parts) == 0) {
 #ifdef _WIN32
-    _mkdir(parts);
+        _mkdir(parts);
 #else
-    mkdir(parts, 0755);
+        mkdir(parts, 0755);
 #endif
+    } else {
+        log_err("半成品目录路径过长（-d 目录 %zu 字节），断点续传将不可用",
+                strlen(g_upload_dir));
+    }
     ensure_clipboard_dir();
+}
+
+/* 超过 24 小时没动过的断点续传半成品，启动时和运行中定期清掉，避免小闪存
+ * 被永远传不完的 .part 占满。只动 .lanshare-parts 目录里的 *.part。 */
+static void cleanup_stale_parts(void) {
+    time_t now = time(NULL);
+    char parts[PATH_MAX_LOCAL];
+    if (parts_dir_path(parts, sizeof parts) != 0) return;
+#ifdef _WIN32
+    char pat[PATH_MAX_LOCAL];
+    WIN32_FIND_DATAA fd;
+    HANDLE h;
+    snprintf(pat, sizeof pat, "%s\\*.part", parts);
+    h = FindFirstFileA(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        ULARGE_INTEGER t;
+        uint64_t secs;
+        t.LowPart = fd.ftLastWriteTime.dwLowDateTime;
+        t.HighPart = fd.ftLastWriteTime.dwHighDateTime;
+        secs = t.QuadPart / 10000000ULL;
+        if (secs > 11644473600ULL && (uint64_t)now > secs - 11644473600ULL
+            && (uint64_t)now - (secs - 11644473600ULL) > 86400ULL) {
+            char p[PATH_MAX_LOCAL];
+            snprintf(p, sizeof p, "%s\\%s", parts, fd.cFileName);
+            DeleteFileA(p);
+        }
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+#else
+    DIR *d = opendir(parts);
+    struct dirent *e;
+    if (!d) return;
+    while ((e = readdir(d)) != NULL) {
+        char p[PATH_MAX_LOCAL];
+        struct stat st;
+        size_t n = strlen(e->d_name);
+        if (n < 5 || strcmp(e->d_name + n - 5, ".part") != 0) continue;
+        if (path_join(parts, e->d_name, p, sizeof p) != 0) continue;
+        if (stat(p, &st) == 0 && S_ISREG(st.st_mode)
+            && now > st.st_mtime && now - st.st_mtime > 86400) {
+            unlink(p);
+        }
+    }
+    closedir(d);
+#endif
 }
 
 static void usage(const char *prog) {
     fprintf(stderr,
-        "用法: %s [-p 端口] [-d 文件库目录] [-w 前端目录]\n"
+        "用法: %s [-p 端口] [-d 文件库目录] [-w 前端目录] [--token 口令] [--quota MiB] [-v|-vv]\n"
         "\n"
         "  -p  监听端口，默认 8080\n"
         "  -d  文件库落盘目录，默认 ./uploads（路由器上建议指到外接存储）\n"
         "  -w  前端静态文件目录，默认 ./public\n"
+        "  --token  可选访问口令；开启后先显示登录页，认证通过才能进入\n"
+        "  --quota  文件库总配额，单位 MiB，默认 4096，0 表示不限制\n"
+        "  -v   输出常规日志（连接/上传/下载/访问记录）；默认只输出错误\n"
+        "  -vv  额外输出逐帧、逐块等调试日志\n"
         "  -h  显示本帮助\n"
         "\n"
         "示例:\n"
@@ -2916,20 +3729,85 @@ static void handle_stun(int fd) {
     }
 }
 
+/* 探测本机在局域网里的 IPv4 地址，让启动横幅直接给出能点开的地址。
+ * 做法：建一个 UDP socket 并 connect 到一个外部地址——UDP 的 connect 只设置
+ * 对端、不会真的发包，随后 getsockname 拿到内核"选出口"时挑中的那张网卡 IP。
+ * 没有任何默认路由（纯内网/无网关，路由器上很常见）时会失败，于是退回
+ * 127.0.0.1，横幅里同时把两个地址都列出来。 */
+static void detect_local_ip(char *out, size_t cap) {
+    struct sockaddr_in probe, me;
+    socklen_t mlen = sizeof me;
+    int fd;
+
+    snprintf(out, cap, "127.0.0.1");
+    fd = (int)socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) return;
+    memset(&probe, 0, sizeof probe);
+    probe.sin_family = AF_INET;
+    probe.sin_port = htons(53);
+    probe.sin_addr.s_addr = htonl(0x08080808u);      /* 8.8.8.8，仅用于选路 */
+    if (connect(fd, (struct sockaddr *)&probe, sizeof probe) == 0
+        && getsockname(fd, (struct sockaddr *)&me, &mlen) == 0
+        && me.sin_family == AF_INET) {
+        unsigned long ip = ntohl(me.sin_addr.s_addr);
+        /* 0.0.0.0 / 127.x 说明没选到真实网卡，保持回退值 */
+        if (ip != 0 && ((ip >> 24) & 0xff) != 127) {
+            snprintf(out, cap, "%lu.%lu.%lu.%lu",
+                     (ip >> 24) & 0xff, (ip >> 16) & 0xff,
+                     (ip >> 8) & 0xff, ip & 0xff);
+        }
+    }
+    ls_closesock(fd);
+}
+
 int main(int argc, char **argv) {
     int listen_fd;
     int stun_fd;
     struct sockaddr_in addr;
     int i;
     int one = 1;
+    time_t last_cleanup = 0;
 
     for (i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) {
             g_port = atoi(argv[++i]);
         } else if (strcmp(argv[i], "-d") == 0 && i + 1 < argc) {
+            /* 超长路径不能靠 snprintf 静默截断：截断到别的目录比启动失败更难查 */
+            if (strlen(argv[i + 1]) >= sizeof g_upload_dir) {
+                fprintf(stderr, "-d 路径过长（上限 %zu 字节）\n", sizeof g_upload_dir - 1);
+                return 1;
+            }
             snprintf(g_upload_dir, sizeof g_upload_dir, "%s", argv[++i]);
         } else if (strcmp(argv[i], "-w") == 0 && i + 1 < argc) {
+            if (strlen(argv[i + 1]) >= sizeof g_web_dir) {
+                fprintf(stderr, "-w 路径过长（上限 %zu 字节）\n", sizeof g_web_dir - 1);
+                return 1;
+            }
             snprintf(g_web_dir, sizeof g_web_dir, "%s", argv[++i]);
+        } else if (strcmp(argv[i], "--token") == 0 && i + 1 < argc) {
+            const char *t = argv[++i];
+            size_t tl = strlen(t);
+            if (tl == 0 || tl >= sizeof g_token) {
+                fprintf(stderr, "口令长度必须在 1..%lu 之间\n",
+                        (unsigned long)(sizeof g_token - 1));
+                return 1;
+            }
+            snprintf(g_token, sizeof g_token, "%s", t);
+        } else if (strcmp(argv[i], "--quota") == 0 && i + 1 < argc) {
+            char *endp = NULL;
+            unsigned long long mb;
+            errno = 0;
+            mb = strtoull(argv[++i], &endp, 10);
+            if (endp == argv[i] || *endp != '\0' || errno == ERANGE || mb > 1024ULL * 1024ULL) {
+                fprintf(stderr, "配额必须是 MiB 整数（0 表示不限制）: %s\n", argv[i]);
+                return 1;
+            }
+            g_quota_bytes = mb * 1024ULL * 1024ULL;
+        } else if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0) {
+            /* -v 常规日志（连接/上传/下载/访问），-vv 再叠加逐帧逐块调试细节 */
+            if (g_log_level < LOG_INFO) g_log_level = LOG_INFO;
+        } else if (strcmp(argv[i], "-vv") == 0) {
+            g_log_level = LOG_DEBUG;
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             usage(argv[0]);
             return 0;
@@ -2985,6 +3863,7 @@ int main(int argc, char **argv) {
     /* 确保上传目录存在。把二进制单独拷到路由器上时，这个目录通常还不存在，
      * 不建的话第一次上传会直接失败。已存在时调用会失败，忽略即可。 */
     ensure_upload_dir();
+    cleanup_stale_parts();
 
     listen_fd = (int)socket(AF_INET, SOCK_STREAM, 0);
     if (listen_fd < 0) {
@@ -3031,7 +3910,20 @@ int main(int argc, char **argv) {
     printf("  端口:        %d\n", g_port);
     printf("  文件库目录:  %s\n", g_upload_dir);
     printf("  前端目录:    %s\n", g_web_dir);
-    printf("  浏览器打开:  http://<路由器IP>:%d\n", g_port);
+    {
+        char lanip[64];
+        detect_local_ip(lanip, sizeof lanip);
+        printf("  浏览器打开:  http://%s:%d\n", lanip, g_port);
+        if (strcmp(lanip, "127.0.0.1") != 0) {
+            printf("                http://127.0.0.1:%d（本机）\n", g_port);
+        }
+    }
+    printf("  访问口令:    %s\n", g_token[0] ? "已启用" : "未启用");
+    printf("  文件库配额:  %s\n",
+           g_quota_bytes ? "见下方 MiB" : "不限制");
+    if (g_quota_bytes) {
+        printf("               %llu MiB\n", (unsigned long long)(g_quota_bytes / (1024ULL * 1024ULL)));
+    }
     printf("  设备间传文件走 WebRTC 直连，本程序只转发信令。\n");
     printf("  局域网 STUN: %s（UDP %d，给客户端发真实内网 IP 的自反射候选，\n"
            "                 绕开 Chrome 的 mDNS 伪装对组播的依赖）\n\n",
@@ -3053,6 +3945,11 @@ int main(int argc, char **argv) {
         }
         for (i = 0; i < MAX_CLIENTS; i++) {
             if (!g_clients[i].used) continue;
+            /* fd 超出 FD_SETSIZE 时 FD_SET 会越界写 fd_set 位图，直接关掉该连接。 */
+            if (g_clients[i].fd < 0 || g_clients[i].fd >= FD_SETSIZE) {
+                client_close_why(&g_clients[i], "fd 超出 FD_SETSIZE");
+                continue;
+            }
             FD_SET(g_clients[i].fd, &rfds);
             if (g_clients[i].out.has || g_clients[i].pendlen > 0) FD_SET(g_clients[i].fd, &wfds);
             if (g_clients[i].fd > maxfd) maxfd = g_clients[i].fd;
@@ -3062,7 +3959,10 @@ int main(int argc, char **argv) {
         tv.tv_usec = 0;
         r = select(maxfd + 1, &rfds, &wfds, NULL, &tv);
         if (r < 0) {
+            /* EINTR 被信号打断正常重试；其它真错误记日志，避免静默吞掉导致 busy-loop。 */
+            int e = errno;
             if (would_block()) continue;
+            log_err("select 错误 errno=%d", e);
             continue;
         }
 
@@ -3081,9 +3981,22 @@ int main(int argc, char **argv) {
                     g_clients[i].pending_hello = 0;
                     broadcast_peers();
                 }
+                if (fr == 1 && g_clients[i].close_after) {
+                    client_close_why(&g_clients[i], "响应后关闭（请求体过大，不排水）");
+                    continue;
+                }
             }
             if (!g_clients[i].used) continue;
             if (FD_ISSET(g_clients[i].fd, &rfds)) client_readable(&g_clients[i]);
+        }
+
+        {
+            time_t now = time(NULL);
+            enforce_timeouts(now);
+            if (now - last_cleanup >= 600) {
+                cleanup_stale_parts();
+                last_cleanup = now;
+            }
         }
     }
 

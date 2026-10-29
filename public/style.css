@@ -185,7 +185,7 @@ main {
 #clipboardText {
   display: block;
   width: 100%;
-  min-height: 160px;
+  height: 300px;
   resize: vertical;
   padding: 10px 12px;
   color: var(--text);
@@ -198,6 +198,7 @@ main {
 #clipboardText:focus { outline: 2px solid var(--blue-soft); border-color: var(--blue); }
 
 .clip-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+.clip-actions a.btn { text-decoration: none; }
 
 .clipboard-image-drop {
   display: flex;
@@ -217,8 +218,7 @@ main {
 .clipboard-image-drop small { flex-basis: 100%; text-align: center; }
 
 .clipboard-preview {
-  min-height: 120px;
-  max-height: 52vh;
+  height: 300px;
   overflow: auto;
   padding: 12px;
   background: var(--card);
@@ -538,6 +538,16 @@ main {
 .modal-card h3 { font-size: 15px; margin-bottom: 6px; }
 .modal-card p { margin: 0 0 16px; font-size: 13px; color: var(--muted); word-break: break-all; }
 .modal-actions { display: flex; justify-content: flex-end; gap: 8px; }
+.token-input {
+  width: 100%;
+  margin-bottom: 12px;
+  padding: 9px 11px;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  background: var(--bg);
+  color: var(--text);
+  font: inherit;
+}
 
 @media (max-width: 620px) {
   .topbar { padding: 12px 16px; }

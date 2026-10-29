@@ -1,6 +1,6 @@
 'use strict';
-/* 服务端吞吐基准：分别测 C 版和 Node 版的上传/下载，看瓶颈在不在服务端。
- * 用法：node bench.js <engine: c|node> [port]
+/* 服务端吞吐基准：上传（分块串行 / 整块一次）与下载，看瓶颈在不在服务端。
+ * 用法：node bench.js [port]
  */
 const http = require('http');
 const fs = require('fs');
@@ -8,8 +8,7 @@ const os = require('os');
 const path = require('path');
 const { spawn } = require('child_process');
 
-const engine = process.argv[2] || 'c';
-const PORT = Number(process.argv[3] || 8123);
+const PORT = Number(process.argv[2] || 8123);
 const MB = 1024 * 1024;
 const TOTAL = 64 * MB;
 const CHUNK = 4 * MB;
@@ -45,7 +44,11 @@ function post(name, size, offset, body) {
         const req = http.request({
             host: '127.0.0.1', port: PORT, method: 'POST',
             path: `/api/upload?name=${encodeURIComponent(name)}&size=${size}&offset=${offset}`,
-            headers: { 'Content-Type': 'application/octet-stream', 'Content-Length': body.length },
+            headers: {
+                'Content-Type': 'application/octet-stream',
+                'Content-Length': body.length,
+                'X-Lan-Share-Request': '1',
+            },
         }, (res) => {
             let d = '';
             res.on('data', (c) => { d += c; });
@@ -74,20 +77,13 @@ function download(name) {
 }
 
 (async () => {
-    const upDir = path.join(os.tmpdir(), `bench-${engine}-${PORT}`);
+    const upDir = path.join(os.tmpdir(), `bench-${PORT}`);
     fs.rmSync(upDir, { recursive: true, force: true });
     fs.mkdirSync(upDir, { recursive: true });
 
-    let child = null;
-    if (engine === 'c') {
-        const exe = path.join(__dirname, 'lan_share.exe');
-        child = spawn(exe, ['-p', String(PORT), '-d', upDir, '-w', path.join(__dirname, 'public')], { stdio: 'ignore' });
-    } else {
-        child = spawn(process.execPath, [path.join(__dirname, 'server.js')], {
-            stdio: 'ignore',
-            env: { ...process.env, PORT: String(PORT), UPLOAD_DIR: upDir },
-        });
-    }
+    const exe = path.join(__dirname, process.platform === 'win32' ? 'lan-share.exe' : 'lan-share');
+    const child = spawn(exe, ['-p', String(PORT), '-d', upDir, '-w', path.join(__dirname, 'public')],
+        { stdio: 'ignore' });
 
     if (!await waitPort(15000)) {
         console.log('服务未就绪');
@@ -95,7 +91,7 @@ function download(name) {
         process.exit(1);
     }
 
-    const name = `bench-${engine}.bin`;
+    const name = 'bench.bin';
     const data = pseudoBuf(TOTAL);
     const results = {};
 
@@ -109,7 +105,7 @@ function download(name) {
     results.upload = (TOTAL / MB) / ((Date.now() - t0) / 1000);
 
     /* ---- 上传（整块一次 POST，测协议本身的开销）---- */
-    const name2 = `bench-${engine}-one.bin`;
+    const name2 = 'bench-one.bin';
     t0 = Date.now();
     const r2 = await post(name2, TOTAL, 0, data);
     results.uploadOneShot = (TOTAL / MB) / ((Date.now() - t0) / 1000);
@@ -120,7 +116,7 @@ function download(name) {
     results.download = (dl.bytes / MB) / ((Date.now() - t0) / 1000);
     results.downloadBytes = dl.bytes;
 
-    console.log(`\n===== ${engine} 版服务端吞吐 =====`);
+    console.log('\n===== 服务端吞吐 =====');
     console.log(`  上传（4MB 分块串行）  ${results.upload.toFixed(1)} MB/s`);
     console.log(`  上传（整块一次 POST）  ${results.uploadOneShot.toFixed(1)} MB/s`);
     console.log(`  下载                  ${results.download.toFixed(1)} MB/s  (${results.downloadBytes} 字节)`);

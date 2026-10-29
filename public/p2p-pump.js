@@ -30,13 +30,15 @@
     /* 背压：缓冲超过 DRAIN_LIMIT 就停发，等泄到 LOW_WATER 以下再继续。
      * LOW_WATER 同时也是 bufferedAmountLowThreshold。
      *
-     * 2MB 这个值是按"吸收窗口"定的：每条 lane 最多囤 2MB，32 条 lane 合计
-     * 64MB——足够把局域网/RTT 个位数毫秒的管道填满，又不至于像 4MB 那样
-     * 攒出 128MB 的吸收窗口。窗口越大，发送端"入队速率"的虚报越离谱
-     * （实测 32 条 × 4MB 时，发送端显示在 2~40MB/s 之间荡，而对端实收一直
-     * 稳定在 13MB/s——荡的是表，不是链路）。CI sweep 会盯住掉头。 */
-    const DRAIN_LIMIT = 2 * 1024 * 1024;
-    const LOW_WATER = 1024 * 1024;
+     * 1MB/512KB 是 128MB×32lane 实测的中位数最优点（每组 6 次）：
+     *   1MB/512KB 中位 2.29s / 56MB/s，停顿 0 次
+     *   1MB/256KB 中位 2.83s / 45MB/s（低水位太深，等得太久）
+     *   2MB/1MB   中位 3.60s / 36MB/s（原默认，收尾更容易被单条慢 lane 拖住）
+     * 水位再往上加没有收益：发送端 bufferedAmount 全程只有 2~3MB（32 lane
+     * 合计），说明瓶颈不在队列深度，而在搬字节的速率；窗口开大只多攒内存
+     * 和"入队速率"的虚报。 */
+    const DRAIN_LIMIT = 1024 * 1024;
+    const LOW_WATER = 512 * 1024;
     /* 兜底通道（WebSocket 中转）的单块大小。服务端单帧上限 WS_BUF = 128KB，
      * 帧里还要扣 1 字节 id 长度 + id，64KB 留足余量。 */
     const RELAY_CHUNK = 64 * 1024;
@@ -57,11 +59,11 @@
      * 它们共享同一个拥塞窗口。
      *
      * 32 是容量上限，不是每次传输都用 32：lane 数的最优值随链路丢包变——
-     * CI 实测（--sweep，对端计时）：无损 loopback 上 1~4 条就够（26~39MB/s），
-     * 16/32 条反而回落到 16~18；5ms+0.5% 丢包时 16 条（20.0）优于 32 条
-     * （17.1）；只有 20ms+2% 的重丢包才是 32 条（4.2）明显占优。所以 app.js
-     * 每次连接先用 16 条探一次速，慢（对端聚合 <10MB/s）才加开到 32 条，
-     * 见 probeLanes()。 */
+     * 实测（tools/p2p-e2e.js --sweep，对端计时）：无损 loopback 上 1~4 条就够
+     * （26~39MB/s），16/32 条反而回落到 16~18；5ms+0.5% 丢包时 16 条（20.0）
+     * 优于 32 条（17.1）；只有 20ms+2% 的重丢包才是 32 条（4.2）明显占优。
+     * 所以 app.js 起步用 PROBE_LANES=16 条，这一趟对端实收低于 10MB/s 才在
+     * 下一次升到全部活 lane，不预先发探测数据。 */
     const LANES = 32;
 
     /* 静态自检：高水位加上一块必须明显小于 Chrome 的队列上限，
@@ -71,20 +73,6 @@
     }
     if (LOW_WATER >= DRAIN_LIMIT) {
         throw new Error('LSPump: LOW_WATER 必须小于 DRAIN_LIMIT，否则恢复不了发送');
-    }
-
-    /** 把 [startOffset, fileSize) 切成若干大块，返回 [{ from, want }]。
-     *  纯函数，边界情况（起点在块边界、最后一块不足、空文件）都在这里收敛。 */
-    function planBlocks(fileSize, startOffset, blockSize) {
-        const plan = [];
-        let from = Math.max(0, Math.min(Number(startOffset) || 0, fileSize));
-        while (from < fileSize) {
-            const want = Math.min(blockSize, fileSize - from);
-            if (want <= 0) break;
-            plan.push({ from, want });
-            from += want;
-        }
-        return plan;
     }
 
     /** 把 [from, to) 均切成 n 段连续区间，按 lane 顺序返回 [{ from, to }]。
@@ -105,9 +93,12 @@
         return out;
     }
 
-    /** 读出从 from 开始的那一大块。 */
-    function readBlockAt(file, from) {
-        const want = Math.min(READ_BLOCK, file.size - from);
+    /** 读出从 from 开始的那一大块，最多读到 end（并行 lane 只读自己那段）。
+     *  end 缺省为文件末尾，保持旧调用可用。 */
+    function readBlockAt(file, from, end) {
+        const stop = Math.min(end == null ? file.size : end, file.size);
+        const want = Math.max(0, Math.min(READ_BLOCK, stop - from));
+        if (want === 0) return Promise.resolve(new ArrayBuffer(0));
         return file.slice(from, from + want).arrayBuffer();
     }
 
@@ -187,31 +178,41 @@
         let offset = Math.max(0, Math.min(Number(startOffset) || 0, file.size));
         onProgress(offset);
 
-        let block = await readBlockAt(file, offset);
+        /* 读块必须在本 lane 的 [offset, end) 内截止：早先按 file.size 截止，
+         * 每条 lane 都会把自己那 4MB 段之后的 8MB 也读进来（还再预读 8MB），
+         * 128MB / 32 lane 实际分配出 ~500MB ArrayBuffer——大对象挤爆堆，
+         * 主线程被 GC 冻住几百毫秒，表现出来就是速率序列中间一段 0 之后
+         * 突然涌入一大坨。 */
+        let block = await readBlockAt(file, offset, end);
         let blockPos = 0;
-        let prefetch = (offset + block.byteLength < file.size)
-            ? readBlockAt(file, offset + block.byteLength)
+        let prefetch = (offset + block.byteLength < end)
+            ? readBlockAt(file, offset + block.byteLength, end)
             : null;
 
         while (offset < end) {
             if (waitForAck) await waitForAck(offset);
             if (blockPos >= block.byteLength) {
-                block = prefetch ? await prefetch : await readBlockAt(file, offset);
+                block = prefetch ? await prefetch : await readBlockAt(file, offset, end);
                 blockPos = 0;
-                prefetch = (offset + block.byteLength < file.size)
-                    ? readBlockAt(file, offset + block.byteLength)
+                prefetch = (offset + block.byteLength < end)
+                    ? readBlockAt(file, offset + block.byteLength, end)
                     : null;
             }
 
             /* 这一块最大能发多少：不能超过单块上限、不能越过本 block 末尾、
              * 也不能越过 end（并行 lane 只发自己那段，多发的字节会污染文件）。 */
             const want = Math.min(chunk, block.byteLength - blockPos, end - offset);
-            const buf = block.slice(blockPos, blockPos + want);
-            blockPos += buf.byteLength;
-            offset += buf.byteLength;
+            /* 用视图而不是 slice：每块 256KB 的拷贝在千兆以上会明显吃掉 CPU
+             * （128MB 文件就是 128MB 的额外拷贝）。DataChannel.send 接受
+             * ArrayBufferView，发送时由浏览器自己拷进 SCTP 队列，所以复用
+             * 底层 block 是安全的。中转通道那边也已按 byteOffset/byteLength
+             * 取字节，不会把整块 8MB 发出去。 */
+            const buf = new Uint8Array(block, blockPos, want);
+            blockPos += want;
+            offset += want;
 
-            /* 发送节奏：没满就连续发，把 1MB~4MB 的在途窗口始终填着；
-             * 只有真的到高水位了才等一次，等到低水位再接着填。
+            /* 发送节奏：没满就连续发，把高水位（1MB）以内的在途窗口始终填着；
+             * 只有真的到高水位了才等一次，等到低水位（512KB）再接着填。
              *
              * 曾经是"每发一块都先 await waitDrain"，而 bufferedamountlow 的阈值
              * 默认是 0、要等整队泄空才触发，实际放行全靠 50ms 轮询——于是每块
@@ -285,8 +286,8 @@
 
     return {
         CHROME_DC_QUEUE_CAP,
-        MAX_CHUNK, DRAIN_LIMIT, LOW_WATER, READ_BLOCK, SPEED_TEST_TIMEOUT, LANES,
-        planBlocks, splitRange, readBlockAt, chunkSizeFor, isRetryableSendError,
+        MAX_CHUNK, DRAIN_LIMIT, LOW_WATER, SPEED_TEST_TIMEOUT, LANES,
+        splitRange, chunkSizeFor, isRetryableSendError,
         waitDrain, pumpFile,
         speedtestBegin, speedtestCount, speedtestFinish, speedtestAbort,
     };
